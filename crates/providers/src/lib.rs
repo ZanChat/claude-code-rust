@@ -2176,6 +2176,95 @@ pub fn compatibility_model_catalog(provider: ApiProvider) -> StaticModelCatalog 
     StaticModelCatalog::new(compatibility_models_for(provider))
 }
 
+// ---------------------------------------------------------------------------
+// OpenAI-family model overrides (parity with TS openai.ts)
+// ---------------------------------------------------------------------------
+
+/// Default OpenAI reasoning model (used for thinking-enabled turns).
+pub const DEFAULT_OPENAI_REASONING_MODEL: &str = "gpt-5.4";
+
+/// Default OpenAI completion model (used for standard/utility turns).
+pub const DEFAULT_OPENAI_COMPLETION_MODEL: &str = "gpt-5.3-codex";
+
+/// Valid think-level values for reasoning effort.
+pub const OPENAI_THINK_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
+
+/// Returns the OpenAI reasoning model, honouring the `REASONING_MODEL` env var.
+pub fn get_openai_reasoning_model() -> String {
+    env::var("REASONING_MODEL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_OPENAI_REASONING_MODEL.to_owned())
+}
+
+/// Returns the OpenAI completion model, honouring the `COMPLETION_MODEL` env var.
+pub fn get_openai_completion_model() -> String {
+    env::var("COMPLETION_MODEL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_OPENAI_COMPLETION_MODEL.to_owned())
+}
+
+/// Parse a think-level env var value into a validated level string.
+fn parse_think_level(value: Option<String>, fallback: &str) -> String {
+    match value.map(|v| v.trim().to_lowercase()).filter(|v| !v.is_empty()) {
+        Some(v) if OPENAI_THINK_LEVELS.contains(&v.as_str()) => v,
+        Some(_) => fallback.to_owned(), // invalid value → fallback
+        None => fallback.to_owned(),
+    }
+}
+
+/// Returns the reasoning think level from `REASONING_MODEL_THINK` (default: `xhigh`).
+pub fn get_openai_reasoning_think_level() -> String {
+    parse_think_level(env::var("REASONING_MODEL_THINK").ok(), "xhigh")
+}
+
+/// Returns the completion think level from `COMPLETION_MODEL_THINK` (default: `xhigh`).
+pub fn get_openai_completion_think_level() -> String {
+    parse_think_level(env::var("COMPLETION_MODEL_THINK").ok(), "xhigh")
+}
+
+/// Resolve the model to use for a given request.
+///
+/// If the user has explicitly set `--model`, that value is always used.
+/// Otherwise, for OpenAI-family providers, the model is chosen based on
+/// whether thinking/reasoning is enabled for the current turn:
+/// - thinking enabled → `REASONING_MODEL` (default `gpt-5.4`)
+/// - thinking disabled → `COMPLETION_MODEL` (default `gpt-5.3-codex`)
+///
+/// For non-OpenAI providers, returns the original model unchanged.
+pub fn resolve_active_model(
+    provider: ApiProvider,
+    model: &str,
+    user_specified_model: bool,
+    thinking_enabled: bool,
+) -> String {
+    // If the user explicitly set `--model`, always honour it.
+    if user_specified_model {
+        return model.to_owned();
+    }
+
+    match provider {
+        ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
+            if thinking_enabled {
+                get_openai_reasoning_model()
+            } else {
+                get_openai_completion_model()
+            }
+        }
+        _ => model.to_owned(),
+    }
+}
+
+/// Returns the thinking effort level for a resolved model.
+pub fn resolve_reasoning_effort(model: &str) -> String {
+    if model == get_openai_completion_model() {
+        get_openai_completion_think_level()
+    } else {
+        get_openai_reasoning_think_level()
+    }
+}
+
 pub async fn collect_provider_response(
     provider: &dyn Provider,
     request: ProviderRequest,
