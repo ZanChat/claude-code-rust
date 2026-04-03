@@ -134,7 +134,9 @@ cargo run --bin code-agent-rust -- --provider foundry --repl
 | `ANTHROPIC_FOUNDRY_BASE_URL` / `FOUNDRY_BASE_URL` | Override Foundry endpoint | Derived from resource name |
 | `ANTHROPIC_FOUNDRY_RESOURCE` | Azure AI Foundry resource name | — |
 
-### Model Overrides (OpenAI-Family)
+### Model Overrides (All Providers)
+
+These environment variables override the default model selection for **all** providers. When not using `--model`, the agent automatically selects between a reasoning model (for thinking-enabled turns) and a completion model (for standard turns).
 
 | Variable | Description | Default |
 |---|---|---|

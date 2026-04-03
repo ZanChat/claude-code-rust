@@ -2227,14 +2227,15 @@ pub fn get_openai_completion_think_level() -> String {
 /// Resolve the model to use for a given request.
 ///
 /// If the user has explicitly set `--model`, that value is always used.
-/// Otherwise, for OpenAI-family providers, the model is chosen based on
-/// whether thinking/reasoning is enabled for the current turn:
+/// Otherwise, the model is chosen based on whether thinking/reasoning
+/// is enabled for the current turn:
 /// - thinking enabled → `REASONING_MODEL` (default `gpt-5.4`)
 /// - thinking disabled → `COMPLETION_MODEL` (default `gpt-5.3-codex`)
 ///
-/// For non-OpenAI providers, returns the original model unchanged.
+/// This applies to **all** providers, allowing operators to override
+/// the default model regardless of the backend.
 pub fn resolve_active_model(
-    provider: ApiProvider,
+    _provider: ApiProvider,
     model: &str,
     user_specified_model: bool,
     thinking_enabled: bool,
@@ -2244,15 +2245,10 @@ pub fn resolve_active_model(
         return model.to_owned();
     }
 
-    match provider {
-        ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
-            if thinking_enabled {
-                get_openai_reasoning_model()
-            } else {
-                get_openai_completion_model()
-            }
-        }
-        _ => model.to_owned(),
+    if thinking_enabled {
+        get_openai_reasoning_model()
+    } else {
+        get_openai_completion_model()
     }
 }
 
