@@ -1,0 +1,19 @@
+{
+  "cases": [
+    {
+      "input": "/remote foo bar",
+      "name": "remote-control",
+      "args": ["foo", "bar"]
+    },
+    {
+      "input": "/compact",
+      "name": "compact",
+      "args": []
+    },
+    {
+      "input": "/plugin bridge-status ./fixtures/plugin-fixtures/review-tools",
+      "name": "plugin",
+      "args": ["bridge-status", "./fixtures/plugin-fixtures/review-tools"]
+    }
+  ]
+}

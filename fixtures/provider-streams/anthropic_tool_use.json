@@ -1,0 +1,21 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Need to inspect the file. "
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_1",
+      "name": "file_read",
+      "input": {
+        "path": "src/main.rs"
+      }
+    }
+  ],
+  "usage": {
+    "input_tokens": 11,
+    "output_tokens": 7
+  },
+  "stop_reason": "tool_use"
+}

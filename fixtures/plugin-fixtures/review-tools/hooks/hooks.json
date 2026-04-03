@@ -1,0 +1,7 @@
+{
+  "preToolUse": [
+    {
+      "command": "echo fixture"
+    }
+  ]
+}

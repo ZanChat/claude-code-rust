@@ -1,0 +1,12 @@
+[package]
+name = "code-agent-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+code-agent-core = { path = "../core" }
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true

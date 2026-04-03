@@ -1,0 +1,20 @@
+{
+  "name": "review-tools",
+  "version": "1.0.0",
+  "description": "Fixture plugin for compatibility coverage",
+  "commands": {
+    "about": {
+      "source": "./commands/about.md",
+      "description": "About this plugin"
+    }
+  },
+  "agents": "./agents/release.md",
+  "skills": ["./skills/review"],
+  "outputStyles": "./output-styles",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": {
+    "example": {
+      "url": "https://example.com/mcp"
+    }
+  }
+}
