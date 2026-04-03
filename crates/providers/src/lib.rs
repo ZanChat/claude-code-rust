@@ -175,6 +175,27 @@ pub struct ModelMetadata {
     pub supports_reasoning: bool,
 }
 
+/// Thinking configuration for a provider request.
+///
+/// Claude and OpenAI use fundamentally different thinking parameter shapes:
+/// - Claude: `adaptive` or `enabled` with a token budget
+/// - OpenAI: `reasoning_effort` string level (low/medium/high/xhigh)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ThinkingConfig {
+    /// Model decides how much thinking to use (Claude 4.6+ models).
+    Adaptive,
+    /// Explicit thinking token budget (older Claude models).
+    Enabled { budget_tokens: u64 },
+    /// Thinking is disabled.
+    Disabled,
+}
+
+impl Default for ThinkingConfig {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProviderRequest {
     pub model: String,
@@ -182,6 +203,7 @@ pub struct ProviderRequest {
     pub tools: Vec<ProviderToolDefinition>,
     pub extra_headers: BTreeMap<String, String>,
     pub max_output_tokens: Option<u64>,
+    pub thinking: ThinkingConfig,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -424,6 +446,19 @@ impl HttpProvider {
         if let Some(system) = anthropic_system_prompt(&request.messages) {
             payload["system"] = Value::String(system);
         }
+        // Wire Claude thinking config into the API payload.
+        match &request.thinking {
+            ThinkingConfig::Adaptive => {
+                payload["thinking"] = json!({ "type": "adaptive" });
+            }
+            ThinkingConfig::Enabled { budget_tokens } => {
+                payload["thinking"] = json!({
+                    "type": "enabled",
+                    "budget_tokens": budget_tokens,
+                });
+            }
+            ThinkingConfig::Disabled => {}
+        }
         if !request.tools.is_empty() {
             payload["tools"] = Value::Array(
                 request
@@ -475,6 +510,11 @@ impl HttpProvider {
 
         if let Some(max_output_tokens) = request.max_output_tokens {
             payload["max_completion_tokens"] = Value::Number(max_output_tokens.into());
+        }
+        // Wire OpenAI reasoning_effort into the API payload.
+        if request.thinking != ThinkingConfig::Disabled {
+            let effort = resolve_reasoning_effort(&request.model);
+            payload["reasoning_effort"] = Value::String(effort);
         }
         if !request.tools.is_empty() {
             payload["tools"] = Value::Array(
@@ -2177,7 +2217,7 @@ pub fn compatibility_model_catalog(provider: ApiProvider) -> StaticModelCatalog 
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI-family model overrides (parity with TS openai.ts)
+// Model overrides and thinking configuration (parity with TS)
 // ---------------------------------------------------------------------------
 
 /// Default OpenAI reasoning model (used for thinking-enabled turns).
@@ -2186,7 +2226,10 @@ pub const DEFAULT_OPENAI_REASONING_MODEL: &str = "gpt-5.4";
 /// Default OpenAI completion model (used for standard/utility turns).
 pub const DEFAULT_OPENAI_COMPLETION_MODEL: &str = "gpt-5.3-codex";
 
-/// Valid think-level values for reasoning effort.
+/// Default max thinking token budget for Claude models.
+pub const DEFAULT_MAX_THINKING_TOKENS: u64 = 10_000;
+
+/// Valid think-level values for OpenAI reasoning effort.
 pub const OPENAI_THINK_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
 
 /// Returns the OpenAI reasoning model, honouring the `REASONING_MODEL` env var.
@@ -2209,7 +2252,7 @@ pub fn get_openai_completion_model() -> String {
 fn parse_think_level(value: Option<String>, fallback: &str) -> String {
     match value.map(|v| v.trim().to_lowercase()).filter(|v| !v.is_empty()) {
         Some(v) if OPENAI_THINK_LEVELS.contains(&v.as_str()) => v,
-        Some(_) => fallback.to_owned(), // invalid value → fallback
+        Some(_) => fallback.to_owned(),
         None => fallback.to_owned(),
     }
 }
@@ -2224,35 +2267,134 @@ pub fn get_openai_completion_think_level() -> String {
     parse_think_level(env::var("COMPLETION_MODEL_THINK").ok(), "xhigh")
 }
 
+fn env_flag_truthy(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Claude-specific thinking helpers (parity with TS thinking.ts)
+// ---------------------------------------------------------------------------
+
+/// Check if a Claude model supports thinking at all.
+/// Claude 4+ models support thinking. Claude 3.x models do not.
+pub fn model_supports_thinking(model: &str, provider: ApiProvider) -> bool {
+    let lower = model.to_lowercase();
+    match provider {
+        // OpenAI family always supports "thinking" via reasoning_effort
+        ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => true,
+        // 1P and Foundry: all Claude 4+ models
+        ApiProvider::FirstParty | ApiProvider::Foundry => !lower.contains("claude-3-"),
+        // 3P (Bedrock / Vertex): only Opus 4+ and Sonnet 4+
+        ApiProvider::Bedrock | ApiProvider::Vertex => {
+            lower.contains("sonnet-4") || lower.contains("opus-4")
+        }
+    }
+}
+
+/// Check if a Claude model supports adaptive thinking (newer 4.6+ models).
+pub fn model_supports_adaptive_thinking(model: &str, provider: ApiProvider) -> bool {
+    match provider {
+        ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => true,
+        _ => {
+            let lower = model.to_lowercase();
+            if lower.contains("opus-4-6") || lower.contains("sonnet-4-6") {
+                return true;
+            }
+            // Known legacy models do not support adaptive
+            if lower.contains("opus") || lower.contains("sonnet") || lower.contains("haiku") {
+                return false;
+            }
+            // Default: true for 1P/Foundry (newer models), false for 3P
+            matches!(provider, ApiProvider::FirstParty | ApiProvider::Foundry)
+        }
+    }
+}
+
+/// Resolve the `ThinkingConfig` for a Claude request.
+///
+/// Reads `CLAUDE_CODE_DISABLE_THINKING`, `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING`,
+/// and `MAX_THINKING_TOKENS` to determine the correct thinking config.
+pub fn resolve_claude_thinking_config(
+    model: &str,
+    provider: ApiProvider,
+    max_output_tokens: u64,
+) -> ThinkingConfig {
+    if env_flag_truthy("CLAUDE_CODE_DISABLE_THINKING") {
+        return ThinkingConfig::Disabled;
+    }
+    if !model_supports_thinking(model, provider) {
+        return ThinkingConfig::Disabled;
+    }
+
+    if !env_flag_truthy("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING")
+        && model_supports_adaptive_thinking(model, provider)
+    {
+        return ThinkingConfig::Adaptive;
+    }
+
+    // Budget-based thinking for older models
+    let budget = env::var("MAX_THINKING_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_THINKING_TOKENS);
+    let clamped = budget.min(max_output_tokens.saturating_sub(1));
+    ThinkingConfig::Enabled { budget_tokens: clamped }
+}
+
 /// Resolve the model to use for a given request.
 ///
 /// If the user has explicitly set `--model`, that value is always used.
-/// Otherwise, the model is chosen based on whether thinking/reasoning
-/// is enabled for the current turn:
+/// For OpenAI-family providers (when no explicit model is set), the model is
+/// split based on whether thinking is enabled:
 /// - thinking enabled → `REASONING_MODEL` (default `gpt-5.4`)
 /// - thinking disabled → `COMPLETION_MODEL` (default `gpt-5.3-codex`)
 ///
-/// This applies to **all** providers, allowing operators to override
-/// the default model regardless of the backend.
+/// For Claude providers, `REASONING_MODEL`/`COMPLETION_MODEL` are also respected
+/// if set, but no split is applied by default (Claude uses a single model).
 pub fn resolve_active_model(
-    _provider: ApiProvider,
+    provider: ApiProvider,
     model: &str,
     user_specified_model: bool,
     thinking_enabled: bool,
 ) -> String {
-    // If the user explicitly set `--model`, always honour it.
     if user_specified_model {
         return model.to_owned();
     }
 
-    if thinking_enabled {
-        get_openai_reasoning_model()
-    } else {
-        get_openai_completion_model()
+    match provider {
+        ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
+            // OpenAI providers split between reasoning and completion models
+            if thinking_enabled {
+                get_openai_reasoning_model()
+            } else {
+                get_openai_completion_model()
+            }
+        }
+        _ => {
+            // Claude providers: honour REASONING_MODEL/COMPLETION_MODEL if
+            // explicitly set, otherwise use the catalog default.
+            if thinking_enabled {
+                if let Ok(v) = env::var("REASONING_MODEL") {
+                    if !v.trim().is_empty() {
+                        return v;
+                    }
+                }
+            } else {
+                if let Ok(v) = env::var("COMPLETION_MODEL") {
+                    if !v.trim().is_empty() {
+                        return v;
+                    }
+                }
+            }
+            model.to_owned()
+        }
     }
 }
 
-/// Returns the thinking effort level for a resolved model.
+/// Returns the OpenAI reasoning effort level for a resolved model.
 pub fn resolve_reasoning_effort(model: &str) -> String {
     if model == get_openai_completion_model() {
         get_openai_completion_think_level()

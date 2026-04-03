@@ -134,16 +134,33 @@ cargo run --bin code-agent-rust -- --provider foundry --repl
 | `ANTHROPIC_FOUNDRY_BASE_URL` / `FOUNDRY_BASE_URL` | Override Foundry endpoint | Derived from resource name |
 | `ANTHROPIC_FOUNDRY_RESOURCE` | Azure AI Foundry resource name | — |
 
-### Model Overrides (All Providers)
+### Model Selection (All Providers)
 
-These environment variables override the default model selection for **all** providers. When not using `--model`, the agent automatically selects between a reasoning model (for thinking-enabled turns) and a completion model (for standard turns).
+Override the default model when `--model` is not specified. For OpenAI providers, the agent automatically selects between reasoning and completion models per-turn. For Claude providers, these are only used if explicitly set.
 
 | Variable | Description | Default |
 |---|---|---|
-| `REASONING_MODEL` | Model for thinking-enabled turns | `gpt-5.4` |
-| `COMPLETION_MODEL` | Model for standard/utility turns | `gpt-5.3-codex` |
-| `REASONING_MODEL_THINK` | Thinking effort for reasoning model (`low`, `medium`, `high`, `xhigh`) | `xhigh` |
-| `COMPLETION_MODEL_THINK` | Thinking effort for completion model (`low`, `medium`, `high`, `xhigh`) | `xhigh` |
+| `REASONING_MODEL` | Model for thinking-enabled turns (OpenAI default split) | `gpt-5.4` |
+| `COMPLETION_MODEL` | Model for standard/utility turns (OpenAI default split) | `gpt-5.3-codex` |
+
+### OpenAI Thinking (Reasoning Effort)
+
+Controls the `reasoning_effort` parameter sent to OpenAI-family providers.
+
+| Variable | Description | Default |
+|---|---|---|
+| `REASONING_MODEL_THINK` | Reasoning effort for the reasoning model (`low`, `medium`, `high`, `xhigh`) | `xhigh` |
+| `COMPLETION_MODEL_THINK` | Reasoning effort for the completion model (`low`, `medium`, `high`, `xhigh`) | `xhigh` |
+
+### Claude Thinking (Budget / Adaptive)
+
+Claude models use a different thinking mechanism: either `adaptive` (model decides) or `budget_tokens` (explicit token count). The agent auto-detects the correct mode based on the model version.
+
+| Variable | Description | Default |
+|---|---|---|
+| `CLAUDE_CODE_DISABLE_THINKING` | Disable thinking entirely for Claude models | `false` |
+| `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING` | Force budget-based thinking instead of adaptive | `false` |
+| `MAX_THINKING_TOKENS` | Token budget for non-adaptive thinking | `10000` |
 
 ### Region & Project
 
