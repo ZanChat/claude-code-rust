@@ -736,11 +736,11 @@ fn apply_selected_command(
 }
 
 fn scroll_up(scroll: &mut u16, amount: u16) {
-    *scroll = scroll.saturating_sub(amount);
+    *scroll = scroll.saturating_add(amount);
 }
 
 fn scroll_down(scroll: &mut u16, amount: u16) {
-    *scroll = scroll.saturating_add(amount);
+    *scroll = scroll.saturating_sub(amount);
 }
 
 fn should_exit_repl(prompt_text: &str) -> bool {
@@ -846,10 +846,10 @@ fn run_startup_flow<B: ratatui::backend::Backend>(
                     scroll_down(&mut transcript_scroll, 1);
                 }
                 KeyCode::Home => {
-                    transcript_scroll = 0;
+                    transcript_scroll = u16::MAX;
                 }
                 KeyCode::End => {
-                    transcript_scroll = u16::MAX;
+                    transcript_scroll = 0;
                 }
                 KeyCode::Esc => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
@@ -3974,11 +3974,11 @@ async fn run_interactive_repl(
                     dirty = true;
                 }
                 KeyCode::Home => {
-                    transcript_scroll = 0;
+                    transcript_scroll = u16::MAX;
                     dirty = true;
                 }
                 KeyCode::End => {
-                    transcript_scroll = u16::MAX;
+                    transcript_scroll = 0;
                     dirty = true;
                 }
                 KeyCode::Left if vim_state.is_insert() => {

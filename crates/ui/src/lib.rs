@@ -205,24 +205,9 @@ impl UiState {
                 text: message
                     .blocks
                     .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        ContentBlock::ToolCall { call } => Some(call.name.as_str()),
-                        ContentBlock::ToolResult { result } => Some(result.output_text.as_str()),
-                        ContentBlock::Boundary { boundary } => Some(match boundary.kind {
-                            code_agent_core::BoundaryKind::Compact => "[compact boundary]",
-                            code_agent_core::BoundaryKind::MicroCompact => {
-                                "[micro-compact boundary]"
-                            }
-                            code_agent_core::BoundaryKind::SessionMemory => {
-                                "[session-memory boundary]"
-                            }
-                            code_agent_core::BoundaryKind::Resume => "[resume boundary]",
-                        }),
-                        ContentBlock::Attachment { attachment } => Some(attachment.name.as_str()),
-                    })
+                    .filter_map(content_block_text)
                     .collect::<Vec<_>>()
-                    .join(" "),
+                    .join("\n\n"),
                 author_label: transcript_author_label(message),
             })
             .collect::<Vec<_>>();
@@ -253,6 +238,26 @@ impl UiState {
 
     pub fn active_pane_or_default(&self) -> PaneKind {
         self.active_pane.unwrap_or(PaneKind::Transcript)
+    }
+}
+
+fn content_block_text(block: &ContentBlock) -> Option<String> {
+    match block {
+        ContentBlock::Text { text } => Some(text.clone()),
+        ContentBlock::ToolCall { call } => {
+            Some(format!("Tool call: {}\n{}", call.name, call.input_json))
+        }
+        ContentBlock::ToolResult { result } => Some(result.output_text.clone()),
+        ContentBlock::Boundary { boundary } => Some(
+            match boundary.kind {
+                code_agent_core::BoundaryKind::Compact => "[compact boundary]",
+                code_agent_core::BoundaryKind::MicroCompact => "[micro-compact boundary]",
+                code_agent_core::BoundaryKind::SessionMemory => "[session-memory boundary]",
+                code_agent_core::BoundaryKind::Resume => "[resume boundary]",
+            }
+            .to_owned(),
+        ),
+        ContentBlock::Attachment { attachment } => Some(attachment.name.clone()),
     }
 }
 
@@ -472,6 +477,80 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
     format!("{left}...{right}")
 }
 
+fn push_chunked_line(wrapped: &mut Vec<String>, text: &str, width: usize) {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        wrapped.push(String::new());
+        return;
+    }
+
+    for chunk in chars.chunks(width.max(1)) {
+        wrapped.push(chunk.iter().collect::<String>());
+    }
+}
+
+fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+
+    for raw_line in text.split('\n') {
+        if raw_line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let preserve_spacing = raw_line.starts_with(char::is_whitespace)
+            || raw_line.contains("  ")
+            || raw_line.contains('\t');
+        if preserve_spacing {
+            push_chunked_line(&mut wrapped, raw_line, width);
+            continue;
+        }
+
+        let mut current = String::new();
+        for word in raw_line.split_whitespace() {
+            let word_width = line_width(word);
+            if current.is_empty() {
+                if word_width > width {
+                    push_chunked_line(&mut wrapped, word, width);
+                } else {
+                    current.push_str(word);
+                }
+                continue;
+            }
+
+            let next_width = line_width(&current).saturating_add(1 + word_width);
+            if next_width <= width {
+                current.push(' ');
+                current.push_str(word);
+                continue;
+            }
+
+            wrapped.push(current);
+            current = String::new();
+            if word_width > width {
+                push_chunked_line(&mut wrapped, word, width);
+            } else {
+                current.push_str(word);
+            }
+        }
+
+        if !current.is_empty() {
+            wrapped.push(current);
+        }
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
+}
+
+fn line_width(text: &str) -> usize {
+    text.chars().count()
+}
+
 fn role_style(role: &str) -> Style {
     match role {
         "user" => Style::default()
@@ -531,20 +610,65 @@ fn assistant_author_label(metadata: &MessageMetadata) -> String {
     }
 }
 
-fn last_user_prompt_excerpt(state: &UiState, width: u16) -> Option<String> {
-    if state.transcript_scroll == 0 {
-        return None;
+fn append_wrapped_transcript_line(
+    lines: &mut Vec<Line<'static>>,
+    transcript_line: &TranscriptLine,
+    width: u16,
+) {
+    let width = width.max(1) as usize;
+    let label = transcript_line
+        .author_label
+        .as_deref()
+        .unwrap_or(role_label(&transcript_line.role));
+    let label_prefix = format!("{label}  ");
+    let label_style = role_style(&transcript_line.role);
+
+    if transcript_line.text.trim().is_empty() {
+        lines.push(Line::from(Span::styled(label_prefix, label_style)));
+        return;
     }
 
-    state
-        .transcript_lines
-        .iter()
-        .rev()
-        .find(|line| line.role == "user")
-        .map(|line| truncate_middle(&line.text, width.saturating_sub(4) as usize))
+    let inline_label = line_width(&label_prefix) + 6 < width;
+    if inline_label {
+        let continuation_prefix = " ".repeat(line_width(&label_prefix));
+        let mut wrapped = wrap_plain_text(
+            &transcript_line.text,
+            width.saturating_sub(line_width(&label_prefix)).max(1),
+        )
+        .into_iter();
+
+        if let Some(first) = wrapped.next() {
+            lines.push(Line::from(vec![
+                Span::styled(label_prefix.clone(), label_style),
+                Span::raw(first),
+            ]));
+        }
+
+        for segment in wrapped {
+            lines.push(Line::from(vec![
+                Span::raw(continuation_prefix.clone()),
+                Span::raw(segment),
+            ]));
+        }
+        return;
+    }
+
+    lines.push(Line::from(Span::styled(label.to_owned(), label_style)));
+    let continuation_prefix = "  ".to_owned();
+    for segment in wrap_plain_text(
+        &transcript_line.text,
+        width
+            .saturating_sub(line_width(&continuation_prefix))
+            .max(1),
+    ) {
+        lines.push(Line::from(vec![
+            Span::raw(continuation_prefix.clone()),
+            Span::raw(segment),
+        ]));
+    }
 }
 
-fn transcript_lines(state: &UiState) -> Vec<Line<'static>> {
+fn transcript_visual_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
     if state.transcript_lines.is_empty() {
         let mut lines = vec![
             Line::from(Span::styled(
@@ -558,44 +682,68 @@ fn transcript_lines(state: &UiState) -> Vec<Line<'static>> {
         ];
         if !state.command_palette.is_empty() {
             lines.push(Line::from(""));
-            lines.extend(state.command_palette.iter().take(4).map(|entry| {
-                Line::from(vec![
-                    Span::styled(entry.name.clone(), Style::default().fg(Color::Cyan)),
-                    Span::raw("  "),
-                    Span::styled(
-                        entry.description.clone(),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])
-            }));
+            for entry in state.command_palette.iter().take(4) {
+                let combined = format!("{}  {}", entry.name, entry.description);
+                for segment in wrap_plain_text(&combined, width.max(1) as usize) {
+                    lines.push(Line::from(segment));
+                }
+            }
         }
         return lines;
+    }
+
+    let mut lines = Vec::new();
+    for (index, transcript_line) in state.transcript_lines.iter().enumerate() {
+        append_wrapped_transcript_line(&mut lines, transcript_line, width);
+        if index + 1 < state.transcript_lines.len() {
+            lines.push(Line::from(""));
+        }
+    }
+    lines
+}
+
+fn clamped_transcript_scroll(
+    total_lines: usize,
+    viewport_height: u16,
+    requested_scroll: u16,
+) -> u16 {
+    let max_scroll = total_lines.saturating_sub(viewport_height as usize) as u16;
+    requested_scroll.min(max_scroll)
+}
+
+fn transcript_viewport(state: &UiState, width: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+    let all_lines = transcript_visual_lines(state, width);
+    if height == 0 {
+        return (Vec::new(), 0);
+    }
+
+    let scroll = clamped_transcript_scroll(all_lines.len(), height, state.transcript_scroll);
+    let start = all_lines
+        .len()
+        .saturating_sub(height as usize + scroll as usize);
+    let end = (start + height as usize).min(all_lines.len());
+    (all_lines[start..end].to_vec(), scroll)
+}
+
+fn last_user_prompt_excerpt(state: &UiState, width: u16, transcript_scroll: u16) -> Option<String> {
+    if transcript_scroll == 0 {
+        return None;
     }
 
     state
         .transcript_lines
         .iter()
-        .map(|line| {
-            let label = line
-                .author_label
-                .as_deref()
-                .unwrap_or(role_label(&line.role));
-            Line::from(vec![
-                Span::styled(format!("{label}  "), role_style(&line.role)),
-                Span::raw(line.text.clone()),
-            ])
-        })
-        .collect()
+        .rev()
+        .find(|line| line.role == "user")
+        .map(|line| truncate_middle(&line.text, width.saturating_sub(4) as usize))
 }
 
-fn transcript_widget(state: &UiState) -> Paragraph<'static> {
-    Paragraph::new(transcript_lines(state))
-        .scroll((state.transcript_scroll, 0))
-        .wrap(Wrap { trim: false })
-}
-
-fn sticky_prompt_widget(state: &UiState, width: u16) -> Option<Paragraph<'static>> {
-    let text = last_user_prompt_excerpt(state, width)?;
+fn sticky_prompt_widget(
+    state: &UiState,
+    width: u16,
+    transcript_scroll: u16,
+) -> Option<Paragraph<'static>> {
+    let text = last_user_prompt_excerpt(state, width, transcript_scroll)?;
     Some(
         Paragraph::new(Line::from(vec![
             Span::styled("▸ ", Style::default().fg(Color::DarkGray)),
@@ -606,15 +754,15 @@ fn sticky_prompt_widget(state: &UiState, width: u16) -> Option<Paragraph<'static
     )
 }
 
-fn scroll_pill_widget(state: &UiState) -> Option<Paragraph<'static>> {
-    if state.transcript_scroll == 0 {
+fn scroll_pill_widget(transcript_scroll: u16) -> Option<Paragraph<'static>> {
+    if transcript_scroll == 0 {
         return None;
     }
 
-    let label = if state.transcript_scroll == 1 {
+    let label = if transcript_scroll == 1 {
         " Jump to bottom ".to_owned()
     } else {
-        format!(" Jump to bottom · {} lines up ", state.transcript_scroll)
+        format!(" Jump to bottom · {} lines up ", transcript_scroll)
     };
 
     Some(
@@ -658,6 +806,12 @@ fn task_status_style(status: &TaskStatus) -> (&'static str, Style) {
     }
 }
 
+fn indented_detail_lines(text: &str, indent: &str, style: Style) -> Vec<Line<'static>> {
+    text.split('\n')
+        .map(|line| Line::from(Span::styled(format!("{indent}{line}"), style)))
+        .collect()
+}
+
 fn task_lines(state: &UiState, max_items: usize, detailed: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
@@ -690,10 +844,11 @@ fn task_lines(state: &UiState, max_items: usize, detailed: bool) -> Vec<Line<'st
 
         if detailed {
             if let Some(detail) = task.output.as_ref().or(task.input.as_ref()) {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", truncate_middle(detail, 72)),
+                lines.extend(indented_detail_lines(
+                    detail,
+                    "  ",
                     Style::default().fg(Color::DarkGray),
-                )));
+                ));
             }
         }
     }
@@ -780,7 +935,7 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
                 TaskStatus::Running | TaskStatus::WaitingForInput
             )
         })
-        .take(3)
+        .take(5)
     {
         let (badge, style) = task_status_style(&task.status);
         lines.push(Line::from(vec![
@@ -792,10 +947,11 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
             ),
         ]));
         if let Some(detail) = task.output.as_ref().or(task.input.as_ref()) {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", truncate_middle(detail, 84)),
+            lines.extend(indented_detail_lines(
+                detail,
+                "  ",
                 Style::default().fg(Color::DarkGray),
-            )));
+            ));
         }
     }
 
@@ -833,7 +989,6 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
         }
     }
 
-    lines.truncate(2);
     lines
 }
 
@@ -841,19 +996,13 @@ fn activity_widget(state: &UiState) -> Paragraph<'static> {
     Paragraph::new(activity_lines(state)).wrap(Wrap { trim: false })
 }
 
-fn header_line_count(state: &UiState) -> u16 {
-    [
-        state.header_title.as_deref(),
-        state.header_subtitle.as_deref(),
-        state.header_context.as_deref(),
-    ]
-    .into_iter()
-    .filter(|value| value.is_some_and(|value| !value.trim().is_empty()))
-    .count() as u16
+fn push_wrapped_styled_lines(lines: &mut Vec<Line<'static>>, text: &str, width: u16, style: Style) {
+    for segment in wrap_plain_text(text, width.max(1) as usize) {
+        lines.push(Line::from(Span::styled(segment, style)));
+    }
 }
 
 fn header_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
-    let width = width.max(1) as usize;
     let mut lines = Vec::new();
 
     if let Some(title) = state
@@ -861,10 +1010,12 @@ fn header_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        lines.push(Line::from(vec![Span::styled(
-            truncate_middle(title, width),
+        push_wrapped_styled_lines(
+            &mut lines,
+            title,
+            width,
             Style::default().add_modifier(Modifier::BOLD),
-        )]));
+        );
     }
 
     if let Some(subtitle) = state
@@ -872,10 +1023,12 @@ fn header_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        lines.push(Line::from(vec![Span::styled(
-            truncate_middle(subtitle, width),
+        push_wrapped_styled_lines(
+            &mut lines,
+            subtitle,
+            width,
             Style::default().fg(Color::DarkGray),
-        )]));
+        );
     }
 
     if let Some(context) = state
@@ -883,13 +1036,19 @@ fn header_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        lines.push(Line::from(vec![Span::styled(
-            truncate_middle(context, width),
+        push_wrapped_styled_lines(
+            &mut lines,
+            context,
+            width,
             Style::default().fg(Color::DarkGray),
-        )]));
+        );
     }
 
     lines
+}
+
+fn header_height(state: &UiState, width: u16) -> u16 {
+    header_lines(state, width).len() as u16
 }
 
 fn header_widget(state: &UiState, width: u16) -> Paragraph<'static> {
@@ -928,13 +1087,15 @@ fn line_text(line: &Line<'_>) -> String {
 }
 
 fn wrapped_line_count(text: &str, width: u16) -> u16 {
-    let width = width.max(1) as usize;
-    let mut count = 0u16;
-    for line in text.split('\n') {
-        let char_count = line.chars().count().max(1);
-        count = count.saturating_add(((char_count - 1) / width + 1) as u16);
-    }
-    count.max(1)
+    wrap_plain_text(text, width.max(1) as usize).len().max(1) as u16
+}
+
+fn wrapped_lines_height(lines: &[Line<'_>], width: u16) -> u16 {
+    lines
+        .iter()
+        .map(|line| wrapped_line_count(&line_text(line), width))
+        .fold(0u16, u16::saturating_add)
+        .max(1)
 }
 
 fn prompt_row_height(state: &UiState, width: u16) -> u16 {
@@ -1168,7 +1329,8 @@ fn render_overlay(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
         return;
     };
     let lines = overlay_content_lines(state, kind);
-    let Some(sheet_area) = overlay_rect(area, lines.len()) else {
+    let desired_height = wrapped_lines_height(&lines, area.width.saturating_sub(4)) as usize;
+    let Some(sheet_area) = overlay_rect(area, desired_height) else {
         return;
     };
 
@@ -1231,29 +1393,37 @@ fn render_body(frame: &mut Frame<'_>, state: &UiState, body_area: Rect) {
         return;
     }
 
-    let (header_area, transcript_area) =
-        if sticky_prompt_widget(state, body_area.width).is_some() && body_area.height > 1 {
-            (
-                Some(Rect::new(body_area.x, body_area.y, body_area.width, 1)),
-                Rect::new(
-                    body_area.x,
-                    body_area.y.saturating_add(1),
-                    body_area.width,
-                    body_area.height.saturating_sub(1),
-                ),
-            )
-        } else {
-            (None, body_area)
-        };
+    let (_, initial_scroll) = transcript_viewport(state, body_area.width, body_area.height);
+    let sticky_visible = initial_scroll > 0 && body_area.height > 1;
+    let transcript_height = if sticky_visible {
+        body_area.height.saturating_sub(1)
+    } else {
+        body_area.height
+    };
+    let (transcript_lines, effective_scroll) =
+        transcript_viewport(state, body_area.width, transcript_height);
+    let (header_area, transcript_area) = if sticky_visible {
+        (
+            Some(Rect::new(body_area.x, body_area.y, body_area.width, 1)),
+            Rect::new(
+                body_area.x,
+                body_area.y.saturating_add(1),
+                body_area.width,
+                body_area.height.saturating_sub(1),
+            ),
+        )
+    } else {
+        (None, body_area)
+    };
 
     if let Some(area) = header_area {
-        if let Some(widget) = sticky_prompt_widget(state, area.width) {
+        if let Some(widget) = sticky_prompt_widget(state, area.width, effective_scroll) {
             frame.render_widget(widget, area);
         }
     }
     if transcript_area.width > 0 && transcript_area.height > 0 {
-        frame.render_widget(transcript_widget(state), transcript_area);
-        if let Some(pill) = scroll_pill_widget(state) {
+        frame.render_widget(Paragraph::new(transcript_lines), transcript_area);
+        if let Some(pill) = scroll_pill_widget(effective_scroll) {
             let pill_area = Rect::new(
                 transcript_area.x,
                 transcript_area.y + transcript_area.height.saturating_sub(1),
@@ -1278,14 +1448,35 @@ fn render_frame(frame: &mut Frame<'_>, state: &UiState) {
     let suggestions_visible =
         state.show_input && !overlay_visible && !state.command_suggestions.is_empty();
     let footer_width = area.width.saturating_sub(4);
-    let header_height = header_line_count(state);
+    let header_width = area.width.saturating_sub(4);
+    let header_height = header_height(state, header_width);
+    let activity_width = area.width.saturating_sub(4);
+    let activity_content = activity_lines(state);
     let mut activity_height = if state.show_input && !overlay_visible && !suggestions_visible {
-        activity_lines(state).len().min(2) as u16
+        wrapped_lines_height(&activity_content, activity_width).min(
+            if matches!(layout, LayoutMode::Compact) {
+                6
+            } else {
+                10
+            },
+        )
     } else {
         0
     };
     let mut suggestion_height = if suggestions_visible {
-        state.command_suggestions.len().min(MAX_VISIBLE_SUGGESTIONS) as u16
+        let suggestion_lines = state
+            .command_suggestions
+            .iter()
+            .take(MAX_VISIBLE_SUGGESTIONS)
+            .enumerate()
+            .map(|(index, entry)| {
+                let selected = state.selected_command_suggestion == Some(index);
+                let prefix = if selected { "> " } else { "  " };
+                Line::from(format!("{prefix}{:<14} {}", entry.name, entry.description))
+            })
+            .collect::<Vec<_>>();
+        wrapped_lines_height(&suggestion_lines, area.width.saturating_sub(4))
+            .min(MAX_VISIBLE_SUGGESTIONS as u16 + 2)
     } else {
         0
     };
@@ -1303,9 +1494,9 @@ fn render_frame(frame: &mut Frame<'_>, state: &UiState) {
     let mut footer_height = if state.show_input { 2 } else { 1 };
     let transcript_min_height = if state.show_input {
         if matches!(layout, LayoutMode::Compact) {
-            5
+            4
         } else {
-            6
+            5
         }
     } else if matches!(layout, LayoutMode::Compact) {
         7
@@ -1600,30 +1791,25 @@ mod tests {
     #[test]
     fn transcript_widget_supports_scroll_offset() {
         let mut state = RatatuiApp::new("scroll").initial_state();
-        state.transcript_lines = vec![
-            super::TranscriptLine {
-                role: "user".to_owned(),
-                text: "line one".to_owned(),
+        state.transcript_lines = (1..=8)
+            .map(|index| super::TranscriptLine {
+                role: if index == 1 {
+                    "user".to_owned()
+                } else {
+                    "assistant".to_owned()
+                },
+                text: format!("line {index}"),
                 author_label: None,
-            },
-            super::TranscriptLine {
-                role: "assistant".to_owned(),
-                text: "line two".to_owned(),
-                author_label: None,
-            },
-            super::TranscriptLine {
-                role: "assistant".to_owned(),
-                text: "line three".to_owned(),
-                author_label: None,
-            },
-        ];
-        state.transcript_scroll = 2;
+            })
+            .collect();
+        let pinned = render_to_string(&state, 60, 10).unwrap();
+        state.transcript_scroll = u16::MAX;
 
-        let rendered = render_to_string(&state, 80, 12).unwrap();
+        let scrolled = render_to_string(&state, 60, 10).unwrap();
 
-        assert!(rendered.contains("Jump to bottom"));
-        assert!(rendered.contains("line one"));
-        assert!(rendered.contains("line three"));
+        assert_ne!(pinned, scrolled);
+        assert!(!pinned.contains("Jump to bottom"));
+        assert!(scrolled.contains("Jump to bottom"));
     }
 
     #[test]
@@ -1655,6 +1841,22 @@ mod tests {
 
         assert!(rendered.contains("code-agent-rust v0.1.0"));
         assert!(rendered.contains("gemini-3.1-pro-preview"));
+        assert!(rendered.contains("workspace/code-agent-rust"));
+    }
+
+    #[test]
+    fn wraps_long_runtime_header_content() {
+        let mut state = RatatuiApp::new("wrapped header").initial_state();
+        state.header_title = Some("code-agent-rust v0.1.0".to_owned());
+        state.header_subtitle =
+            Some("gemini-3.1-pro-preview · openai-compatible · reasoning".to_owned());
+        state.header_context =
+            Some("/Users/pengfeiduan/workspace/code-agent-rust/examples/very/long/path".to_owned());
+
+        let rendered = render_to_string(&state, 48, 20).unwrap();
+
+        assert!(rendered.contains("gemini-3.1-pro-preview"));
+        assert!(rendered.contains("openai-compatible"));
         assert!(rendered.contains("workspace/code-agent-rust"));
     }
 
