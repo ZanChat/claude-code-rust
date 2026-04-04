@@ -2758,7 +2758,7 @@ async fn run_agent_turns(
     auth_configured: bool,
     pending_view: Option<&Arc<Mutex<PendingReplView>>>,
 ) -> Result<(Option<code_agent_core::TokenUsage>, usize, Option<String>)> {
-    const MAX_AGENT_STEPS: usize = 8;
+    const MAX_AGENT_STEPS: usize = 100;
 
     let provider_tools = tool_definitions(tool_registry);
     let tool_context = ToolContext {
