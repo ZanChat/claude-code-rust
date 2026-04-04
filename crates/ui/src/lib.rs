@@ -130,6 +130,21 @@ pub struct TranscriptLine {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptGroup {
+    pub id: String,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub expanded: bool,
+    pub lines: Vec<TranscriptLine>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UiMouseAction {
+    JumpToBottom,
+    ToggleTranscriptGroup(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PermissionPromptState {
     pub tool_name: String,
     pub summary: String,
@@ -169,6 +184,7 @@ pub struct QuestionUiEntry {
 pub struct UiState {
     pub messages: Vec<Message>,
     pub transcript_lines: Vec<TranscriptLine>,
+    pub transcript_groups: Vec<TranscriptGroup>,
     pub header_title: Option<String>,
     pub header_subtitle: Option<String>,
     pub header_context: Option<String>,
@@ -668,35 +684,136 @@ fn append_wrapped_transcript_line(
     }
 }
 
-fn transcript_visual_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
-    if state.transcript_lines.is_empty() {
-        let mut lines = vec![
-            Line::from(Span::styled(
-                "Start a conversation",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "Type a prompt below or start with / to browse commands.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
-        if !state.command_palette.is_empty() {
-            lines.push(Line::from(""));
-            for entry in state.command_palette.iter().take(4) {
-                let combined = format!("{}  {}", entry.name, entry.description);
-                for segment in wrap_plain_text(&combined, width.max(1) as usize) {
-                    lines.push(Line::from(segment));
-                }
+#[derive(Clone, Debug)]
+enum TranscriptRenderLineKind {
+    Regular,
+    GroupHeader(String),
+}
+
+#[derive(Clone, Debug)]
+struct TranscriptRenderLine {
+    line: Line<'static>,
+    kind: TranscriptRenderLineKind,
+}
+
+fn regular_render_line(line: Line<'static>) -> TranscriptRenderLine {
+    TranscriptRenderLine {
+        line,
+        kind: TranscriptRenderLineKind::Regular,
+    }
+}
+
+fn group_header_render_line(id: &str, line: Line<'static>) -> TranscriptRenderLine {
+    TranscriptRenderLine {
+        line,
+        kind: TranscriptRenderLineKind::GroupHeader(id.to_owned()),
+    }
+}
+
+fn indent_line(line: Line<'static>, indent: &str) -> Line<'static> {
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::raw(indent.to_owned()));
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
+fn wrapped_transcript_lines(transcript_line: &TranscriptLine, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    append_wrapped_transcript_line(&mut lines, transcript_line, width);
+    lines
+}
+
+fn group_header_lines(group: &TranscriptGroup, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let icon = if group.expanded { "▼" } else { "▶" };
+    let title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let subtitle_style = Style::default().fg(Color::DarkGray);
+
+    for segment in wrap_plain_text(&format!("{icon} {}", group.title), width.max(1) as usize) {
+        lines.push(Line::from(Span::styled(segment, title_style)));
+    }
+
+    let subtitle = group.subtitle.as_deref().map(|value| {
+        format!(
+            "{value} · click to {}",
+            if group.expanded { "collapse" } else { "expand" }
+        )
+    });
+    if let Some(subtitle) = subtitle {
+        for segment in wrap_plain_text(&subtitle, width.saturating_sub(2).max(1) as usize) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(segment, subtitle_style),
+            ]));
+        }
+    }
+
+    lines
+}
+
+fn empty_transcript_render_lines(
+    width: u16,
+    command_palette: &[CommandPaletteEntry],
+) -> Vec<TranscriptRenderLine> {
+    let mut lines = vec![
+        regular_render_line(Line::from(Span::styled(
+            "Start a conversation",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))),
+        regular_render_line(Line::from(Span::styled(
+            "Type a prompt below or start with / to browse commands.",
+            Style::default().fg(Color::DarkGray),
+        ))),
+    ];
+    if !command_palette.is_empty() {
+        lines.push(regular_render_line(Line::from("")));
+        for entry in command_palette.iter().take(4) {
+            let combined = format!("{}  {}", entry.name, entry.description);
+            for segment in wrap_plain_text(&combined, width.max(1) as usize) {
+                lines.push(regular_render_line(Line::from(segment)));
             }
         }
-        return lines;
+    }
+    lines
+}
+
+fn transcript_visual_lines(state: &UiState, width: u16) -> Vec<TranscriptRenderLine> {
+    if state.transcript_lines.is_empty() && state.transcript_groups.is_empty() {
+        return empty_transcript_render_lines(width, &state.command_palette);
     }
 
     let mut lines = Vec::new();
+
     for (index, transcript_line) in state.transcript_lines.iter().enumerate() {
-        append_wrapped_transcript_line(&mut lines, transcript_line, width);
-        if index + 1 < state.transcript_lines.len() {
-            lines.push(Line::from(""));
+        for line in wrapped_transcript_lines(transcript_line, width) {
+            lines.push(regular_render_line(line));
+        }
+        if index + 1 < state.transcript_lines.len() || !state.transcript_groups.is_empty() {
+            lines.push(regular_render_line(Line::from("")));
+        }
+    }
+
+    for (group_index, group) in state.transcript_groups.iter().enumerate() {
+        for line in group_header_lines(group, width) {
+            lines.push(group_header_render_line(&group.id, line));
+        }
+
+        if group.expanded && !group.lines.is_empty() {
+            lines.push(regular_render_line(Line::from("")));
+            for (line_index, transcript_line) in group.lines.iter().enumerate() {
+                for line in wrapped_transcript_lines(transcript_line, width.saturating_sub(2)) {
+                    lines.push(regular_render_line(indent_line(line, "  ")));
+                }
+                if line_index + 1 < group.lines.len() {
+                    lines.push(regular_render_line(Line::from("")));
+                }
+            }
+        }
+
+        if group_index + 1 < state.transcript_groups.len() {
+            lines.push(regular_render_line(Line::from("")));
         }
     }
     lines
@@ -711,7 +828,11 @@ fn clamped_transcript_scroll(
     requested_scroll.min(max_scroll)
 }
 
-fn transcript_viewport(state: &UiState, width: u16, height: u16) -> (Vec<Line<'static>>, u16) {
+fn transcript_viewport(
+    state: &UiState,
+    width: u16,
+    height: u16,
+) -> (Vec<TranscriptRenderLine>, u16) {
     let all_lines = transcript_visual_lines(state, width);
     if height == 0 {
         return (Vec::new(), 0);
@@ -1388,9 +1509,17 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     frame.render_widget(notice, area);
 }
 
-fn render_body(frame: &mut Frame<'_>, state: &UiState, body_area: Rect) {
+#[derive(Clone, Debug)]
+struct TranscriptBodyLayout {
+    header_area: Option<Rect>,
+    transcript_area: Rect,
+    visible_lines: Vec<TranscriptRenderLine>,
+    effective_scroll: u16,
+}
+
+fn transcript_body_layout(state: &UiState, body_area: Rect) -> Option<TranscriptBodyLayout> {
     if body_area.width == 0 || body_area.height == 0 {
-        return;
+        return None;
     }
 
     let (_, initial_scroll) = transcript_viewport(state, body_area.width, body_area.height);
@@ -1400,7 +1529,7 @@ fn render_body(frame: &mut Frame<'_>, state: &UiState, body_area: Rect) {
     } else {
         body_area.height
     };
-    let (transcript_lines, effective_scroll) =
+    let (visible_lines, effective_scroll) =
         transcript_viewport(state, body_area.width, transcript_height);
     let (header_area, transcript_area) = if sticky_visible {
         (
@@ -1416,22 +1545,196 @@ fn render_body(frame: &mut Frame<'_>, state: &UiState, body_area: Rect) {
         (None, body_area)
     };
 
-    if let Some(area) = header_area {
-        if let Some(widget) = sticky_prompt_widget(state, area.width, effective_scroll) {
+    Some(TranscriptBodyLayout {
+        header_area,
+        transcript_area,
+        visible_lines,
+        effective_scroll,
+    })
+}
+
+fn render_body(frame: &mut Frame<'_>, state: &UiState, body_area: Rect) {
+    let Some(layout) = transcript_body_layout(state, body_area) else {
+        return;
+    };
+
+    if let Some(area) = layout.header_area {
+        if let Some(widget) = sticky_prompt_widget(state, area.width, layout.effective_scroll) {
             frame.render_widget(widget, area);
         }
     }
-    if transcript_area.width > 0 && transcript_area.height > 0 {
-        frame.render_widget(Paragraph::new(transcript_lines), transcript_area);
-        if let Some(pill) = scroll_pill_widget(effective_scroll) {
+    if layout.transcript_area.width > 0 && layout.transcript_area.height > 0 {
+        let lines = layout
+            .visible_lines
+            .iter()
+            .map(|line| line.line.clone())
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), layout.transcript_area);
+        if let Some(pill) = scroll_pill_widget(layout.effective_scroll) {
             let pill_area = Rect::new(
-                transcript_area.x,
-                transcript_area.y + transcript_area.height.saturating_sub(1),
-                transcript_area.width,
+                layout.transcript_area.x,
+                layout.transcript_area.y + layout.transcript_area.height.saturating_sub(1),
+                layout.transcript_area.width,
                 1,
             );
             frame.render_widget(pill, pill_area);
         }
+    }
+}
+
+fn point_in_rect(column: u16, row: u16, rect: Rect) -> bool {
+    column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+pub fn mouse_action_for_position(
+    state: &UiState,
+    width: u16,
+    height: u16,
+    column: u16,
+    row: u16,
+) -> Option<UiMouseAction> {
+    let area = Rect::new(0, 0, width, height);
+    let layout = layout_mode(area, state);
+    if matches!(layout, LayoutMode::TooSmall) {
+        return None;
+    }
+
+    let overlay_visible = overlay_kind(state).is_some();
+    let suggestions_visible =
+        state.show_input && !overlay_visible && !state.command_suggestions.is_empty();
+    let header_width = area.width.saturating_sub(4);
+    let header_height = header_height(state, header_width);
+    let activity_width = area.width.saturating_sub(4);
+    let activity_content = activity_lines(state);
+    let mut activity_height = if state.show_input && !overlay_visible && !suggestions_visible {
+        wrapped_lines_height(&activity_content, activity_width).min(
+            if matches!(layout, LayoutMode::Compact) {
+                6
+            } else {
+                10
+            },
+        )
+    } else {
+        0
+    };
+    let mut suggestion_height = if suggestions_visible {
+        let suggestion_lines = state
+            .command_suggestions
+            .iter()
+            .take(MAX_VISIBLE_SUGGESTIONS)
+            .enumerate()
+            .map(|(index, entry)| {
+                let selected = state.selected_command_suggestion == Some(index);
+                let prefix = if selected { "> " } else { "  " };
+                Line::from(format!("{prefix}{:<14} {}", entry.name, entry.description))
+            })
+            .collect::<Vec<_>>();
+        wrapped_lines_height(&suggestion_lines, area.width.saturating_sub(4))
+            .min(MAX_VISIBLE_SUGGESTIONS as u16 + 2)
+    } else {
+        0
+    };
+    let prompt_height = if state.show_input {
+        prompt_row_height(state, area.width.saturating_sub(2)).max(
+            if matches!(layout, LayoutMode::Compact) {
+                COMPACT_INPUT_HEIGHT.saturating_sub(3)
+            } else {
+                STANDARD_INPUT_HEIGHT.saturating_sub(3)
+            },
+        )
+    } else {
+        0
+    };
+    let mut footer_height = if state.show_input { 2 } else { 1 };
+    let transcript_min_height = if state.show_input {
+        if matches!(layout, LayoutMode::Compact) {
+            4
+        } else {
+            5
+        }
+    } else if matches!(layout, LayoutMode::Compact) {
+        7
+    } else {
+        8
+    };
+
+    if state.show_input {
+        let max_reserved = area.height.saturating_sub(transcript_min_height);
+        while activity_height + suggestion_height + prompt_height + footer_height > max_reserved {
+            if suggestion_height > 0 {
+                suggestion_height -= 1;
+                continue;
+            }
+            if activity_height > 0 {
+                activity_height -= 1;
+                continue;
+            }
+            if footer_height > 1 {
+                footer_height -= 1;
+                continue;
+            }
+            break;
+        }
+    }
+
+    let vertical = if state.show_input {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(header_height),
+                Constraint::Min(transcript_min_height),
+                Constraint::Length(activity_height),
+                Constraint::Length(suggestion_height),
+                Constraint::Length(prompt_height),
+                Constraint::Length(footer_height),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(header_height),
+                Constraint::Min(transcript_min_height),
+                Constraint::Length(footer_height),
+            ])
+            .split(area)
+    };
+    let body_area = vertical[1];
+    let body_layout = transcript_body_layout(state, body_area)?;
+
+    if let Some(header_area) = body_layout.header_area {
+        if point_in_rect(column, row, header_area) {
+            return Some(UiMouseAction::JumpToBottom);
+        }
+    }
+    if body_layout.effective_scroll > 0 {
+        let pill_area = Rect::new(
+            body_layout.transcript_area.x,
+            body_layout.transcript_area.y + body_layout.transcript_area.height.saturating_sub(1),
+            body_layout.transcript_area.width,
+            1,
+        );
+        if point_in_rect(column, row, pill_area) {
+            return Some(UiMouseAction::JumpToBottom);
+        }
+    }
+    if !point_in_rect(column, row, body_layout.transcript_area) {
+        return None;
+    }
+
+    let line_index = row.saturating_sub(body_layout.transcript_area.y) as usize;
+    match body_layout
+        .visible_lines
+        .get(line_index)
+        .map(|line| &line.kind)
+    {
+        Some(TranscriptRenderLineKind::GroupHeader(id)) => {
+            Some(UiMouseAction::ToggleTranscriptGroup(id.clone()))
+        }
+        _ => None,
     }
 }
 
@@ -1658,7 +1961,8 @@ pub fn render_to_string(state: &UiState, width: u16, height: u16) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        render_to_string, Notification, PaneKind, PermissionPromptState, RatatuiApp, StatusLevel,
+        mouse_action_for_position, render_to_string, Notification, PaneKind, PermissionPromptState,
+        RatatuiApp, StatusLevel, TranscriptGroup, TranscriptLine, UiMouseAction,
     };
     use code_agent_core::{compatibility_command_registry, ContentBlock, Message, MessageRole};
 
@@ -1858,6 +2162,33 @@ mod tests {
         assert!(rendered.contains("gemini-3.1-pro-preview"));
         assert!(rendered.contains("openai-compatible"));
         assert!(rendered.contains("workspace/code-agent-rust"));
+    }
+
+    #[test]
+    fn transcript_groups_render_and_toggle_from_mouse_hit_testing() {
+        let mut state = RatatuiApp::new("groups").initial_state();
+        state.transcript_groups = vec![TranscriptGroup {
+            id: "pending-step-1".to_owned(),
+            title: "Step 1 · running list_dir".to_owned(),
+            subtitle: Some("2 messages".to_owned()),
+            expanded: false,
+            lines: vec![TranscriptLine {
+                role: "assistant".to_owned(),
+                text: "Tool call: list_dir".to_owned(),
+                author_label: Some("gpt-5.4(chatgpt-codex)".to_owned()),
+            }],
+        }];
+
+        let rendered = render_to_string(&state, 80, 24).unwrap();
+        let action = mouse_action_for_position(&state, 80, 24, 1, 0);
+
+        assert!(rendered.contains("Step 1"));
+        assert_eq!(
+            action,
+            Some(UiMouseAction::ToggleTranscriptGroup(
+                "pending-step-1".to_owned()
+            ))
+        );
     }
 
     #[test]

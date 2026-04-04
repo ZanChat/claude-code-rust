@@ -31,12 +31,16 @@ use code_agent_session::{
 };
 use code_agent_tools::{compatibility_tool_registry, ToolCallRequest, ToolContext, ToolRegistry};
 use code_agent_ui::{
-    draw_terminal as draw_tui, render_to_string as render_tui_to_string, CommandPaletteEntry,
-    Notification, PaneKind, PanePreview, PermissionPromptState, QuestionUiEntry, RatatuiApp,
-    StatusLevel, TaskUiEntry, TranscriptLine, UiState,
+    draw_terminal as draw_tui, mouse_action_for_position, render_to_string as render_tui_to_string,
+    CommandPaletteEntry, Notification, PaneKind, PanePreview, PermissionPromptState,
+    QuestionUiEntry, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup, TranscriptLine,
+    UiMouseAction, UiState,
 };
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, size as terminal_size, EnterAlternateScreen,
@@ -829,6 +833,15 @@ fn run_startup_flow<B: ratatui::backend::Backend>(
             Event::Resize(width, height) => {
                 terminal.resize(Rect::new(0, 0, width, height))?;
             }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    scroll_up(&mut transcript_scroll, 3);
+                }
+                MouseEventKind::ScrollDown => {
+                    scroll_down(&mut transcript_scroll, 3);
+                }
+                _ => {}
+            },
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Tab => {
                     if index + 1 >= screens.len() {
@@ -1485,6 +1498,7 @@ fn build_repl_ui_state(
     app: &RatatuiApp,
     registry: &code_agent_core::CommandRegistry,
     raw_messages: &[Message],
+    pending_view: Option<&PendingReplView>,
     cwd: &Path,
     provider: ApiProvider,
     active_model: &str,
@@ -1501,6 +1515,60 @@ fn build_repl_ui_state(
 ) -> code_agent_ui::UiState {
     let runtime_messages = materialize_runtime_messages(raw_messages);
     let mut state = app.state_from_messages(runtime_messages.clone(), &registry.all());
+    if let Some(pending_view) = pending_view.filter(|view| !view.steps.is_empty()) {
+        let first_step_start = pending_view
+            .steps
+            .first()
+            .map(|step| step.start_index.min(runtime_messages.len()))
+            .unwrap_or(runtime_messages.len());
+        state.transcript_lines =
+            UiState::from_messages(runtime_messages[..first_step_start].to_vec()).transcript_lines;
+        state.transcript_groups = pending_view
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let end_index = pending_view
+                    .steps
+                    .get(index + 1)
+                    .map(|next| next.start_index)
+                    .unwrap_or(runtime_messages.len())
+                    .min(runtime_messages.len());
+                let start_index = step.start_index.min(end_index);
+                let slice = &runtime_messages[start_index..end_index];
+                let assistant_count = slice
+                    .iter()
+                    .filter(|message| message.role == MessageRole::Assistant)
+                    .count();
+                let tool_count = slice
+                    .iter()
+                    .filter(|message| message.role == MessageRole::Tool)
+                    .count();
+                let mut detail_parts = vec![format!(
+                    "{} {}",
+                    slice.len(),
+                    if slice.len() == 1 {
+                        "message"
+                    } else {
+                        "messages"
+                    }
+                )];
+                if assistant_count > 0 {
+                    detail_parts.push(format!("{} assistant", assistant_count));
+                }
+                if tool_count > 0 {
+                    detail_parts.push(format!("{} tool", tool_count));
+                }
+                TranscriptGroup {
+                    id: step.id(),
+                    title: format!("Step {} · {}", step.step, step.status_label),
+                    subtitle: Some(detail_parts.join(" · ")),
+                    expanded: step.expanded,
+                    lines: UiState::from_messages(slice.to_vec()).transcript_lines,
+                }
+            })
+            .collect();
+    }
     apply_repl_header(&mut state, provider, active_model, cwd, session_id);
     let (task_items, question_items) = load_task_ui_data(cwd);
     state.show_input = true;
@@ -1548,6 +1616,7 @@ fn draw_repl_state(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     registry: &code_agent_core::CommandRegistry,
     raw_messages: &[Message],
+    pending_view: Option<&PendingReplView>,
     cwd: &Path,
     provider: ApiProvider,
     active_model: &str,
@@ -1568,6 +1637,7 @@ fn draw_repl_state(
         &app,
         registry,
         raw_messages,
+        pending_view,
         cwd,
         provider,
         active_model,
@@ -1584,6 +1654,55 @@ fn draw_repl_state(
     );
     state.vim_state = vim_state.clone();
     draw_tui(terminal, &state)
+}
+
+fn repl_mouse_action(
+    terminal: &Terminal<CrosstermBackend<std::io::Stdout>>,
+    registry: &code_agent_core::CommandRegistry,
+    raw_messages: &[Message],
+    pending_view: Option<&PendingReplView>,
+    cwd: &Path,
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    input_buffer: &code_agent_ui::InputBuffer,
+    status_line: &str,
+    progress_message: Option<String>,
+    active_pane: PaneKind,
+    compact_banner: Option<String>,
+    transcript_scroll: u16,
+    selected_command_suggestion: usize,
+    status_marquee_tick: usize,
+    mouse: &MouseEvent,
+) -> Result<Option<UiMouseAction>> {
+    let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+    let state = build_repl_ui_state(
+        &app,
+        registry,
+        raw_messages,
+        pending_view,
+        cwd,
+        provider,
+        active_model,
+        session_id,
+        input_buffer,
+        status_line,
+        progress_message,
+        active_pane,
+        compact_banner,
+        transcript_scroll,
+        command_suggestions(registry, input_buffer),
+        selected_command_suggestion,
+        status_marquee_tick,
+    );
+    let size = terminal.size()?;
+    Ok(mouse_action_for_position(
+        &state,
+        size.width,
+        size.height,
+        mouse.column,
+        mouse.row,
+    ))
 }
 
 fn optimistic_messages_for_prompt(
@@ -1603,9 +1722,25 @@ fn optimistic_messages_for_prompt(
 }
 
 #[derive(Clone, Debug)]
+struct PendingReplStep {
+    step: usize,
+    start_index: usize,
+    status_label: String,
+    expanded: bool,
+    touched: bool,
+}
+
+impl PendingReplStep {
+    fn id(&self) -> String {
+        format!("pending-step-{}", self.step)
+    }
+}
+
+#[derive(Clone, Debug)]
 struct PendingReplView {
     messages: Vec<Message>,
     progress_label: String,
+    steps: Vec<PendingReplStep>,
 }
 
 impl PendingReplView {
@@ -1613,6 +1748,7 @@ impl PendingReplView {
         Self {
             messages,
             progress_label: progress_label.into(),
+            steps: Vec::new(),
         }
     }
 }
@@ -1626,8 +1762,58 @@ fn update_pending_repl_view(
         return;
     };
     if let Ok(mut state) = pending_view.lock() {
-        state.messages = messages.to_vec();
+        state.messages = materialize_runtime_messages(messages);
         state.progress_label = progress_label.into();
+    }
+}
+
+fn update_pending_repl_step_view(
+    pending_view: Option<&Arc<Mutex<PendingReplView>>>,
+    step: usize,
+    step_start_index: usize,
+    messages: &[Message],
+    progress_label: impl Into<String>,
+) {
+    let Some(pending_view) = pending_view else {
+        return;
+    };
+    if let Ok(mut state) = pending_view.lock() {
+        let runtime_messages = materialize_runtime_messages(messages);
+        let runtime_start_index = step_start_index.min(runtime_messages.len());
+        if !state.steps.iter().any(|entry| entry.step == step) {
+            if let Some(previous) = state.steps.last_mut() {
+                if !previous.touched {
+                    previous.expanded = false;
+                }
+            }
+            state.steps.push(PendingReplStep {
+                step,
+                start_index: runtime_start_index,
+                status_label: String::new(),
+                expanded: true,
+                touched: false,
+            });
+        }
+        if let Some(entry) = state.steps.iter_mut().find(|entry| entry.step == step) {
+            entry.start_index = runtime_start_index.min(runtime_messages.len());
+            entry.status_label = progress_label.into();
+        }
+        state.messages = runtime_messages;
+        state.progress_label = state
+            .steps
+            .iter()
+            .find(|entry| entry.step == step)
+            .map(|entry| entry.status_label.clone())
+            .unwrap_or_else(|| "working".to_owned());
+    }
+}
+
+fn toggle_pending_repl_group(pending_view: &Arc<Mutex<PendingReplView>>, group_id: &str) {
+    if let Ok(mut state) = pending_view.lock() {
+        if let Some(entry) = state.steps.iter_mut().find(|entry| entry.id() == group_id) {
+            entry.expanded = !entry.expanded;
+            entry.touched = true;
+        }
     }
 }
 
@@ -1659,17 +1845,6 @@ fn pending_spinner_frame(tick: usize) -> &'static str {
     FRAMES[tick % FRAMES.len()]
 }
 
-fn drain_pending_repl_events(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-) -> Result<()> {
-    while event::poll(Duration::from_millis(0))? {
-        if let Event::Resize(width, height) = event::read()? {
-            terminal.resize(Rect::new(0, 0, width, height))?;
-        }
-    }
-    Ok(())
-}
-
 async fn run_pending_repl_operation<F, T>(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     registry: &code_agent_core::CommandRegistry,
@@ -1692,14 +1867,86 @@ where
     let mut operation = std::pin::pin!(operation);
     let mut tick = 0usize;
     let mut selected_command_suggestion = 0usize;
+    let mut active_pane = active_pane;
+    let mut transcript_scroll = transcript_scroll;
 
     loop {
-        drain_pending_repl_events(terminal)?;
+        let pending_snapshot = pending_repl_snapshot(&pending_view);
+        while event::poll(Duration::from_millis(0))? {
+            match event::read()? {
+                Event::Resize(width, height) => {
+                    terminal.resize(Rect::new(0, 0, width, height))?;
+                }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        scroll_up(&mut transcript_scroll, 3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        scroll_down(&mut transcript_scroll, 3);
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(action) = repl_mouse_action(
+                            terminal,
+                            registry,
+                            &pending_snapshot.messages,
+                            Some(&pending_snapshot),
+                            cwd,
+                            provider,
+                            active_model,
+                            session_id,
+                            input_buffer,
+                            status_line,
+                            Some(format!(
+                                "{} {}",
+                                pending_spinner_frame(tick),
+                                pending_snapshot.progress_label
+                            )),
+                            active_pane,
+                            compact_banner.clone(),
+                            transcript_scroll,
+                            selected_command_suggestion,
+                            tick,
+                            &mouse,
+                        )? {
+                            match action {
+                                UiMouseAction::JumpToBottom => {
+                                    transcript_scroll = 0;
+                                }
+                                UiMouseAction::ToggleTranscriptGroup(group_id) => {
+                                    toggle_pending_repl_group(&pending_view, &group_id);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if let Some(pane) = pane_from_shortcut(&key) {
+                        active_pane = pane;
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Tab => active_pane = rotate_pane(active_pane, true),
+                        KeyCode::BackTab => active_pane = rotate_pane(active_pane, false),
+                        KeyCode::Up => scroll_up(&mut transcript_scroll, 1),
+                        KeyCode::Down => scroll_down(&mut transcript_scroll, 1),
+                        KeyCode::PageUp => scroll_up(&mut transcript_scroll, 5),
+                        KeyCode::PageDown => scroll_down(&mut transcript_scroll, 5),
+                        KeyCode::Home => transcript_scroll = u16::MAX,
+                        KeyCode::End => transcript_scroll = 0,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let snapshot = pending_repl_snapshot(&pending_view);
         draw_repl_state(
             terminal,
             registry,
             &snapshot.messages,
+            Some(&snapshot),
             cwd,
             provider,
             active_model,
@@ -2443,8 +2690,11 @@ async fn run_agent_turns(
     };
 
     for step in 1..=MAX_AGENT_STEPS {
-        update_pending_repl_view(
+        let step_start_index = messages.len();
+        update_pending_repl_step_view(
             pending_view,
+            step,
+            step_start_index,
             messages,
             format!("waiting for response · step {step}"),
         );
@@ -2478,8 +2728,10 @@ async fn run_agent_turns(
                     );
                     let mut preview_messages = messages.clone();
                     preview_messages.push(preview_message);
-                    update_pending_repl_view(
+                    update_pending_repl_step_view(
                         pending_view,
+                        step,
+                        step_start_index,
                         &preview_messages,
                         format!("receiving response · step {step}"),
                     );
@@ -2498,8 +2750,10 @@ async fn run_agent_turns(
                     );
                     let mut preview_messages = messages.clone();
                     preview_messages.push(preview_message);
-                    update_pending_repl_view(
+                    update_pending_repl_step_view(
                         pending_view,
+                        step,
+                        step_start_index,
                         &preview_messages,
                         format!("running {tool_name}"),
                     );
@@ -2527,8 +2781,10 @@ async fn run_agent_turns(
         );
         store.append_message(session_id, &assistant_message).await?;
         messages.push(assistant_message.clone());
-        update_pending_repl_view(
+        update_pending_repl_step_view(
             pending_view,
+            step,
+            step_start_index,
             messages,
             if response_tool_calls.is_empty() {
                 format!("completed step {step}")
@@ -2542,7 +2798,13 @@ async fn run_agent_turns(
         }
 
         for call in response_tool_calls {
-            update_pending_repl_view(pending_view, messages, format!("running {}", call.name));
+            update_pending_repl_step_view(
+                pending_view,
+                step,
+                step_start_index,
+                messages,
+                format!("running {}", call.name),
+            );
             let input = serde_json::from_str(&call.input_json).unwrap_or_else(|_| json!({}));
             let output = tool_registry
                 .invoke(
@@ -2562,8 +2824,10 @@ async fn run_agent_turns(
             );
             store.append_message(session_id, &tool_message).await?;
             messages.push(tool_message);
-            update_pending_repl_view(
+            update_pending_repl_step_view(
                 pending_view,
+                step,
+                step_start_index,
                 messages,
                 if output.is_error {
                     format!("{} failed", call.name)
@@ -3821,7 +4085,7 @@ async fn run_interactive_repl(
     let mut vim_state = code_agent_ui::vim::VimState::default();
     let mut out = stdout();
     enable_raw_mode()?;
-    execute!(out, EnterAlternateScreen, Hide)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture, Hide)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -3869,6 +4133,7 @@ async fn run_interactive_repl(
                     &mut terminal,
                     registry,
                     raw_messages,
+                    None,
                     &cwd,
                     provider,
                     &active_model,
@@ -3899,6 +4164,47 @@ async fn run_interactive_repl(
             if let Event::Resize(width, height) = event {
                 terminal.resize(Rect::new(0, 0, width, height))?;
                 dirty = true;
+                continue;
+            }
+            if let Event::Mouse(mouse) = event {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        scroll_up(&mut transcript_scroll, 3);
+                        dirty = true;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        scroll_down(&mut transcript_scroll, 3);
+                        dirty = true;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(action) = repl_mouse_action(
+                            &terminal,
+                            registry,
+                            raw_messages,
+                            None,
+                            &cwd,
+                            provider,
+                            &active_model,
+                            session_id,
+                            &input_buffer,
+                            &status_line,
+                            None,
+                            active_pane,
+                            compact_banner.clone(),
+                            transcript_scroll,
+                            selected_command_suggestion,
+                            status_marquee_tick,
+                            &mouse,
+                        )? {
+                            match action {
+                                UiMouseAction::JumpToBottom => transcript_scroll = 0,
+                                UiMouseAction::ToggleTranscriptGroup(_) => {}
+                            }
+                            dirty = true;
+                        }
+                    }
+                    _ => {}
+                }
                 continue;
             }
             let Event::Key(key) = event else {
@@ -4075,7 +4381,7 @@ async fn run_interactive_repl(
                         let base_status_line = repl_status(provider, &active_model, session_id);
                         let active_model_display = active_model.clone();
                         let vim_state_display = vim_state.clone();
-                        let preview_messages = raw_messages.to_vec();
+                        let preview_messages = materialize_runtime_messages(raw_messages);
                         let pending_view = Arc::new(Mutex::new(PendingReplView::new(
                             preview_messages,
                             format!("running {}", invocation.name),
@@ -4137,8 +4443,9 @@ async fn run_interactive_repl(
                     }
 
                     let base_status_line = repl_status(provider, &active_model, session_id);
-                    let preview_messages =
-                        optimistic_messages_for_prompt(raw_messages, session_id, &prompt_text);
+                    let preview_messages = materialize_runtime_messages(
+                        &optimistic_messages_for_prompt(raw_messages, session_id, &prompt_text),
+                    );
                     let pending_view = Arc::new(Mutex::new(PendingReplView::new(
                         preview_messages,
                         "waiting for response",
@@ -4220,7 +4527,13 @@ async fn run_interactive_repl(
     .await;
 
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), Show, LeaveAlternateScreen).ok();
+    execute!(
+        terminal.backend_mut(),
+        Show,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .ok();
     loop_result
 }
 
@@ -4902,10 +5215,11 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{
         build_repl_ui_state, build_startup_screens, build_startup_ui_state, build_text_message,
-        choose_active_session, command_suggestions, handle_repl_slash_command, message_text,
-        pane_from_shortcut, render_auth_command_with_resume, render_remote_control_command,
-        resolve_continue_target, resolved_command_registry, should_exit_repl, ActiveSessionStore,
-        Cli, LocalBridgeHandler, Message, MessageRole, StartupPreferences,
+        build_tool_result_message, choose_active_session, command_suggestions,
+        handle_repl_slash_command, message_text, pane_from_shortcut,
+        render_auth_command_with_resume, render_remote_control_command, resolve_continue_target,
+        resolved_command_registry, should_exit_repl, ActiveSessionStore, Cli, LocalBridgeHandler,
+        Message, MessageRole, PendingReplStep, PendingReplView, StartupPreferences,
     };
     use code_agent_bridge::{
         base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
@@ -4918,7 +5232,7 @@ mod tests {
     use code_agent_providers::{
         ApiProvider, DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
     };
-    use code_agent_session::LocalSessionStore;
+    use code_agent_session::{materialize_runtime_messages, LocalSessionStore};
     use code_agent_tools::compatibility_tool_registry;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde::Deserialize;
@@ -5278,6 +5592,7 @@ mod tests {
             &app,
             &registry,
             &[],
+            None,
             Path::new("."),
             ApiProvider::ChatGPTCodex,
             DEFAULT_OPENAI_REASONING_MODEL,
@@ -5301,6 +5616,64 @@ mod tests {
             state.header_subtitle.as_deref(),
             Some("gpt-5.4 · chatgpt-codex")
         );
+    }
+
+    #[test]
+    fn build_repl_ui_state_groups_pending_steps() {
+        let app = code_agent_ui::RatatuiApp::new("repl");
+        let registry = compatibility_command_registry();
+        let session_id = SessionId::new_v4();
+        let user = build_text_message(session_id, MessageRole::User, "inspect".to_owned(), None);
+        let assistant = build_text_message(
+            session_id,
+            MessageRole::Assistant,
+            "calling list_dir".to_owned(),
+            Some(user.id),
+        );
+        let tool = build_tool_result_message(
+            session_id,
+            "tool-call-1".to_owned(),
+            "src\nCargo.toml".to_owned(),
+            false,
+            Some(assistant.id),
+        );
+        let messages = vec![user, assistant, tool];
+        let pending_view = PendingReplView {
+            messages: materialize_runtime_messages(&messages),
+            progress_label: "running list_dir".to_owned(),
+            steps: vec![PendingReplStep {
+                step: 1,
+                start_index: 1,
+                status_label: "running list_dir".to_owned(),
+                expanded: false,
+                touched: false,
+            }],
+        };
+
+        let state = build_repl_ui_state(
+            &app,
+            &registry,
+            &messages,
+            Some(&pending_view),
+            Path::new("."),
+            ApiProvider::ChatGPTCodex,
+            DEFAULT_OPENAI_REASONING_MODEL,
+            session_id,
+            &code_agent_ui::InputBuffer::new(),
+            "status",
+            Some("working".to_owned()),
+            code_agent_ui::PaneKind::Transcript,
+            None,
+            0,
+            Vec::new(),
+            0,
+            0,
+        );
+
+        assert_eq!(state.transcript_lines.len(), 1);
+        assert_eq!(state.transcript_groups.len(), 1);
+        assert!(state.transcript_groups[0].title.contains("Step 1"));
+        assert!(!state.transcript_groups[0].expanded);
     }
 
     #[tokio::test]
