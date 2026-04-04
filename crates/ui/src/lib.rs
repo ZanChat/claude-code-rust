@@ -1,7 +1,9 @@
 use anyhow::Result;
-use code_agent_core::{CommandSpec, ContentBlock, Message, MessageRole, TaskStatus};
+use code_agent_core::{
+    CommandSpec, ContentBlock, Message, MessageMetadata, MessageRole, TaskStatus,
+};
 use ratatui::backend::{Backend, TestBackend};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -19,6 +21,7 @@ const COMPACT_REPL_HEIGHT: u16 = 24;
 const STANDARD_INPUT_HEIGHT: u16 = 6;
 const COMPACT_INPUT_HEIGHT: u16 = 6;
 const MAX_VISIBLE_SUGGESTIONS: usize = 4;
+const MODAL_TRANSCRIPT_PEEK: u16 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InputBuffer {
@@ -110,17 +113,6 @@ impl PaneKind {
             Self::Logs => "Logs",
         }
     }
-
-    fn number(self) -> usize {
-        match self {
-            Self::Transcript => 1,
-            Self::Diff => 2,
-            Self::FileViewer => 3,
-            Self::Tasks => 4,
-            Self::Permissions => 5,
-            Self::Logs => 6,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -134,6 +126,7 @@ pub struct Notification {
 pub struct TranscriptLine {
     pub role: String,
     pub text: String,
+    pub author_label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -178,6 +171,7 @@ pub struct UiState {
     pub transcript_lines: Vec<TranscriptLine>,
     pub transcript_scroll: u16,
     pub status_line: String,
+    pub status_marquee_tick: usize,
     pub input_buffer: InputBuffer,
     pub prompt_helper: Option<String>,
     pub show_input: bool,
@@ -226,6 +220,7 @@ impl UiState {
                     })
                     .collect::<Vec<_>>()
                     .join(" "),
+                author_label: transcript_author_label(message),
             })
             .collect::<Vec<_>>();
 
@@ -441,6 +436,14 @@ fn overlay_kind(state: &UiState) -> Option<PaneKind> {
     }
 }
 
+fn pane_shortcut_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd+1-6"
+    } else {
+        "Ctrl+1-6"
+    }
+}
+
 fn truncate_middle(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -466,65 +469,6 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
     format!("{left}...{right}")
 }
 
-fn header_lines(state: &UiState, layout: LayoutMode, width: u16) -> Vec<Line<'static>> {
-    let width = width as usize;
-    let mode_label = if state.vim_state.is_insert() {
-        "insert"
-    } else {
-        "vim"
-    };
-    let overlay_label =
-        overlay_kind(state).map(|pane| format!("focus {}", pane.title().to_ascii_lowercase()));
-
-    if matches!(layout, LayoutMode::Compact) {
-        let overlay_width = overlay_label.as_ref().map_or(0, |label| label.len() + 2);
-        let status_width = width.saturating_sub(mode_label.len() + overlay_width + 4);
-        let mut status_line = vec![
-            Span::raw(truncate_middle(&state.status_line, status_width)),
-            Span::raw("  "),
-        ];
-        if let Some(label) = overlay_label {
-            status_line.push(Span::styled(label, Style::default().fg(Color::Green)));
-            status_line.push(Span::raw("  "));
-        }
-        status_line.push(Span::styled(
-            mode_label.to_owned(),
-            Style::default().fg(Color::Magenta),
-        ));
-        return vec![
-            Line::from(Span::styled(
-                "code-agent-rust",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(status_line),
-        ];
-    }
-
-    let overlay_width = overlay_label.as_ref().map_or(0, |label| label.len() + 2);
-    let reserved = "code-agent-rust".len() + mode_label.len() + overlay_width + 6;
-    let mut line = vec![
-        Span::styled(
-            "code-agent-rust",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::raw(truncate_middle(
-            &state.status_line,
-            width.saturating_sub(reserved),
-        )),
-        Span::raw("  "),
-    ];
-    if let Some(label) = overlay_label {
-        line.push(Span::styled(label, Style::default().fg(Color::Green)));
-        line.push(Span::raw("  "));
-    }
-    line.push(Span::styled(
-        mode_label.to_owned(),
-        Style::default().fg(Color::Magenta),
-    ));
-    vec![Line::from(line)]
-}
-
 fn role_style(role: &str) -> Style {
     match role {
         "user" => Style::default()
@@ -545,85 +489,141 @@ fn role_style(role: &str) -> Style {
     }
 }
 
-fn transcript_title(state: &UiState) -> String {
-    if state.transcript_lines.is_empty() {
-        "Transcript".to_owned()
-    } else if state.transcript_scroll > 0 {
-        format!(
-            "Transcript · {} entries · scroll {}",
-            state.transcript_lines.len(),
-            state.transcript_scroll
-        )
-    } else {
-        format!("Transcript · {} entries", state.transcript_lines.len())
+fn role_label(role: &str) -> &'static str {
+    match role {
+        "user" => "You",
+        "assistant" => "Assistant",
+        "tool" => "Tool",
+        "setup" => "Setup",
+        _ => "Info",
     }
 }
 
-fn transcript_widget(state: &UiState) -> Paragraph<'static> {
-    let lines =
-        if state.transcript_lines.is_empty() {
-            let mut lines = vec![
-                Line::from(Span::styled(
-                    "No transcript messages yet.",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from("Type a prompt below or start with / to browse commands."),
-            ];
-            if !state.command_palette.is_empty() {
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "Suggested commands",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                lines.extend(
-                    state.command_palette.iter().take(4).map(|entry| {
-                        Line::from(format!("{:<12} {}", entry.name, entry.description))
-                    }),
-                );
-            }
-            lines
-        } else {
-            state
-                .transcript_lines
-                .iter()
-                .map(|line| {
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{:>9} ", clip_line(&line.role.to_ascii_uppercase(), 9)),
-                            role_style(&line.role),
-                        ),
-                        Span::raw(line.text.clone()),
-                    ])
-                })
-                .collect::<Vec<_>>()
-        };
-
-    Paragraph::new(lines)
-        .scroll((state.transcript_scroll, 0))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(transcript_title(state))
-                .borders(Borders::ALL),
-        )
+fn transcript_author_label(message: &Message) -> Option<String> {
+    match message.role {
+        MessageRole::Assistant => Some(assistant_author_label(&message.metadata)),
+        _ => None,
+    }
 }
 
-fn preview_widget(preview: PanePreview) -> Paragraph<'static> {
-    let preview_lines = if preview.lines.is_empty() {
-        vec![Line::from("No details available.")]
+fn assistant_author_label(metadata: &MessageMetadata) -> String {
+    let model = metadata
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let channel = metadata
+        .attributes
+        .get("channel")
+        .map(String::as_str)
+        .or(metadata.provider.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (model, channel) {
+        (Some(model), Some(channel)) => format!("{model}({channel})"),
+        (Some(model), None) => model.to_owned(),
+        (None, Some(channel)) => format!("Assistant({channel})"),
+        (None, None) => "Assistant".to_owned(),
+    }
+}
+
+fn last_user_prompt_excerpt(state: &UiState, width: u16) -> Option<String> {
+    if state.transcript_scroll == 0 {
+        return None;
+    }
+
+    state
+        .transcript_lines
+        .iter()
+        .rev()
+        .find(|line| line.role == "user")
+        .map(|line| truncate_middle(&line.text, width.saturating_sub(4) as usize))
+}
+
+fn transcript_lines(state: &UiState) -> Vec<Line<'static>> {
+    if state.transcript_lines.is_empty() {
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "Start a conversation",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "Type a prompt below or start with / to browse commands.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        if !state.command_palette.is_empty() {
+            lines.push(Line::from(""));
+            lines.extend(state.command_palette.iter().take(4).map(|entry| {
+                Line::from(vec![
+                    Span::styled(entry.name.clone(), Style::default().fg(Color::Cyan)),
+                    Span::raw("  "),
+                    Span::styled(
+                        entry.description.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            }));
+        }
+        return lines;
+    }
+
+    state
+        .transcript_lines
+        .iter()
+        .map(|line| {
+            let label = line
+                .author_label
+                .as_deref()
+                .unwrap_or(role_label(&line.role));
+            Line::from(vec![
+                Span::styled(format!("{label}  "), role_style(&line.role)),
+                Span::raw(line.text.clone()),
+            ])
+        })
+        .collect()
+}
+
+fn transcript_widget(state: &UiState) -> Paragraph<'static> {
+    Paragraph::new(transcript_lines(state))
+        .scroll((state.transcript_scroll, 0))
+        .wrap(Wrap { trim: false })
+}
+
+fn sticky_prompt_widget(state: &UiState, width: u16) -> Option<Paragraph<'static>> {
+    let text = last_user_prompt_excerpt(state, width)?;
+    Some(
+        Paragraph::new(Line::from(vec![
+            Span::styled("▸ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(text, Style::default().fg(Color::White)),
+        ]))
+        .wrap(Wrap { trim: true })
+        .style(Style::default().bg(Color::DarkGray)),
+    )
+}
+
+fn scroll_pill_widget(state: &UiState) -> Option<Paragraph<'static>> {
+    if state.transcript_scroll == 0 {
+        return None;
+    }
+
+    let label = if state.transcript_scroll == 1 {
+        " Jump to bottom ".to_owned()
     } else {
-        preview
-            .lines
-            .iter()
-            .map(|line| Line::from(line.clone()))
-            .collect::<Vec<_>>()
+        format!(" Jump to bottom · {} lines up ", state.transcript_scroll)
     };
 
-    Paragraph::new(preview_lines)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().title(preview.title).borders(Borders::ALL))
+    Some(
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center),
+    )
 }
 
 fn task_status_style(status: &TaskStatus) -> (&'static str, Style) {
@@ -718,18 +718,8 @@ fn task_lines(state: &UiState, max_items: usize, detailed: bool) -> Vec<Line<'st
     lines
 }
 
-fn tasks_widget(state: &UiState, title: &str, detailed: bool) -> Paragraph<'static> {
-    Paragraph::new(task_lines(state, if detailed { 6 } else { 3 }, detailed))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(title.to_owned())
-                .borders(Borders::ALL),
-        )
-}
-
-fn permission_widget(state: &UiState, title: &str) -> Paragraph<'static> {
-    let lines = if let Some(prompt) = &state.permission_prompt {
+fn permission_lines(state: &UiState) -> Vec<Line<'static>> {
+    if let Some(prompt) = &state.permission_prompt {
         vec![
             Line::from(vec![
                 Span::styled(
@@ -748,22 +738,28 @@ fn permission_widget(state: &UiState, title: &str) -> Paragraph<'static> {
         ]
     } else {
         vec![Line::from("No pending permission prompts.")]
-    };
-
-    Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .title(title.to_owned())
-            .borders(Borders::ALL),
-    )
+    }
 }
 
 fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
+    if let Some(text) = &state.compact_banner {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "compact  ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(text.clone()),
+        ]));
+    }
+
     if let Some(progress) = &state.progress_message {
         lines.push(Line::from(vec![
             Span::styled(
-                "LIVE ",
+                "live  ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -816,28 +812,30 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
         if let Some(prompt) = &state.permission_prompt {
             lines.push(Line::from(vec![
                 Span::styled(
-                    "ASK  ",
+                    "wait  ",
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(prompt.summary.clone()),
             ]));
+        } else if let Some(notification) = state.notifications.back() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}  ", notification.title),
+                    notification.level.unwrap_or(StatusLevel::Info).style(),
+                ),
+                Span::raw(notification.body.clone()),
+            ]));
         }
     }
 
+    lines.truncate(2);
     lines
 }
 
 fn activity_widget(state: &UiState) -> Paragraph<'static> {
-    let title = if state.progress_message.is_some() {
-        "Live Turn"
-    } else {
-        "Activity"
-    };
-    Paragraph::new(activity_lines(state))
-        .wrap(Wrap { trim: false })
-        .block(Block::default().title(title).borders(Borders::ALL))
+    Paragraph::new(activity_lines(state)).wrap(Wrap { trim: false })
 }
 
 fn status_line(state: &UiState) -> Line<'static> {
@@ -881,57 +879,126 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
     count.max(1)
 }
 
-fn prompt_content_height(
+fn prompt_row_height(state: &UiState, width: u16) -> u16 {
+    let prompt_text = format!("> {}", state.input_buffer.as_str());
+    wrapped_line_count(&prompt_text, width)
+        .max(1)
+        .saturating_add(2)
+        .clamp(3, 6)
+}
+
+fn navigation_hint(active_pane: PaneKind, layout: LayoutMode, suggestions_visible: bool) -> String {
+    let suggestion_hint = if suggestions_visible {
+        "Up/Down choose"
+    } else {
+        "Up/Down scroll"
+    };
+    let focus_label = if matches!(active_pane, PaneKind::Transcript) {
+        "Transcript".to_owned()
+    } else {
+        format!("{} open", active_pane.title())
+    };
+
+    if matches!(layout, LayoutMode::Compact) {
+        format!(
+            "{focus_label}  {} panes  {suggestion_hint}",
+            pane_shortcut_label()
+        )
+    } else {
+        format!(
+            "{focus_label}  Tab cycle  {} panes  {suggestion_hint}  Ctrl-C exit",
+            pane_shortcut_label()
+        )
+    }
+}
+
+fn compose_footer_line(left: &str, right: &str, width: u16) -> Line<'static> {
+    let width = width as usize;
+    if width == 0 {
+        return Line::from(String::new());
+    }
+    if right.is_empty() {
+        return Line::from(truncate_middle(left, width));
+    }
+
+    let right = truncate_middle(right, width.saturating_sub(1));
+    let right_len = right.chars().count();
+    if right_len >= width {
+        return Line::from(right);
+    }
+
+    let left_max = width.saturating_sub(right_len + 1);
+    let left = truncate_middle(left, left_max);
+    let left_len = left.chars().count();
+    let gap = width.saturating_sub(left_len + right_len).max(1);
+    Line::from(format!("{left}{}{right}", " ".repeat(gap)))
+}
+
+fn marquee_text(text: &str, width: u16, tick: usize) -> String {
+    let width = width as usize;
+    if width == 0 {
+        return String::new();
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= width {
+        return text.to_owned();
+    }
+
+    let cycle_len = chars.len() + 3;
+    let mut looped = chars.clone();
+    looped.extend([' ', ' ', ' ']);
+    looped.extend(chars);
+    let start = tick % cycle_len;
+    looped
+        .into_iter()
+        .skip(start)
+        .take(width)
+        .collect::<String>()
+}
+
+fn footer_primary_text(state: &UiState, suggestions_visible: bool) -> String {
+    if state.vim_state.is_insert() {
+        return "-- INSERT --".to_owned();
+    }
+    if suggestions_visible {
+        return "Command suggestions".to_owned();
+    }
+    if state.permission_prompt.is_some() {
+        return "Waiting for permission".to_owned();
+    }
+    if state.progress_message.is_some() {
+        return "Working".to_owned();
+    }
+    if let Some(helper) = state.prompt_helper.as_deref() {
+        return helper.to_owned();
+    }
+    if state.input_buffer.is_empty() {
+        "Type a prompt or /command".to_owned()
+    } else {
+        "Enter to send".to_owned()
+    }
+}
+
+fn footer_widget(
     state: &UiState,
     active_pane: PaneKind,
     layout: LayoutMode,
     width: u16,
-) -> u16 {
-    let suggestions_visible = !state.command_suggestions.is_empty();
-    let helper = if let Some(helper) = state.prompt_helper.as_deref() {
-        helper.to_owned()
-    } else if suggestions_visible {
-        "Up/Down selects a command. Enter completes the selection first.".to_owned()
-    } else if state.input_buffer.is_empty() {
-        "Type a prompt or start with / to browse commands.".to_owned()
-    } else {
-        "Enter submits the prompt.".to_owned()
-    };
+    suggestions_visible: bool,
+) -> Paragraph<'static> {
+    let secondary_text = line_text(&status_line(state));
+    let primary = compose_footer_line(
+        &footer_primary_text(state, suggestions_visible),
+        &navigation_hint(active_pane, layout, suggestions_visible),
+        width,
+    );
+    let secondary = Line::from(Span::styled(
+        marquee_text(&secondary_text, width, state.status_marquee_tick),
+        Style::default().fg(Color::DarkGray),
+    ));
 
-    let prompt_text = format!("> {}", state.input_buffer.as_str());
-    let status = line_text(&status_line(state));
-    let navigation = navigation_hint(active_pane, layout, suggestions_visible);
-
-    wrapped_line_count(&prompt_text, width)
-        .saturating_add(wrapped_line_count(&helper, width))
-        .saturating_add(wrapped_line_count(&navigation, width))
-        .saturating_add(wrapped_line_count(&status, width))
-}
-
-fn navigation_hint(active_pane: PaneKind, layout: LayoutMode, suggestions_visible: bool) -> String {
-    let pane_shortcut = if cfg!(target_os = "macos") {
-        "Cmd+1-6"
-    } else {
-        "Ctrl+1-6"
-    };
-    let suggestion_hint = if suggestions_visible {
-        "Up/Down commands"
-    } else {
-        "Up/Down transcript"
-    };
-    let focus_label = if matches!(active_pane, PaneKind::Transcript) {
-        "focus transcript".to_owned()
-    } else {
-        format!("focus {} overlay", active_pane.title().to_ascii_lowercase())
-    };
-
-    if matches!(layout, LayoutMode::Compact) {
-        format!("{focus_label}  Tab cycle  {pane_shortcut}  {suggestion_hint}")
-    } else {
-        format!(
-            "{focus_label}  Tab/Shift-Tab cycle  {pane_shortcut}  {suggestion_hint}  Ctrl-C exit"
-        )
-    }
+    Paragraph::new(vec![primary, secondary]).wrap(Wrap { trim: false })
 }
 
 fn input_prompt_line(state: &UiState) -> Line<'static> {
@@ -958,32 +1025,10 @@ fn input_prompt_line(state: &UiState) -> Line<'static> {
     ])
 }
 
-fn input_widget(state: &UiState, active_pane: PaneKind, layout: LayoutMode) -> Paragraph<'static> {
-    let suggestions_visible = !state.command_suggestions.is_empty();
-    let helper = if let Some(helper) = state.prompt_helper.as_deref() {
-        helper.to_owned()
-    } else if suggestions_visible {
-        "Up/Down selects a command. Enter completes the selection first.".to_owned()
-    } else if state.input_buffer.is_empty() {
-        "Type a prompt or start with / to browse commands.".to_owned()
-    } else {
-        "Enter submits the prompt.".to_owned()
-    };
-
-    let status = status_line(state);
-    let lines = vec![
-        input_prompt_line(state),
-        Line::from(Span::styled(helper, Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled(
-            navigation_hint(active_pane, layout, suggestions_visible),
-            Style::default().fg(Color::DarkGray),
-        )),
-        status,
-    ];
-
-    Paragraph::new(lines)
+fn input_widget(state: &UiState) -> Paragraph<'static> {
+    Paragraph::new(vec![input_prompt_line(state)])
         .wrap(Wrap { trim: false })
-        .block(Block::default().title("Prompt").borders(Borders::ALL))
+        .block(Block::default().borders(Borders::TOP | Borders::BOTTOM))
 }
 
 fn command_suggestions_widget(state: &UiState) -> Paragraph<'static> {
@@ -1010,102 +1055,83 @@ fn command_suggestions_widget(state: &UiState) -> Paragraph<'static> {
         })
         .collect::<Vec<_>>();
 
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: true })
-        .block(Block::default().title("Suggestions").borders(Borders::ALL))
-}
-
-fn footer_lines(state: &UiState, active_pane: PaneKind, layout: LayoutMode) -> Vec<Line<'static>> {
-    vec![
-        status_line(state),
-        Line::from(navigation_hint(active_pane, layout, false)),
-    ]
+    Paragraph::new(lines).wrap(Wrap { trim: true })
 }
 
 fn overlay_title(kind: PaneKind, preview_title: &str) -> String {
-    let pane_label = format!("pane {}/{}", kind.number(), PaneKind::ALL.len());
     if preview_title.is_empty() || preview_title == kind.title() {
-        format!("{} · {}", kind.title(), pane_label)
+        kind.title().to_owned()
     } else {
-        format!("{preview_title} · {pane_label}")
+        format!("{} · {}", kind.title(), preview_title)
     }
 }
 
-fn overlay_line_count(state: &UiState, kind: PaneKind) -> usize {
+fn overlay_content_lines(state: &UiState, kind: PaneKind) -> Vec<Line<'static>> {
+    let preview = pane_preview(state, kind);
+    let mut lines = vec![Line::from(Span::styled(
+        overlay_title(kind, &preview.title),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    lines.push(Line::from(""));
+
     match kind {
-        PaneKind::Tasks => task_lines(state, 6, true).len(),
-        PaneKind::Permissions => {
-            if state.permission_prompt.is_some() {
-                3
+        PaneKind::Tasks => lines.extend(task_lines(state, 8, true)),
+        PaneKind::Permissions => lines.extend(permission_lines(state)),
+        _ => {
+            if preview.lines.is_empty() {
+                lines.push(Line::from("No details available."));
             } else {
-                1
+                lines.extend(preview.lines.into_iter().map(Line::from));
             }
         }
-        _ => pane_preview(state, kind).lines.len().max(1),
     }
+
+    lines
 }
 
-fn overlay_rect(body_area: Rect, layout: LayoutMode, desired_lines: usize) -> Option<Rect> {
-    if body_area.width < 28 || body_area.height < 8 {
+fn overlay_rect(area: Rect, desired_lines: usize) -> Option<Rect> {
+    if area.width < 28 || area.height < 8 {
         return None;
     }
 
-    let max_height = body_area.height.saturating_sub(2);
-    if max_height < 6 {
+    let max_height = area.height.saturating_sub(MODAL_TRANSCRIPT_PEEK);
+    if max_height < 5 {
         return None;
     }
 
-    let preferred_height = (desired_lines as u16).saturating_add(2).max(6);
-    let height_cap = if matches!(layout, LayoutMode::Compact) {
-        max_height.min(10)
-    } else {
-        max_height.min((body_area.height / 2).max(12))
-    };
-    let height = preferred_height.min(height_cap.max(6));
-
-    let max_width = body_area
-        .width
-        .saturating_sub(if matches!(layout, LayoutMode::Compact) {
-            2
-        } else {
-            5
-        });
-    if max_width < 26 {
-        return None;
-    }
-
-    let width = if matches!(layout, LayoutMode::Compact) {
-        max_width
-    } else {
-        ((body_area.width.saturating_mul(45)) / 100)
-            .clamp(38, 58)
-            .min(max_width)
-    };
-
-    let x = if matches!(layout, LayoutMode::Compact) {
-        body_area.x + 1
-    } else {
-        body_area.x + body_area.width.saturating_sub(width + 2)
-    };
-    let y = body_area.y + body_area.height.saturating_sub(height + 1);
-    Some(Rect::new(x, y, width, height))
+    let preferred_height = (desired_lines as u16).saturating_add(3).max(6);
+    let height = preferred_height.min(max_height);
+    let y = area.y + area.height.saturating_sub(height);
+    Some(Rect::new(area.x, y, area.width, height))
 }
 
-fn render_overlay(frame: &mut Frame<'_>, state: &UiState, body_area: Rect, layout: LayoutMode) {
+fn render_overlay(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     let Some(kind) = overlay_kind(state) else {
         return;
     };
-    let Some(area) = overlay_rect(body_area, layout, overlay_line_count(state, kind)) else {
+    let lines = overlay_content_lines(state, kind);
+    let Some(sheet_area) = overlay_rect(area, lines.len()) else {
         return;
     };
 
-    let preview = pane_preview(state, kind);
-    let title = overlay_title(kind, &preview.title);
-    frame.render_widget(Clear, area);
-    match kind {
-        PaneKind::Tasks => frame.render_widget(tasks_widget(state, &title, true), area),
-        PaneKind::Permissions => frame.render_widget(permission_widget(state, &title), area),
-        _ => frame.render_widget(preview_widget(PanePreview { title, ..preview }), area),
+    let divider_area = Rect::new(sheet_area.x, sheet_area.y, sheet_area.width, 1);
+    let content_area = Rect::new(
+        sheet_area.x.saturating_add(2),
+        sheet_area.y.saturating_add(1),
+        sheet_area.width.saturating_sub(4),
+        sheet_area.height.saturating_sub(1),
+    );
+    frame.render_widget(Clear, sheet_area);
+    frame.render_widget(
+        Paragraph::new(Line::from("▔".repeat(sheet_area.width as usize)))
+            .style(Style::default().fg(Color::Yellow)),
+        divider_area,
+    );
+    if content_area.width > 0 && content_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            content_area,
+        );
     }
 }
 
@@ -1142,9 +1168,43 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     frame.render_widget(notice, area);
 }
 
-fn render_body(frame: &mut Frame<'_>, state: &UiState, body_area: Rect, layout: LayoutMode) {
-    frame.render_widget(transcript_widget(state), body_area);
-    render_overlay(frame, state, body_area, layout);
+fn render_body(frame: &mut Frame<'_>, state: &UiState, body_area: Rect) {
+    if body_area.width == 0 || body_area.height == 0 {
+        return;
+    }
+
+    let (header_area, transcript_area) =
+        if sticky_prompt_widget(state, body_area.width).is_some() && body_area.height > 1 {
+            (
+                Some(Rect::new(body_area.x, body_area.y, body_area.width, 1)),
+                Rect::new(
+                    body_area.x,
+                    body_area.y.saturating_add(1),
+                    body_area.width,
+                    body_area.height.saturating_sub(1),
+                ),
+            )
+        } else {
+            (None, body_area)
+        };
+
+    if let Some(area) = header_area {
+        if let Some(widget) = sticky_prompt_widget(state, area.width) {
+            frame.render_widget(widget, area);
+        }
+    }
+    if transcript_area.width > 0 && transcript_area.height > 0 {
+        frame.render_widget(transcript_widget(state), transcript_area);
+        if let Some(pill) = scroll_pill_widget(state) {
+            let pill_area = Rect::new(
+                transcript_area.x,
+                transcript_area.y + transcript_area.height.saturating_sub(1),
+                transcript_area.width,
+                1,
+            );
+            frame.render_widget(pill, pill_area);
+        }
+    }
 }
 
 fn render_frame(frame: &mut Frame<'_>, state: &UiState) {
@@ -1155,148 +1215,158 @@ fn render_frame(frame: &mut Frame<'_>, state: &UiState) {
         return;
     }
 
-    let header_height = if matches!(layout, LayoutMode::Compact) {
-        2
+    let active_pane = state.active_pane_or_default();
+    let overlay_visible = overlay_kind(state).is_some();
+    let suggestions_visible =
+        state.show_input && !overlay_visible && !state.command_suggestions.is_empty();
+    let footer_width = area.width.saturating_sub(4);
+    let mut activity_height = if state.show_input && !overlay_visible && !suggestions_visible {
+        activity_lines(state).len().min(2) as u16
     } else {
-        1
+        0
     };
-    let mut constraints = vec![Constraint::Length(header_height)];
-    if state.compact_banner.is_some() {
-        constraints.push(Constraint::Length(1));
-    }
-    let body_min_height = if state.show_input {
-        6
+    let mut suggestion_height = if suggestions_visible {
+        state.command_suggestions.len().min(MAX_VISIBLE_SUGGESTIONS) as u16
+    } else {
+        0
+    };
+    let prompt_height = if state.show_input {
+        prompt_row_height(state, area.width.saturating_sub(2)).max(
+            if matches!(layout, LayoutMode::Compact) {
+                COMPACT_INPUT_HEIGHT.saturating_sub(3)
+            } else {
+                STANDARD_INPUT_HEIGHT.saturating_sub(3)
+            },
+        )
+    } else {
+        0
+    };
+    let mut footer_height = if state.show_input { 2 } else { 1 };
+    let transcript_min_height = if state.show_input {
+        if matches!(layout, LayoutMode::Compact) {
+            5
+        } else {
+            6
+        }
     } else if matches!(layout, LayoutMode::Compact) {
         7
     } else {
         8
     };
-    constraints.push(Constraint::Min(body_min_height));
-    let activity_height = if state.show_input {
-        let lines = activity_lines(state);
-        if lines.is_empty() {
-            0
-        } else {
-            let max_height = if matches!(layout, LayoutMode::Compact) {
-                6
-            } else {
-                8
-            };
-            ((lines.len() as u16).saturating_add(2)).min(max_height)
-        }
-    } else {
-        0
-    };
+
     if state.show_input {
-        let base_input_height = if matches!(layout, LayoutMode::Compact) {
-            COMPACT_INPUT_HEIGHT
-        } else {
-            STANDARD_INPUT_HEIGHT
-        };
-        let active_pane = state.active_pane_or_default();
-        let prompt_width = area.width.saturating_sub(2);
-        let content_height = prompt_content_height(state, active_pane, layout, prompt_width);
-        let input_height = content_height.saturating_add(2).max(base_input_height).min(
-            if matches!(layout, LayoutMode::Compact) {
-                11
-            } else {
-                12
-            },
-        );
-        let banner_height = u16::from(state.compact_banner.is_some());
-        let reserved =
-            header_height + banner_height + body_min_height + activity_height + input_height;
-        let available_for_suggestions = area.height.saturating_sub(reserved);
-        let max_suggestion_height =
-            (state.command_suggestions.len().min(MAX_VISIBLE_SUGGESTIONS) as u16).saturating_add(2);
-        let suggestion_height = if available_for_suggestions >= 3 {
-            available_for_suggestions.min(max_suggestion_height)
-        } else {
-            0
-        };
+        let max_reserved = area.height.saturating_sub(transcript_min_height);
+        while activity_height + suggestion_height + prompt_height + footer_height > max_reserved {
+            if suggestion_height > 0 {
+                suggestion_height -= 1;
+                continue;
+            }
+            if activity_height > 0 {
+                activity_height -= 1;
+                continue;
+            }
+            if footer_height > 1 {
+                footer_height -= 1;
+                continue;
+            }
+            break;
+        }
+    }
+
+    let vertical = if state.show_input {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(transcript_min_height),
+                Constraint::Length(activity_height),
+                Constraint::Length(suggestion_height),
+                Constraint::Length(prompt_height),
+                Constraint::Length(footer_height),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(transcript_min_height),
+                Constraint::Length(footer_height),
+            ])
+            .split(area)
+    };
+
+    let body_area = vertical[0];
+    render_body(frame, state, body_area);
+
+    if state.show_input {
+        let activity_area = vertical[1];
+        let suggestion_area = vertical[2];
+        let input_area = vertical[3];
+        let footer_area = vertical[4];
 
         if activity_height > 0 {
-            constraints.push(Constraint::Length(activity_height));
+            let inner = Rect::new(
+                activity_area.x.saturating_add(2),
+                activity_area.y,
+                activity_area.width.saturating_sub(4),
+                activity_area.height,
+            );
+            if inner.width > 0 && inner.height > 0 {
+                frame.render_widget(activity_widget(state), inner);
+            }
         }
         if suggestion_height > 0 {
-            constraints.push(Constraint::Length(suggestion_height));
+            frame.render_widget(Clear, suggestion_area);
+            let inner = Rect::new(
+                suggestion_area.x.saturating_add(2),
+                suggestion_area.y,
+                suggestion_area.width.saturating_sub(4),
+                suggestion_area.height,
+            );
+            if inner.width > 0 && inner.height > 0 {
+                frame.render_widget(command_suggestions_widget(state), inner);
+            }
         }
-        constraints.push(Constraint::Length(input_height));
-    } else {
-        constraints.push(Constraint::Length(2));
-    }
-
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
-
-    let mut index = 0;
-    let header_area = vertical[index];
-    index += 1;
-    let banner_area = if state.compact_banner.is_some() {
-        let area = vertical[index];
-        index += 1;
-        Some(area)
-    } else {
-        None
-    };
-    let body_area = vertical[index];
-    index += 1;
-    let activity_area = if state.show_input && activity_height > 0 {
-        let area = vertical[index];
-        index += 1;
-        Some(area)
-    } else {
-        None
-    };
-    let active_pane = state.active_pane_or_default();
-    let footer_area = if state.show_input {
-        None
-    } else {
-        Some(vertical[index])
-    };
-    let suggestion_area = if state.show_input && vertical.len() > index + 1 {
-        Some(vertical[index])
-    } else {
-        None
-    };
-    let input_area = if state.show_input {
-        vertical[vertical.len() - 1]
-    } else {
-        footer_area.expect("footer area must exist when prompt is hidden")
-    };
-
-    let header =
-        Paragraph::new(header_lines(state, layout, header_area.width)).wrap(Wrap { trim: true });
-    frame.render_widget(header, header_area);
-
-    if let (Some(area), Some(text)) = (banner_area, state.compact_banner.as_deref()) {
-        let banner = Paragraph::new(Line::from(vec![
-            Span::styled("banner ", Style::default().fg(Color::Yellow)),
-            Span::raw(text.to_owned()),
-        ]))
-        .wrap(Wrap { trim: true });
-        frame.render_widget(banner, area);
-    }
-
-    render_body(frame, state, body_area, layout);
-
-    if state.show_input {
-        if let Some(area) = activity_area {
-            frame.render_widget(activity_widget(state), area);
+        frame.render_widget(input_widget(state), input_area);
+        let footer_inner = Rect::new(
+            footer_area.x.saturating_add(2),
+            footer_area.y,
+            footer_area.width.saturating_sub(4),
+            footer_area.height,
+        );
+        if footer_inner.width > 0 && footer_inner.height > 0 {
+            frame.render_widget(
+                footer_widget(
+                    state,
+                    active_pane,
+                    layout,
+                    footer_width,
+                    suggestions_visible,
+                ),
+                footer_inner,
+            );
         }
-        if let Some(area) = suggestion_area {
-            frame.render_widget(command_suggestions_widget(state), area);
-        }
-        frame.render_widget(input_widget(state, active_pane, layout), input_area);
     } else {
-        if let Some(area) = footer_area {
-            let footer =
-                Paragraph::new(footer_lines(state, active_pane, layout)).wrap(Wrap { trim: true });
-            frame.render_widget(footer, area);
+        let footer_area = vertical[1];
+        let footer_inner = Rect::new(
+            footer_area.x.saturating_add(2),
+            footer_area.y,
+            footer_area.width.saturating_sub(4),
+            footer_area.height,
+        );
+        if footer_inner.width > 0 && footer_inner.height > 0 {
+            frame.render_widget(
+                Paragraph::new(vec![compose_footer_line(
+                    &line_text(&status_line(state)),
+                    pane_shortcut_label(),
+                    footer_width,
+                )])
+                .wrap(Wrap { trim: false }),
+                footer_inner,
+            );
         }
     }
+
+    render_overlay(frame, state, area);
 }
 
 pub fn draw_terminal<B: Backend>(terminal: &mut Terminal<B>, state: &UiState) -> Result<()> {
@@ -1335,8 +1405,7 @@ mod tests {
 
         let rendered = render_to_string(&state, 100, 24).unwrap();
 
-        assert!(rendered.contains("Transcript"));
-        assert!(rendered.contains("No transcript messages yet."));
+        assert!(rendered.contains("Start a conversation"));
         assert!(rendered.contains("/help") || rendered.contains("/clear"));
     }
 
@@ -1354,9 +1423,9 @@ mod tests {
 
         let rendered = render_to_string(&state, 100, 24).unwrap();
 
-        assert!(rendered.contains("Permission: bash") || rendered.contains("Permissions"));
+        assert!(rendered.contains("Permissions"));
+        assert!(rendered.contains("bash"));
         assert!(rendered.contains("Approve once"));
-        assert!(rendered.contains("auto compact applied"));
     }
 
     #[test]
@@ -1385,17 +1454,11 @@ mod tests {
 
         let rendered = render_to_string(&state, 100, 24).unwrap();
 
-        assert!(rendered.contains("pane 2/6"));
+        assert!(rendered.contains("Diff"));
         assert!(rendered.contains("Diff preview"));
         assert!(rendered.contains("src/main.rs"));
         assert!(rendered.contains("old line"));
         assert!(rendered.contains("new line"));
-        let pane_shortcut = if cfg!(target_os = "macos") {
-            "Cmd+1-6"
-        } else {
-            "Ctrl+1-6"
-        };
-        assert!(rendered.contains(pane_shortcut));
     }
 
     #[test]
@@ -1404,6 +1467,7 @@ mod tests {
         state.transcript_lines = vec![super::TranscriptLine {
             role: "user".to_owned(),
             text: "This layout should collapse cleanly when the terminal is narrow.".to_owned(),
+            author_label: None,
         }];
         state.show_input = true;
         state.task_preview.title = "Setup".to_owned();
@@ -1412,9 +1476,9 @@ mod tests {
 
         let rendered = render_to_string(&state, 60, 24).unwrap();
 
-        assert!(rendered.contains("pane 4/6"));
+        assert!(rendered.contains("Tasks"));
         assert!(rendered.contains("Check auth"));
-        assert!(rendered.contains("Prompt"));
+        assert!(rendered.contains("Add CLAUDE.md"));
     }
 
     #[test]
@@ -1456,9 +1520,8 @@ mod tests {
 
         let rendered = render_to_string(&state, 100, 26).unwrap();
 
-        assert!(rendered.contains("Prompt"));
-        assert!(rendered.contains("Suggestions"));
         assert!(rendered.contains("/help"));
+        assert!(rendered.contains("/hooks"));
     }
 
     #[test]
@@ -1468,22 +1531,44 @@ mod tests {
             super::TranscriptLine {
                 role: "user".to_owned(),
                 text: "line one".to_owned(),
+                author_label: None,
             },
             super::TranscriptLine {
                 role: "assistant".to_owned(),
                 text: "line two".to_owned(),
+                author_label: None,
             },
             super::TranscriptLine {
                 role: "assistant".to_owned(),
                 text: "line three".to_owned(),
+                author_label: None,
             },
         ];
         state.transcript_scroll = 2;
 
         let rendered = render_to_string(&state, 80, 12).unwrap();
 
-        assert!(!rendered.contains("line one"));
+        assert!(rendered.contains("Jump to bottom"));
+        assert!(rendered.contains("line one"));
         assert!(rendered.contains("line three"));
+    }
+
+    #[test]
+    fn assistant_rows_use_model_and_channel_author_label() {
+        let mut assistant = Message::new(
+            MessageRole::Assistant,
+            vec![ContentBlock::Text {
+                text: "Ready".to_owned(),
+            }],
+        );
+        assistant.metadata.model = Some("gemini-3.1-pro-preview".to_owned());
+        assistant.metadata.provider = Some("openai-compatible".to_owned());
+
+        let state = RatatuiApp::new("authors")
+            .state_from_messages(vec![assistant], &compatibility_command_registry().all());
+        let rendered = render_to_string(&state, 100, 24).unwrap();
+
+        assert!(rendered.contains("gemini-3.1-pro-preview(openai-compatible)"));
     }
 
     #[test]
@@ -1491,11 +1576,12 @@ mod tests {
         let mut state = RatatuiApp::new("error").initial_state();
         state.show_input = true;
         state.status_line = "chatgpt-codex · gpt-5.4 · s:12345678 · error: ChatGPT Codex request failed with status 400 Bad Request: body.input.0.call_id: Field required".to_owned();
+        let initial = render_to_string(&state, 80, 24).unwrap();
 
-        let rendered = render_to_string(&state, 80, 24).unwrap();
+        state.status_marquee_tick = 56;
+        let scrolled = render_to_string(&state, 80, 24).unwrap();
 
-        assert!(rendered.contains("Prompt"));
-        assert!(rendered.contains("call_id"));
-        assert!(rendered.contains("Field required"));
+        assert!(initial.contains("chatgpt-codex"));
+        assert!(scrolled.contains("call_id") || scrolled.contains("Field required"));
     }
 }

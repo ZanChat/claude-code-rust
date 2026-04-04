@@ -81,6 +81,7 @@ struct Cli {
     voice_text: Option<String>,
     voice_file: Option<PathBuf>,
     voice_format: Option<String>,
+    continue_latest: bool,
     resume: Option<String>,
     clear_session: Option<String>,
     tool: Option<String>,
@@ -172,6 +173,15 @@ struct AuthCommandReport {
     auth_source: Option<String>,
     hint: Option<String>,
     snapshot_path: Option<PathBuf>,
+    resume_session_id: Option<SessionId>,
+    resume_transcript_path: Option<PathBuf>,
+    resume_command: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ResumeTargetHint {
+    session_id: SessionId,
+    transcript_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -351,6 +361,7 @@ fn parse_cli() -> Cli {
             "--list-sessions" => cli.list_sessions = true,
             "--tui" => cli.tui = true,
             "--repl" => cli.repl = true,
+            "-c" | "--continue" => cli.continue_latest = true,
             "--plugin-root" => cli.plugin_root = args.next().map(PathBuf::from),
             "--show-plugin" => cli.show_plugin = true,
             "--list-skills" => cli.list_skills = true,
@@ -371,7 +382,7 @@ fn parse_cli() -> Cli {
             "--input" => cli.input = args.next(),
             "--help" | "-h" => {
                 println!(
-                    "Usage: code-agent-rust [--provider NAME] [--model NAME] [--resume TARGET] [--list-sessions] [--tool NAME --input JSON] [--tui|--repl] [--voice-text TEXT|--voice-file PATH] [--bridge-server ADDR|tcp://ADDR --bridge-connect URL|tcp://ADDR] [prompt]"
+                    "Usage: code-agent-rust [--provider NAME] [--model NAME] [-c|--continue] [--resume TARGET] [--list-sessions] [--tool NAME --input JSON] [--tui|--repl] [--voice-text TEXT|--voice-file PATH] [--bridge-server ADDR|tcp://ADDR --bridge-connect URL|tcp://ADDR] [prompt]"
                 );
                 println!("Slash commands such as '/help', '/resume <session>', '/clear', '/compact', '/model', and '/config' are supported.");
                 std::process::exit(0);
@@ -711,6 +722,10 @@ fn should_exit_repl(prompt_text: &str) -> bool {
     matches!(prompt_text.trim(), "quit" | "exit" | "/quit" | "/exit")
 }
 
+fn status_line_needs_marquee(status_line: &str) -> bool {
+    status_line.chars().count() > 96
+}
+
 fn build_startup_ui_state(
     app: &RatatuiApp,
     provider: ApiProvider,
@@ -729,13 +744,14 @@ fn build_startup_ui_state(
     state.show_input = true;
     state.prompt_helper =
         Some("Type to enter the REPL immediately. Enter also continues.".to_owned());
-    state.active_pane = Some(PaneKind::Tasks);
+    state.active_pane = Some(PaneKind::Transcript);
     state.transcript_lines = screen
         .body
         .iter()
         .map(|line| TranscriptLine {
             role: "setup".to_owned(),
             text: line.clone(),
+            author_label: None,
         })
         .collect();
     state.transcript_scroll = transcript_scroll;
@@ -822,23 +838,27 @@ fn run_startup_flow<B: ratatui::backend::Backend>(
     Ok(code_agent_ui::InputBuffer::new())
 }
 
+async fn resolve_continue_target(cli: &mut Cli, store: &ActiveSessionStore) -> Result<()> {
+    if cli.resume.is_some() || !cli.continue_latest {
+        return Ok(());
+    }
+
+    let summary = store
+        .list_sessions()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("No conversation found to continue"))?;
+    cli.resume = Some(summary.session_id.to_string());
+    Ok(())
+}
+
 fn choose_active_session(
-    cli: &Cli,
-    listed_sessions: &[SessionSummary],
+    _cli: &Cli,
     explicit_resume: Option<(SessionId, PathBuf, Vec<Message>)>,
 ) -> Result<(SessionId, Option<PathBuf>, Vec<Message>)> {
     if let Some((session_id, path, messages)) = explicit_resume {
         return Ok((session_id, Some(path), messages));
-    }
-
-    if cli.prompt.is_empty() {
-        if let Some(summary) = listed_sessions.first() {
-            return Ok((
-                summary.session_id,
-                Some(summary.transcript_path.clone()),
-                Vec::new(),
-            ));
-        }
     }
 
     Ok((Uuid::new_v4(), None, Vec::new()))
@@ -1430,6 +1450,7 @@ fn build_repl_ui_state(
     transcript_scroll: u16,
     command_suggestions: Vec<CommandPaletteEntry>,
     selected_command_suggestion: usize,
+    status_marquee_tick: usize,
 ) -> code_agent_ui::UiState {
     let runtime_messages = materialize_runtime_messages(raw_messages);
     let mut state = app.state_from_messages(runtime_messages.clone(), &registry.all());
@@ -1447,6 +1468,7 @@ fn build_repl_ui_state(
     } else {
         Some(selected_command_suggestion.min(state.command_suggestions.len() - 1))
     };
+    state.status_marquee_tick = status_marquee_tick;
     state.task_items = task_items;
     state.question_items = question_items;
     state.task_preview = recent_task_preview(cwd);
@@ -1489,6 +1511,7 @@ fn draw_repl_state(
     transcript_scroll: u16,
     selected_command_suggestion: &mut usize,
     vim_state: &code_agent_ui::vim::VimState,
+    status_marquee_tick: usize,
 ) -> Result<()> {
     let suggestions = sync_command_selection(registry, input_buffer, selected_command_suggestion);
     let app = RatatuiApp::new(format!("{provider}  {active_model}"));
@@ -1505,6 +1528,7 @@ fn draw_repl_state(
         transcript_scroll,
         suggestions,
         *selected_command_suggestion,
+        status_marquee_tick,
     );
     state.vim_state = vim_state.clone();
     draw_tui(terminal, &state)
@@ -1586,6 +1610,7 @@ where
             transcript_scroll,
             &mut selected_command_suggestion,
             vim_state,
+            tick,
         )?;
 
         tokio::select! {
@@ -2412,6 +2437,40 @@ async fn execute_local_turn(
 }
 
 async fn render_auth_command(provider: ApiProvider, action: &str) -> Result<String> {
+    render_auth_command_with_resume(provider, action, None).await
+}
+
+fn resume_command_for_session(session_id: SessionId) -> String {
+    format!("code-agent-rust --resume {session_id}")
+}
+
+async fn latest_resume_hint(store: &ActiveSessionStore) -> Result<Option<ResumeTargetHint>> {
+    Ok(store
+        .list_sessions()
+        .await?
+        .into_iter()
+        .next()
+        .map(|summary| ResumeTargetHint {
+            session_id: summary.session_id,
+            transcript_path: summary.transcript_path,
+        }))
+}
+
+async fn current_resume_hint(
+    store: &ActiveSessionStore,
+    session_id: SessionId,
+) -> Result<ResumeTargetHint> {
+    Ok(ResumeTargetHint {
+        session_id,
+        transcript_path: store.transcript_path(session_id).await?,
+    })
+}
+
+async fn render_auth_command_with_resume(
+    provider: ApiProvider,
+    action: &str,
+    resume_hint: Option<ResumeTargetHint>,
+) -> Result<String> {
     match action {
         "login" => {
             let resolver = EnvironmentAuthResolver;
@@ -2438,6 +2497,9 @@ async fn render_auth_command(provider: ApiProvider, action: &str) -> Result<Stri
                 auth_source: auth.source,
                 hint: Some(auth_hint_for_provider(provider)),
                 snapshot_path,
+                resume_session_id: None,
+                resume_transcript_path: None,
+                resume_command: None,
             })?)
         }
         "logout" => Ok(serde_json::to_string_pretty(&AuthCommandReport {
@@ -2450,6 +2512,13 @@ async fn render_auth_command(provider: ApiProvider, action: &str) -> Result<Stri
             auth_source: None,
             hint: Some(auth_hint_for_provider(provider)),
             snapshot_path: Some(code_agent_auth_snapshot_path()),
+            resume_session_id: resume_hint.as_ref().map(|hint| hint.session_id),
+            resume_transcript_path: resume_hint
+                .as_ref()
+                .map(|hint| hint.transcript_path.clone()),
+            resume_command: resume_hint
+                .as_ref()
+                .map(|hint| resume_command_for_session(hint.session_id)),
         })?),
         other => Err(anyhow!("unsupported auth action: {other}")),
     }
@@ -3389,7 +3458,9 @@ async fn handle_repl_slash_command(
                 return Ok(format!("current model={active_model}"));
             };
             let catalog = compatibility_model_catalog(provider);
-            if catalog.get_model(model).is_none() {
+            if !matches!(provider, ApiProvider::OpenAICompatible)
+                && catalog.get_model(model).is_none()
+            {
                 return Ok(format!("unknown compatibility model: {model}"));
             }
             *active_model = model.clone();
@@ -3427,7 +3498,10 @@ async fn handle_repl_slash_command(
         "resume" => Ok("restart with --resume to switch transcripts".to_owned()),
         "session" => render_session_command(store, session_id).await,
         "login" => render_auth_command(provider, "login").await,
-        "logout" => render_auth_command(provider, "logout").await,
+        "logout" => {
+            let resume_hint = current_resume_hint(store, session_id).await?;
+            render_auth_command_with_resume(provider, "logout", Some(resume_hint)).await
+        }
         "permissions" => render_permissions_command(cwd).await,
         "plugin" => render_plugin_command(&invocation, plugin_root, cwd).await,
         "skills" => render_skills_command(cwd, plugin_root).await,
@@ -3576,6 +3650,7 @@ async fn run_interactive_repl(
         let mut input_buffer = initial_input_buffer;
         let mut transcript_scroll = 0u16;
         let mut status_line = repl_status(provider, &active_model, session_id);
+        let mut status_marquee_tick = 0usize;
         let mut active_pane = PaneKind::Transcript;
         let mut selected_command_suggestion = 0usize;
         let mut compact_banner = None;
@@ -3597,11 +3672,21 @@ async fn run_interactive_repl(
                     transcript_scroll,
                     &mut selected_command_suggestion,
                     &vim_state,
+                    status_marquee_tick,
                 )?;
                 dirty = false;
             }
 
-            let event = event::read()?;
+            let event = if status_line_needs_marquee(&status_line) {
+                if !event::poll(Duration::from_millis(160))? {
+                    status_marquee_tick = status_marquee_tick.wrapping_add(1);
+                    dirty = true;
+                    continue;
+                }
+                event::read()?
+            } else {
+                event::read()?
+            };
             if let Event::Resize(width, height) = event {
                 terminal.resize(Rect::new(0, 0, width, height))?;
                 dirty = true;
@@ -3820,6 +3905,7 @@ async fn run_interactive_repl(
                                     repl_status(provider, &active_model, session_id),
                                     &next_status,
                                 );
+                                status_marquee_tick = 0;
                                 if next_status.starts_with("compacted ") {
                                     compact_banner = Some(next_status.clone());
                                 }
@@ -3829,6 +3915,7 @@ async fn run_interactive_repl(
                                     repl_status(provider, &active_model, session_id),
                                     format!("error: {error}"),
                                 );
+                                status_marquee_tick = 0;
                             }
                         }
                         dirty = true;
@@ -3882,12 +3969,14 @@ async fn run_interactive_repl(
                                 repl_status(provider, &active_model, session_id),
                                 detail,
                             );
+                            status_marquee_tick = 0;
                         }
                         Err(error) => {
                             status_line = status_with_detail(
                                 repl_status(provider, &active_model, session_id),
                                 format!("error: {error}"),
                             );
+                            status_marquee_tick = 0;
                         }
                     }
                     dirty = true;
@@ -4094,7 +4183,15 @@ async fn handle_slash_command(
             println!("{}", render_auth_command(provider, "login").await?);
         }
         "logout" => {
-            println!("{}", render_auth_command(provider, "logout").await?);
+            println!(
+                "{}",
+                render_auth_command_with_resume(
+                    provider,
+                    "logout",
+                    latest_resume_hint(&store).await?,
+                )
+                .await?
+            );
         }
         "plugin" => {
             println!(
@@ -4250,7 +4347,7 @@ async fn load_plugin_report(root: PathBuf) -> Result<PluginReport> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let cli = parse_cli();
+    let mut cli = parse_cli();
     let provider = resolve_api_provider(cli.provider.as_deref())?;
     let cwd = env::current_dir()?;
     let project_dir = get_project_dir(&cwd);
@@ -4303,6 +4400,8 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&parsed)?);
         return Ok(());
     }
+
+    resolve_continue_target(&mut cli, &store).await?;
 
     if let Some(address) = cli.bridge_connect.clone() {
         let session_id = cli
@@ -4377,13 +4476,8 @@ async fn main() -> Result<()> {
         Some(target) => Some(store.load_resume_target(target).await?),
         None => None,
     };
-    let listed_sessions = if cli.resume.is_some() {
-        Vec::new()
-    } else {
-        store.list_sessions().await.unwrap_or_default()
-    };
     let (session_id, transcript_path, mut existing_messages) =
-        choose_active_session(&cli, &listed_sessions, explicit_resume)?;
+        choose_active_session(&cli, explicit_resume)?;
     let active_model = cli
         .model
         .clone()
@@ -4578,9 +4672,10 @@ async fn main() -> Result<()> {
 mod tests {
     use super::{
         build_repl_ui_state, build_startup_screens, build_startup_ui_state, build_text_message,
-        command_suggestions, handle_repl_slash_command, message_text, pane_from_shortcut,
-        render_remote_control_command, resolved_command_registry, should_exit_repl,
-        ActiveSessionStore, Cli, LocalBridgeHandler, Message, MessageRole, StartupPreferences,
+        choose_active_session, command_suggestions, handle_repl_slash_command, message_text,
+        pane_from_shortcut, render_auth_command_with_resume, render_remote_control_command,
+        resolve_continue_target, resolved_command_registry, should_exit_repl, ActiveSessionStore,
+        Cli, LocalBridgeHandler, Message, MessageRole, StartupPreferences,
     };
     use code_agent_bridge::{
         base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
@@ -4740,6 +4835,7 @@ mod tests {
             state.prompt_helper.as_deref(),
             Some("Type to enter the REPL immediately. Enter also continues.")
         );
+        assert_eq!(state.active_pane, Some(code_agent_ui::PaneKind::Transcript));
     }
 
     #[test]
@@ -4792,6 +4888,84 @@ mod tests {
         assert!(!should_exit_repl("please exit"));
     }
 
+    #[tokio::test]
+    async fn continue_flag_resolves_latest_session_explicitly() {
+        let root = temp_session_root("continue-latest");
+        let store = ActiveSessionStore::Local(LocalSessionStore::new(root));
+        let session_id = SessionId::new_v4();
+        let persisted =
+            build_text_message(session_id, MessageRole::User, "resume me".to_owned(), None);
+        store.append_message(session_id, &persisted).await.unwrap();
+
+        let mut cli = Cli::default();
+        resolve_continue_target(&mut cli, &store).await.unwrap();
+        assert!(cli.resume.is_none());
+
+        cli.continue_latest = true;
+        resolve_continue_target(&mut cli, &store).await.unwrap();
+        assert_eq!(cli.resume, Some(session_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn continue_flag_errors_when_no_session_exists() {
+        let store =
+            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("continue-none")));
+        let mut cli = Cli {
+            continue_latest: true,
+            ..Cli::default()
+        };
+
+        let error = resolve_continue_target(&mut cli, &store).await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("No conversation found to continue"));
+    }
+
+    #[test]
+    fn choose_active_session_starts_new_session_without_explicit_resume() {
+        let cli = Cli::default();
+
+        let (session_id, transcript_path, messages) = choose_active_session(&cli, None).unwrap();
+
+        assert!(transcript_path.is_none());
+        assert!(messages.is_empty());
+        assert_ne!(session_id, SessionId::nil());
+    }
+
+    #[tokio::test]
+    async fn logout_report_includes_resume_command() {
+        let store =
+            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("logout-resume")));
+        let session_id = SessionId::new_v4();
+        let report = render_auth_command_with_resume(
+            ApiProvider::ChatGPTCodex,
+            "logout",
+            Some(super::ResumeTargetHint {
+                session_id,
+                transcript_path: store.transcript_path(session_id).await.unwrap(),
+            }),
+        )
+        .await
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&report).unwrap();
+
+        assert_eq!(
+            output
+                .get("resume_session_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned),
+            Some(session_id.to_string())
+        );
+        assert_eq!(
+            output
+                .get("resume_command")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned),
+            Some(format!("code-agent-rust --resume {session_id}"))
+        );
+    }
+
     #[test]
     fn build_repl_ui_state_handles_empty_command_suggestions() {
         let app = code_agent_ui::RatatuiApp::new("repl");
@@ -4809,6 +4983,7 @@ mod tests {
             None,
             0,
             Vec::new(),
+            0,
             0,
         );
 
@@ -4929,6 +5104,45 @@ mod tests {
         .unwrap();
 
         assert_eq!(active_model, DEFAULT_OPENAI_COMPLETION_MODEL);
+        assert!(status.contains("model switched"));
+    }
+
+    #[tokio::test]
+    async fn repl_model_command_accepts_openai_compatible_custom_model() {
+        let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
+            "repl-model-openai-compatible",
+        )));
+        let tool_registry = compatibility_tool_registry();
+        let root = env::temp_dir();
+        let registry = resolved_command_registry(&root, None).await;
+        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+        let session_id = SessionId::new_v4();
+        let mut raw_messages = Vec::new();
+        let mut vim_state = code_agent_ui::vim::VimState::default();
+
+        let status = handle_repl_slash_command(
+            &registry,
+            CommandInvocation {
+                name: "model".to_owned(),
+                args: vec!["gemini-3.1-pro-preview".to_owned()],
+                raw_input: "/model gemini-3.1-pro-preview".to_owned(),
+            },
+            &store,
+            &tool_registry,
+            &root,
+            None,
+            ApiProvider::OpenAICompatible,
+            &mut active_model,
+            session_id,
+            &mut raw_messages,
+            true,
+            &mut vim_state,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(active_model, "gemini-3.1-pro-preview");
         assert!(status.contains("model switched"));
     }
 

@@ -634,9 +634,47 @@ impl HttpProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<Box<dyn ProviderStream>> {
+        if matches!(self.provider, ApiProvider::OpenAICompatible)
+            && openai_compatible_uses_chat_completions(&self.base_url)
+        {
+            let url = join_if_missing(&self.base_url, "chat/completions");
+            return self
+                .start_openai_chat_completions_stream(url, request)
+                .await;
+        }
         let url = join_if_missing(&self.base_url, "responses");
         self.send_openai_responses_request(url, request, true, true)
             .await
+    }
+
+    async fn start_openai_chat_completions_stream(
+        &self,
+        url: String,
+        request: ProviderRequest,
+    ) -> Result<Box<dyn ProviderStream>> {
+        let payload = build_openai_chat_completions_payload(&request);
+        let response = self
+            .client
+            .post(&url)
+            .headers(self.openai_headers(&request.extra_headers)?)
+            .json(&payload)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "{} request failed with status {}: {}",
+                openai_request_failure_label(self.provider),
+                status,
+                compact_error_body(&body)
+            ));
+        }
+
+        let value: Value = serde_json::from_str(&body)?;
+        Ok(Box::new(StaticProviderStream::new(
+            events_from_openai_chat_response(&value)?,
+        )))
     }
 
     async fn start_chatgpt_codex_stream(
@@ -1128,6 +1166,16 @@ fn env_value<const N: usize>(names: [&str; N]) -> Option<String> {
     names
         .into_iter()
         .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+}
+
+fn openai_compatible_uses_chat_completions(base_url: &str) -> bool {
+    if env_flag_truthy("OPENAI_COMPAT_CHAT_COMPLETIONS") {
+        return true;
+    }
+
+    base_url
+        .to_ascii_lowercase()
+        .contains("generativelanguage.googleapis.com")
 }
 
 fn resolve_provider_model(provider: ApiProvider, model: &str) -> String {
@@ -1716,6 +1764,127 @@ fn build_openai_responses_payload(
     }
 
     payload
+}
+
+fn build_openai_chat_completions_payload(request: &ProviderRequest) -> Value {
+    let mut payload = json!({
+        "model": request.model,
+        "messages": openai_chat_messages(&request.messages),
+        "stream": false,
+    });
+
+    if request.thinking != ThinkingConfig::Disabled {
+        payload["reasoning_effort"] = Value::String(resolve_reasoning_effort(&request.model));
+    }
+
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        payload["max_completion_tokens"] = Value::Number(max_output_tokens.into());
+    }
+
+    if !request.tools.is_empty() {
+        payload["tools"] = Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.input_schema,
+                        }
+                    })
+                })
+                .collect(),
+        );
+        payload["tool_choice"] = Value::String("auto".to_owned());
+    }
+
+    payload
+}
+
+fn openai_chat_messages(messages: &[Message]) -> Vec<Value> {
+    let mut encoded = Vec::new();
+
+    for message in messages {
+        match message.role {
+            MessageRole::System => {
+                let text = message_text(message);
+                if !text.trim().is_empty() {
+                    encoded.push(json!({
+                        "role": "system",
+                        "content": text,
+                    }));
+                }
+            }
+            MessageRole::User => {
+                let text = message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        ContentBlock::Attachment { attachment } => {
+                            Some(format!("[Attachment omitted: {}]", attachment.name))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.trim().is_empty() {
+                    encoded.push(json!({
+                        "role": "user",
+                        "content": text,
+                    }));
+                }
+            }
+            MessageRole::Assistant => {
+                let mut item = json!({
+                    "role": "assistant",
+                });
+                let text = message_text(message);
+                if !text.trim().is_empty() {
+                    item["content"] = Value::String(text);
+                }
+                let tool_calls = message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolCall { call } => Some(json!({
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.input_json,
+                            }
+                        })),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if !tool_calls.is_empty() {
+                    item["tool_calls"] = Value::Array(tool_calls);
+                }
+                if item.get("content").is_some() || item.get("tool_calls").is_some() {
+                    encoded.push(item);
+                }
+            }
+            MessageRole::Tool => {
+                for result in message.blocks.iter().filter_map(|block| match block {
+                    ContentBlock::ToolResult { result } => Some(result),
+                    _ => None,
+                }) {
+                    encoded.push(json!({
+                        "role": "tool",
+                        "tool_call_id": result.tool_call_id,
+                        "content": result.output_text,
+                    }));
+                }
+            }
+            MessageRole::Attachment => {}
+        }
+    }
+
+    encoded
 }
 
 fn openai_responses_input(messages: &[Message]) -> Vec<Value> {
@@ -2962,34 +3131,66 @@ pub fn compatibility_models_for(provider: ApiProvider) -> Vec<ModelMetadata> {
             },
         ],
         ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
-            vec![
-                ModelMetadata {
-                    id: DEFAULT_OPENAI_REASONING_MODEL.to_owned(),
-                    provider: provider.to_string(),
-                    context_window: Some(200_000),
-                    max_output_tokens: Some(32_000),
-                    supports_tool_use: true,
-                    supports_reasoning: true,
-                },
-                ModelMetadata {
-                    id: DEFAULT_OPENAI_COMPLETION_MODEL.to_owned(),
-                    provider: provider.to_string(),
-                    context_window: Some(128_000),
-                    max_output_tokens: Some(16_000),
-                    supports_tool_use: true,
-                    supports_reasoning: false,
-                },
-                ModelMetadata {
-                    id: "codex-mini-latest".to_owned(),
-                    provider: provider.to_string(),
-                    context_window: Some(128_000),
-                    max_output_tokens: Some(16_000),
-                    supports_tool_use: true,
-                    supports_reasoning: true,
-                },
-            ]
+            openai_family_compatibility_models(provider)
         }
     }
+}
+
+fn openai_family_compatibility_models(provider: ApiProvider) -> Vec<ModelMetadata> {
+    let provider_name = provider.to_string();
+    let mut models = Vec::new();
+    let mut push_unique = |model: ModelMetadata| {
+        if models
+            .iter()
+            .any(|existing: &ModelMetadata| existing.id == model.id)
+        {
+            return;
+        }
+        models.push(model);
+    };
+
+    push_unique(ModelMetadata {
+        id: get_openai_reasoning_model(),
+        provider: provider_name.clone(),
+        context_window: Some(200_000),
+        max_output_tokens: Some(32_000),
+        supports_tool_use: true,
+        supports_reasoning: true,
+    });
+    push_unique(ModelMetadata {
+        id: get_openai_completion_model(),
+        provider: provider_name.clone(),
+        context_window: Some(128_000),
+        max_output_tokens: Some(16_000),
+        supports_tool_use: true,
+        supports_reasoning: false,
+    });
+    push_unique(ModelMetadata {
+        id: DEFAULT_OPENAI_REASONING_MODEL.to_owned(),
+        provider: provider_name.clone(),
+        context_window: Some(200_000),
+        max_output_tokens: Some(32_000),
+        supports_tool_use: true,
+        supports_reasoning: true,
+    });
+    push_unique(ModelMetadata {
+        id: DEFAULT_OPENAI_COMPLETION_MODEL.to_owned(),
+        provider: provider_name.clone(),
+        context_window: Some(128_000),
+        max_output_tokens: Some(16_000),
+        supports_tool_use: true,
+        supports_reasoning: false,
+    });
+    push_unique(ModelMetadata {
+        id: "codex-mini-latest".to_owned(),
+        provider: provider_name,
+        context_window: Some(128_000),
+        max_output_tokens: Some(16_000),
+        supports_tool_use: true,
+        supports_reasoning: true,
+    });
+
+    models
 }
 
 pub fn compatibility_model_catalog(provider: ApiProvider) -> StaticModelCatalog {
@@ -3556,6 +3757,37 @@ mod tests {
         assert!(descriptor.supports_tool_use);
         assert!(catalog.get_model(DEFAULT_OPENAI_REASONING_MODEL).is_some());
         assert!(catalog.get_model(DEFAULT_OPENAI_COMPLETION_MODEL).is_some());
+    }
+
+    #[test]
+    fn openai_compatibility_catalog_honours_env_models() {
+        with_env_lock(|| {
+            with_env_var("REASONING_MODEL", Some("gemini-3.1-pro-preview"), || {
+                with_env_var("COMPLETION_MODEL", Some("gemini-3.1-flash"), || {
+                    let catalog = compatibility_model_catalog(ApiProvider::OpenAICompatible);
+                    let listed = catalog
+                        .list_models()
+                        .into_iter()
+                        .map(|model| model.id)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        listed.first().map(String::as_str),
+                        Some("gemini-3.1-pro-preview")
+                    );
+                    assert!(listed.iter().any(|model| model == "gemini-3.1-flash"));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn detects_gemini_openai_compatible_chat_completions_mode() {
+        assert!(super::openai_compatible_uses_chat_completions(
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        ));
+        assert!(!super::openai_compatible_uses_chat_completions(
+            "https://compat.example/v1"
+        ));
     }
 
     #[test]
