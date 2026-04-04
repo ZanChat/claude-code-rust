@@ -8,10 +8,9 @@ use code_agent_bridge::{
 use code_agent_core::{
     compatibility_command_registry, coordinator_tasks, create_coordinator_synthesis_task,
     create_coordinator_task, create_coordinator_worker_task, resume_tasks_for_question,
-    update_task_record, AppEvent, BoundaryKind, CommandInvocation, CommandRegistry,
-    CommandSource, CommandSpec, ContentBlock, LocalTaskStore as CoreLocalTaskStore, Message,
-    MessageRole, QuestionRequest, QuestionResponse, SessionId, TaskRecord, TaskStatus,
-    TaskStore,
+    update_task_record, AppEvent, BoundaryKind, CommandInvocation, CommandRegistry, CommandSource,
+    CommandSpec, ContentBlock, LocalTaskStore as CoreLocalTaskStore, Message, MessageRole,
+    QuestionRequest, QuestionResponse, SessionId, TaskRecord, TaskStatus, TaskStore,
 };
 use code_agent_mcp::parse_mcp_server_configs;
 use code_agent_plugins::{
@@ -25,29 +24,34 @@ use code_agent_providers::{
     ProviderToolDefinition,
 };
 use code_agent_session::{
-    agent_transcript_path_for, compact_messages, estimate_message_tokens,
+    agent_transcript_path_for, claude_config_home_dir, compact_messages, estimate_message_tokens,
     extract_last_json_string_field, get_project_dir, import_transcript_to_session_root,
     materialize_runtime_messages, CompactionConfig, CompactionOutcome, JsonlTranscriptCodec,
     LocalSessionStore, ProjectSessionStore, SessionStore, SessionSummary, TranscriptCodec,
 };
 use code_agent_tools::{compatibility_tool_registry, ToolCallRequest, ToolContext, ToolRegistry};
 use code_agent_ui::{
-    render_to_string as render_tui_to_string, Notification, PaneKind, PanePreview,
-    PermissionPromptState, RatatuiApp, StatusLevel,
+    draw_terminal as draw_tui, render_to_string as render_tui_to_string, CommandPaletteEntry,
+    Notification, PaneKind, PanePreview, PermissionPromptState, QuestionUiEntry, RatatuiApp,
+    StatusLevel, TaskUiEntry, TranscriptLine, UiState,
 };
-use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, size as terminal_size, Clear, ClearType,
-    EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, size as terminal_size, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
-use crossterm::{execute, queue};
-use serde::Serialize;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui::Terminal;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::{stdout, Write};
+use std::future::Future;
+use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -188,6 +192,18 @@ struct ResponseCommandReport {
     responses: Vec<QuestionResponse>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StartupPreferences {
+    welcome_seen: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StartupScreen {
+    title: String,
+    body: Vec<String>,
+    preview: PanePreview,
+}
+
 enum ActiveSessionStore {
     Local(LocalSessionStore),
     Project(ProjectSessionStore),
@@ -269,10 +285,7 @@ fn command_report(spec: &CommandSpec) -> CommandReport {
     }
 }
 
-async fn resolved_command_registry(
-    cwd: &Path,
-    plugin_root: Option<&PathBuf>,
-) -> CommandRegistry {
+async fn resolved_command_registry(cwd: &Path, plugin_root: Option<&PathBuf>) -> CommandRegistry {
     let mut registry = compatibility_command_registry();
     let runtime = OutOfProcessPluginRuntime;
     let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
@@ -283,14 +296,11 @@ async fn resolved_command_registry(
 }
 
 fn session_preview(messages: &[Message]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find_map(|message| {
-            let text = message_text(message);
-            let trimmed = text.trim();
-            (!trimmed.is_empty()).then(|| preview_lines_from_text(trimmed.to_owned(), 1, 72).join(" "))
-        })
+    messages.iter().rev().find_map(|message| {
+        let text = message_text(message);
+        let trimmed = text.trim();
+        (!trimmed.is_empty()).then(|| preview_lines_from_text(trimmed.to_owned(), 1, 72).join(" "))
+    })
 }
 
 fn auth_hint_for_provider(provider: ApiProvider) -> String {
@@ -400,6 +410,416 @@ fn prompt_preview(messages: &[Message]) -> Vec<String> {
             format!("{:?}: {}", message.role, text)
         })
         .collect()
+}
+
+fn shorten_middle(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let left_len = (max_chars - 3) / 2;
+    let right_len = max_chars - 3 - left_len;
+    let left = text.chars().take(left_len).collect::<String>();
+    let right = text
+        .chars()
+        .rev()
+        .take(right_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{left}...{right}")
+}
+
+fn shorten_path(path: &Path, max_chars: usize) -> String {
+    shorten_middle(&path.display().to_string(), max_chars)
+}
+
+fn short_session_id(session_id: SessionId) -> String {
+    session_id
+        .to_string()
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn repl_status(provider: ApiProvider, active_model: &str, session_id: SessionId) -> String {
+    format!(
+        "{provider} · {active_model} · s:{}",
+        short_session_id(session_id)
+    )
+}
+
+fn status_with_detail(base: String, detail: impl AsRef<str>) -> String {
+    let detail = detail.as_ref().trim();
+    if detail.is_empty() {
+        return base;
+    }
+
+    format!("{base} · {detail}")
+}
+
+fn workspace_is_empty(cwd: &Path) -> bool {
+    fs::read_dir(cwd)
+        .ok()
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+}
+
+fn startup_preferences_path() -> PathBuf {
+    claude_config_home_dir()
+        .join("code-agent-rust")
+        .join("startup.json")
+}
+
+fn load_startup_preferences() -> StartupPreferences {
+    let path = startup_preferences_path();
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<StartupPreferences>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_startup_preferences(preferences: &StartupPreferences) -> Result<()> {
+    let path = startup_preferences_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(preferences)?)?;
+    Ok(())
+}
+
+fn friendly_auth_source(source: Option<&str>) -> String {
+    match source {
+        Some("codex_auth_token") => "Codex refreshable token".to_owned(),
+        Some("codex_auth_api_key") => "Codex API key".to_owned(),
+        Some("OPENAI_API_KEY") => "OPENAI_API_KEY".to_owned(),
+        Some("ANTHROPIC_API_KEY") => "ANTHROPIC_API_KEY".to_owned(),
+        Some("CLAUDE_CODE_OAUTH_TOKEN") => "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
+        Some("ANTHROPIC_AUTH_TOKEN") => "ANTHROPIC_AUTH_TOKEN".to_owned(),
+        Some("ambient_cloud_auth") => "ambient cloud auth".to_owned(),
+        Some(other) => other.replace('_', " "),
+        None => "not configured".to_owned(),
+    }
+}
+
+fn project_onboarding_lines(cwd: &Path) -> Vec<String> {
+    if workspace_is_empty(cwd) {
+        return vec![
+            "The workspace is empty.".to_owned(),
+            "Start by asking the agent to create a new app or clone an existing repository."
+                .to_owned(),
+        ];
+    }
+
+    if !cwd.join("CLAUDE.md").exists() {
+        return vec![
+            "This project does not have a CLAUDE.md file yet.".to_owned(),
+            "Add one with repository-specific instructions, workflows, and validation commands."
+                .to_owned(),
+        ];
+    }
+
+    Vec::new()
+}
+
+fn build_startup_screens(
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    cwd: &Path,
+    session_root: &Path,
+    transcript_path: Option<&Path>,
+    live_runtime: bool,
+    auth_source: Option<&str>,
+    preferences: &StartupPreferences,
+) -> Vec<StartupScreen> {
+    let mut screens = Vec::new();
+    let auth_summary = if live_runtime {
+        format!("ready via {}", friendly_auth_source(auth_source))
+    } else {
+        format!("offline: {}", friendly_auth_source(auth_source))
+    };
+
+    if !preferences.welcome_seen {
+        let transcript_label = transcript_path
+            .map(|path| shorten_path(path, 44))
+            .unwrap_or_else(|| "new session".to_owned());
+        screens.push(StartupScreen {
+            title: "Welcome".to_owned(),
+            body: vec![
+                "This REPL is now using a native ratatui runtime with adaptive terminal layouts."
+                    .to_owned(),
+                format!("Provider: {provider}"),
+                format!("Model: {active_model}"),
+                format!("Auth: {auth_summary}"),
+            ],
+            preview: PanePreview {
+                title: "Runtime".to_owned(),
+                lines: vec![
+                    format!("session: {}", short_session_id(session_id)),
+                    format!("cwd: {}", shorten_path(cwd, 44)),
+                    format!("session root: {}", shorten_path(session_root, 44)),
+                    format!("transcript: {transcript_label}"),
+                ],
+            },
+        });
+    }
+
+    let mut setup_lines = Vec::new();
+    if !live_runtime {
+        setup_lines.push(format!(
+            "Live provider access is not configured yet. {}",
+            auth_hint_for_provider(provider)
+        ));
+    }
+    setup_lines.extend(project_onboarding_lines(cwd));
+
+    if !setup_lines.is_empty() {
+        let migration = config_migration_report(provider);
+        let mut preview_lines = vec![format!(
+            "auth source: {}",
+            friendly_auth_source(auth_source)
+        )];
+        if let Some(path) = migration.codex_auth_path {
+            preview_lines.push(format!("codex auth: {}", shorten_path(&path, 44)));
+        }
+        if let Some(path) = migration.auth_snapshot_path {
+            preview_lines.push(format!("snapshot: {}", shorten_path(&path, 44)));
+        }
+        preview_lines.push("commands: /help /config /login /model".to_owned());
+
+        screens.push(StartupScreen {
+            title: "Setup Checklist".to_owned(),
+            body: setup_lines,
+            preview: PanePreview {
+                title: "Next Steps".to_owned(),
+                lines: preview_lines,
+            },
+        });
+    }
+
+    screens
+}
+
+fn startup_command_palette() -> Vec<CommandPaletteEntry> {
+    vec![
+        CommandPaletteEntry {
+            name: "/help".to_owned(),
+            description: "Show the available REPL commands.".to_owned(),
+        },
+        CommandPaletteEntry {
+            name: "/config".to_owned(),
+            description: "Inspect the current runtime configuration.".to_owned(),
+        },
+        CommandPaletteEntry {
+            name: "/login".to_owned(),
+            description: "Authenticate against the active provider.".to_owned(),
+        },
+        CommandPaletteEntry {
+            name: "/model".to_owned(),
+            description: "Inspect or switch the active model.".to_owned(),
+        },
+    ]
+}
+
+fn command_palette_entries(registry: &CommandRegistry) -> Vec<CommandPaletteEntry> {
+    registry
+        .all()
+        .iter()
+        .map(|command| CommandPaletteEntry {
+            name: format!("/{}", command.name),
+            description: command.description.clone(),
+        })
+        .collect()
+}
+
+fn slash_command_query(input_buffer: &code_agent_ui::InputBuffer) -> Option<String> {
+    let text = input_buffer.as_str();
+    if !text.starts_with('/') {
+        return None;
+    }
+
+    let first_token = text.split_whitespace().next().unwrap_or_default();
+    if first_token.is_empty() || !first_token.starts_with('/') {
+        return None;
+    }
+    if text.contains(char::is_whitespace) && text.trim() != first_token {
+        return None;
+    }
+
+    Some(first_token.trim_start_matches('/').to_ascii_lowercase())
+}
+
+fn command_suggestions(
+    registry: &CommandRegistry,
+    input_buffer: &code_agent_ui::InputBuffer,
+) -> Vec<CommandPaletteEntry> {
+    let Some(query) = slash_command_query(input_buffer) else {
+        return Vec::new();
+    };
+
+    let mut exact_matches = Vec::new();
+    let mut prefix_matches = Vec::new();
+    for entry in command_palette_entries(registry) {
+        let command = entry.name.trim_start_matches('/').to_ascii_lowercase();
+        if query.is_empty() || command == query {
+            exact_matches.push(entry);
+        } else if command.starts_with(&query) {
+            prefix_matches.push(entry);
+        }
+    }
+    exact_matches.extend(prefix_matches);
+    exact_matches
+}
+
+fn sync_command_selection(
+    registry: &CommandRegistry,
+    input_buffer: &code_agent_ui::InputBuffer,
+    selected_index: &mut usize,
+) -> Vec<CommandPaletteEntry> {
+    let suggestions = command_suggestions(registry, input_buffer);
+    if suggestions.is_empty() || *selected_index >= suggestions.len() {
+        *selected_index = 0;
+    }
+    suggestions
+}
+
+fn apply_selected_command(
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    entry: &CommandPaletteEntry,
+) {
+    input_buffer.replace(format!("{} ", entry.name));
+}
+
+fn scroll_up(scroll: &mut u16, amount: u16) {
+    *scroll = scroll.saturating_sub(amount);
+}
+
+fn scroll_down(scroll: &mut u16, amount: u16) {
+    *scroll = scroll.saturating_add(amount);
+}
+
+fn should_exit_repl(prompt_text: &str) -> bool {
+    matches!(prompt_text.trim(), "quit" | "exit" | "/quit" | "/exit")
+}
+
+fn build_startup_ui_state(
+    app: &RatatuiApp,
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    screens: &[StartupScreen],
+    index: usize,
+    transcript_scroll: u16,
+) -> UiState {
+    let screen = &screens[index];
+    let mut state = app.initial_state();
+    state.status_line = status_with_detail(
+        repl_status(provider, active_model, session_id),
+        format!("setup {}/{}", index + 1, screens.len()),
+    );
+    state.show_input = true;
+    state.prompt_helper =
+        Some("Type to enter the REPL immediately. Enter also continues.".to_owned());
+    state.active_pane = Some(PaneKind::Tasks);
+    state.transcript_lines = screen
+        .body
+        .iter()
+        .map(|line| TranscriptLine {
+            role: "setup".to_owned(),
+            text: line.clone(),
+        })
+        .collect();
+    state.transcript_scroll = transcript_scroll;
+    state.transcript_preview = PanePreview {
+        title: screen.title.clone(),
+        lines: screen.body.clone(),
+    };
+    state.task_preview = screen.preview.clone();
+    state.command_palette = startup_command_palette();
+    state.compact_banner = Some(if index + 1 == screens.len() {
+        "Type to start the REPL. Enter also continues.".to_owned()
+    } else {
+        "Type to start the REPL now, or Enter for the next screen.".to_owned()
+    });
+    state
+}
+
+fn run_startup_flow<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    screens: &[StartupScreen],
+) -> Result<code_agent_ui::InputBuffer> {
+    if screens.is_empty() {
+        return Ok(code_agent_ui::InputBuffer::new());
+    }
+
+    let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+    let mut index = 0usize;
+    let mut transcript_scroll = 0u16;
+
+    loop {
+        let state = build_startup_ui_state(
+            &app,
+            provider,
+            active_model,
+            session_id,
+            screens,
+            index,
+            transcript_scroll,
+        );
+        draw_tui(terminal, &state)?;
+
+        match event::read()? {
+            Event::Resize(width, height) => {
+                terminal.resize(Rect::new(0, 0, width, height))?;
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Tab => {
+                    if index + 1 >= screens.len() {
+                        break;
+                    }
+                    index += 1;
+                }
+                KeyCode::Left | KeyCode::BackTab => {
+                    index = index.saturating_sub(1);
+                }
+                KeyCode::Up | KeyCode::PageUp => {
+                    scroll_up(&mut transcript_scroll, 1);
+                }
+                KeyCode::Down | KeyCode::PageDown => {
+                    scroll_down(&mut transcript_scroll, 1);
+                }
+                KeyCode::Home => {
+                    transcript_scroll = 0;
+                }
+                KeyCode::End => {
+                    transcript_scroll = u16::MAX;
+                }
+                KeyCode::Esc => break,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::Char(ch) if key.modifiers.is_empty() => {
+                    let mut input_buffer = code_agent_ui::InputBuffer::new();
+                    input_buffer.push(ch);
+                    return Ok(input_buffer);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    Ok(code_agent_ui::InputBuffer::new())
 }
 
 fn choose_active_session(
@@ -764,7 +1184,11 @@ fn message_text(message: &Message) -> String {
     message_text_blocks(message).join("\n")
 }
 
-fn preview_lines_from_text(text: impl Into<String>, max_lines: usize, max_width: usize) -> Vec<String> {
+fn preview_lines_from_text(
+    text: impl Into<String>,
+    max_lines: usize,
+    max_width: usize,
+) -> Vec<String> {
     let mut lines = Vec::new();
     for line in text.into().lines() {
         let trimmed = line.trim_end();
@@ -809,6 +1233,22 @@ fn pane_from_digit(ch: char) -> Option<PaneKind> {
     Some(PaneKind::ALL[index - 1])
 }
 
+fn pane_from_shortcut(key: &crossterm::event::KeyEvent) -> Option<PaneKind> {
+    let shortcut_modifier = if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::CONTROL
+    };
+    if !key.modifiers.contains(shortcut_modifier) {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char(ch) => pane_from_digit(ch),
+        _ => None,
+    }
+}
+
 fn recent_task_preview(cwd: &Path) -> PanePreview {
     let store = task_store_for(cwd);
     match store.list_tasks() {
@@ -821,14 +1261,7 @@ fn recent_task_preview(cwd: &Path) -> PanePreview {
                 .into_iter()
                 .rev()
                 .take(6)
-                .map(|task| {
-                    format!(
-                        "{:?} {} [{}]",
-                        task.status,
-                        task.title,
-                        task.kind
-                    )
-                })
+                .map(|task| format!("{:?} {} [{}]", task.status, task.title, task.kind))
                 .collect::<Vec<_>>();
             PanePreview {
                 title: "Tasks".to_owned(),
@@ -859,6 +1292,39 @@ fn recent_question_preview(cwd: &Path) -> Option<PanePreview> {
     }
 }
 
+fn load_task_ui_data(cwd: &Path) -> (Vec<TaskUiEntry>, Vec<QuestionUiEntry>) {
+    let store = task_store_for(cwd);
+    let tasks = store
+        .list_tasks()
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .take(8)
+        .map(|task| TaskUiEntry {
+            title: task.title,
+            kind: task.kind,
+            status: task.status,
+            input: task.input,
+            output: task.output,
+        })
+        .collect::<Vec<_>>();
+
+    let questions = store
+        .list_questions()
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .take(3)
+        .map(|question| QuestionUiEntry {
+            prompt: question.prompt,
+            choices: question.choices,
+            task_title: None,
+        })
+        .collect::<Vec<_>>();
+
+    (tasks, questions)
+}
+
 fn preview_for_last_file_message(messages: &[Message], cwd: &Path) -> Option<PanePreview> {
     for message in messages.iter().rev() {
         let MessageRole::Tool = message.role else {
@@ -879,7 +1345,11 @@ fn preview_for_last_file_message(messages: &[Message], cwd: &Path) -> Option<Pan
                     .or_else(|| output.strip_prefix("wrote "))
                     .map(PathBuf::from)
             })?;
-        let resolved = if path.is_absolute() { path } else { cwd.join(path) };
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
         let title = resolved
             .file_name()
             .map(|value| value.to_string_lossy().into_owned())
@@ -954,20 +1424,37 @@ fn build_repl_ui_state(
     cwd: &Path,
     input_buffer: &code_agent_ui::InputBuffer,
     status_line: &str,
+    progress_message: Option<String>,
     active_pane: PaneKind,
     compact_banner: Option<String>,
+    transcript_scroll: u16,
+    command_suggestions: Vec<CommandPaletteEntry>,
+    selected_command_suggestion: usize,
 ) -> code_agent_ui::UiState {
     let runtime_messages = materialize_runtime_messages(raw_messages);
     let mut state = app.state_from_messages(runtime_messages.clone(), &registry.all());
+    let (task_items, question_items) = load_task_ui_data(cwd);
+    state.show_input = true;
     state.input_buffer = input_buffer.clone();
+    state.transcript_scroll = transcript_scroll;
     state.status_line = status_line.to_owned();
+    state.progress_message = progress_message;
     state.active_pane = Some(active_pane);
     state.compact_banner = compact_banner;
+    state.command_suggestions = command_suggestions;
+    state.selected_command_suggestion = if state.command_suggestions.is_empty() {
+        None
+    } else {
+        Some(selected_command_suggestion.min(state.command_suggestions.len() - 1))
+    };
+    state.task_items = task_items;
+    state.question_items = question_items;
     state.task_preview = recent_task_preview(cwd);
-    state.file_preview = preview_for_last_file_message(&runtime_messages, cwd).unwrap_or(PanePreview {
-        title: "File preview".to_owned(),
-        lines: vec!["No file preview available yet.".to_owned()],
-    });
+    state.file_preview =
+        preview_for_last_file_message(&runtime_messages, cwd).unwrap_or(PanePreview {
+            title: "File preview".to_owned(),
+            lines: vec!["No file preview available yet.".to_owned()],
+        });
     state.diff_preview = preview_for_last_diff_message(&runtime_messages).unwrap_or(PanePreview {
         title: "Diff preview".to_owned(),
         lines: vec!["No diff preview available yet.".to_owned()],
@@ -985,6 +1472,129 @@ fn build_repl_ui_state(
         });
     }
     state
+}
+
+fn draw_repl_state(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    registry: &code_agent_core::CommandRegistry,
+    raw_messages: &[Message],
+    cwd: &Path,
+    provider: ApiProvider,
+    active_model: &str,
+    input_buffer: &code_agent_ui::InputBuffer,
+    status_line: &str,
+    progress_message: Option<String>,
+    active_pane: PaneKind,
+    compact_banner: Option<String>,
+    transcript_scroll: u16,
+    selected_command_suggestion: &mut usize,
+    vim_state: &code_agent_ui::vim::VimState,
+) -> Result<()> {
+    let suggestions = sync_command_selection(registry, input_buffer, selected_command_suggestion);
+    let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+    let mut state = build_repl_ui_state(
+        &app,
+        registry,
+        raw_messages,
+        cwd,
+        input_buffer,
+        status_line,
+        progress_message,
+        active_pane,
+        compact_banner,
+        transcript_scroll,
+        suggestions,
+        *selected_command_suggestion,
+    );
+    state.vim_state = vim_state.clone();
+    draw_tui(terminal, &state)
+}
+
+fn optimistic_messages_for_prompt(
+    raw_messages: &[Message],
+    session_id: SessionId,
+    prompt_text: &str,
+) -> Vec<Message> {
+    let mut preview_messages = raw_messages.to_vec();
+    let parent_id = raw_messages.last().map(|message| message.id);
+    preview_messages.push(build_text_message(
+        session_id,
+        MessageRole::User,
+        prompt_text.to_owned(),
+        parent_id,
+    ));
+    preview_messages
+}
+
+fn pending_spinner_frame(tick: usize) -> &'static str {
+    const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+    FRAMES[tick % FRAMES.len()]
+}
+
+fn drain_pending_repl_events(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+) -> Result<()> {
+    while event::poll(Duration::from_millis(0))? {
+        if let Event::Resize(width, height) = event::read()? {
+            terminal.resize(Rect::new(0, 0, width, height))?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_pending_repl_operation<F, T>(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    registry: &code_agent_core::CommandRegistry,
+    preview_messages: &[Message],
+    cwd: &Path,
+    provider: ApiProvider,
+    active_model: &str,
+    input_buffer: &code_agent_ui::InputBuffer,
+    status_line: &str,
+    progress_label: &str,
+    active_pane: PaneKind,
+    compact_banner: Option<String>,
+    transcript_scroll: u16,
+    vim_state: &code_agent_ui::vim::VimState,
+    operation: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let mut operation = std::pin::pin!(operation);
+    let mut tick = 0usize;
+    let mut selected_command_suggestion = 0usize;
+
+    loop {
+        drain_pending_repl_events(terminal)?;
+        draw_repl_state(
+            terminal,
+            registry,
+            preview_messages,
+            cwd,
+            provider,
+            active_model,
+            input_buffer,
+            status_line,
+            Some(format!(
+                "{} {}",
+                pending_spinner_frame(tick),
+                progress_label
+            )),
+            active_pane,
+            compact_banner.clone(),
+            transcript_scroll,
+            &mut selected_command_suggestion,
+            vim_state,
+        )?;
+
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = tokio::time::sleep(Duration::from_millis(120)) => {
+                tick = tick.wrapping_add(1);
+            }
+        }
+    }
 }
 
 fn persist_voice_capture(
@@ -1901,7 +2511,11 @@ fn render_command_help(registry: &CommandRegistry, remote_only: bool) -> String 
         registry.all()
     };
     let mut lines = vec!["REPL commands:".to_owned()];
-    lines.extend(commands.into_iter().map(|spec| format!("/{:<16} {}", spec.name, spec.description)));
+    lines.extend(
+        commands
+            .into_iter()
+            .map(|spec| format!("/{:<16} {}", spec.name, spec.description)),
+    );
     lines.join("\n")
 }
 
@@ -1918,13 +2532,16 @@ async fn render_permissions_command(cwd: &Path) -> Result<String> {
     }))?)
 }
 
-async fn render_session_command(store: &ActiveSessionStore, session_id: SessionId) -> Result<String> {
+async fn render_session_command(
+    store: &ActiveSessionStore,
+    session_id: SessionId,
+) -> Result<String> {
     let transcript_path = store.transcript_path(session_id).await?;
     let messages = store.load_session(session_id).await.unwrap_or_default();
     let runtime_messages = materialize_runtime_messages(&messages);
-    let first_prompt = runtime_messages.iter().find_map(|message| {
-        (message.role == MessageRole::User).then(|| message_text(message))
-    });
+    let first_prompt = runtime_messages
+        .iter()
+        .find_map(|message| (message.role == MessageRole::User).then(|| message_text(message)));
     let report = SessionCommandReport {
         session_id,
         session_root: store.root_dir().to_path_buf(),
@@ -1960,7 +2577,7 @@ fn render_statusline_command(
     session_id: SessionId,
 ) -> Result<String> {
     Ok(serde_json::to_string_pretty(&json!({
-        "statusline": format!("{provider}  {active_model}  session {session_id}"),
+        "statusline": repl_status(provider, active_model, session_id),
     }))?)
 }
 
@@ -2746,7 +3363,10 @@ async fn handle_repl_slash_command(
     remote_mode: bool,
 ) -> Result<String> {
     if !command_allowed_in_repl(registry, remote_mode, &invocation.name) {
-        return Ok(format!("command '/{}' is unavailable in remote mode", invocation.name));
+        return Ok(format!(
+            "command '/{}' is unavailable in remote mode",
+            invocation.name
+        ));
     }
     match invocation.name.as_str() {
         "help" => Ok(render_command_help(registry, remote_mode)),
@@ -2912,6 +3532,8 @@ async fn run_interactive_repl(
     session_id: SessionId,
     raw_messages: &mut Vec<Message>,
     live_runtime: bool,
+    auth_source: Option<String>,
+    transcript_path: Option<PathBuf>,
     remote_mode: bool,
 ) -> Result<()> {
     let mut active_model = active_model;
@@ -2919,39 +3541,81 @@ async fn run_interactive_repl(
     let mut out = stdout();
     enable_raw_mode()?;
     execute!(out, EnterAlternateScreen, Hide)?;
+    let backend = CrosstermBackend::new(out);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let mut startup_preferences = load_startup_preferences();
+    let startup_screens = build_startup_screens(
+        provider,
+        &active_model,
+        session_id,
+        &cwd,
+        store.root_dir(),
+        transcript_path.as_deref(),
+        live_runtime,
+        auth_source.as_deref(),
+        &startup_preferences,
+    );
+    let mut initial_input_buffer = code_agent_ui::InputBuffer::new();
+    if !startup_screens.is_empty() {
+        initial_input_buffer = run_startup_flow(
+            &mut terminal,
+            provider,
+            &active_model,
+            session_id,
+            &startup_screens,
+        )?;
+        if !startup_preferences.welcome_seen {
+            startup_preferences.welcome_seen = true;
+            save_startup_preferences(&startup_preferences)?;
+        }
+    }
 
     let loop_result = async {
-        let mut input_buffer = code_agent_ui::InputBuffer::new();
-        let mut status_line = format!("{provider}  {active_model}  session {session_id}");
+        let mut input_buffer = initial_input_buffer;
+        let mut transcript_scroll = 0u16;
+        let mut status_line = repl_status(provider, &active_model, session_id);
         let mut active_pane = PaneKind::Transcript;
+        let mut selected_command_suggestion = 0usize;
         let mut compact_banner = None;
+        let mut dirty = true;
         loop {
-            let app = RatatuiApp::new(format!("{provider}  {active_model}"));
-            let mut state = build_repl_ui_state(
-                &app,
-                registry,
-                raw_messages,
-                &cwd,
-                &input_buffer,
-                &status_line,
-                active_pane,
-                compact_banner.clone(),
-            );
-            state.vim_state = vim_state.clone();
+            if dirty {
+                draw_repl_state(
+                    &mut terminal,
+                    registry,
+                    raw_messages,
+                    &cwd,
+                    provider,
+                    &active_model,
+                    &input_buffer,
+                    &status_line,
+                    None,
+                    active_pane,
+                    compact_banner.clone(),
+                    transcript_scroll,
+                    &mut selected_command_suggestion,
+                    &vim_state,
+                )?;
+                dirty = false;
+            }
 
-            let (width, height) = terminal_size().unwrap_or((110, 28));
-            let rendered = render_tui_to_string(&state, width.max(80), height.max(24))?;
-            queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-            write!(out, "{rendered}")?;
-            out.flush()?;
-
-            if !event::poll(Duration::from_millis(100))? {
+            let event = event::read()?;
+            if let Event::Resize(width, height) = event {
+                terminal.resize(Rect::new(0, 0, width, height))?;
+                dirty = true;
                 continue;
             }
-            let Event::Key(key) = event::read()? else {
+            let Event::Key(key) = event else {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if let Some(pane) = pane_from_shortcut(&key) {
+                active_pane = pane;
+                dirty = true;
                 continue;
             }
 
@@ -2961,56 +3625,125 @@ async fn run_interactive_repl(
                         if matches!(vim_state.mode, code_agent_ui::vim::VimMode::Insert) {
                             vim_state.enter_normal();
                         } else {
-                            vim_state.mode = code_agent_ui::vim::VimMode::Normal(code_agent_ui::vim::CommandState::Idle);
+                            vim_state.mode = code_agent_ui::vim::VimMode::Normal(
+                                code_agent_ui::vim::CommandState::Idle,
+                            );
                         }
-                    } else {
-                        break;
+                        dirty = true;
                     }
                 }
                 KeyCode::Tab => {
                     active_pane = rotate_pane(active_pane, true);
+                    dirty = true;
                 }
                 KeyCode::BackTab => {
                     active_pane = rotate_pane(active_pane, false);
+                    dirty = true;
+                }
+                KeyCode::Up => {
+                    let suggestions = sync_command_selection(
+                        registry,
+                        &input_buffer,
+                        &mut selected_command_suggestion,
+                    );
+                    if !suggestions.is_empty() {
+                        selected_command_suggestion = if selected_command_suggestion == 0 {
+                            suggestions.len() - 1
+                        } else {
+                            selected_command_suggestion - 1
+                        };
+                    } else {
+                        scroll_up(&mut transcript_scroll, 1);
+                    }
+                    dirty = true;
+                }
+                KeyCode::Down => {
+                    let suggestions = sync_command_selection(
+                        registry,
+                        &input_buffer,
+                        &mut selected_command_suggestion,
+                    );
+                    if !suggestions.is_empty() {
+                        selected_command_suggestion =
+                            (selected_command_suggestion + 1) % suggestions.len();
+                    } else {
+                        scroll_down(&mut transcript_scroll, 1);
+                    }
+                    dirty = true;
+                }
+                KeyCode::PageUp => {
+                    scroll_up(&mut transcript_scroll, 5);
+                    dirty = true;
+                }
+                KeyCode::PageDown => {
+                    scroll_down(&mut transcript_scroll, 5);
+                    dirty = true;
+                }
+                KeyCode::Home => {
+                    transcript_scroll = 0;
+                    dirty = true;
+                }
+                KeyCode::End => {
+                    transcript_scroll = u16::MAX;
+                    dirty = true;
+                }
+                KeyCode::Left if vim_state.is_insert() => {
+                    input_buffer.cursor = input_buffer.cursor.saturating_sub(1);
+                    dirty = true;
+                }
+                KeyCode::Right if vim_state.is_insert() => {
+                    input_buffer.cursor = (input_buffer.cursor + 1).min(input_buffer.chars.len());
+                    dirty = true;
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 KeyCode::Char(ch) if key.modifiers.is_empty() => {
-                    if let Some(pane) = pane_from_digit(ch) {
-                        active_pane = pane;
-                    } else if vim_state.is_insert() {
+                    if vim_state.is_insert() {
                         input_buffer.push(ch);
+                        selected_command_suggestion = 0;
+                        dirty = true;
                     } else {
-                        if let code_agent_ui::vim::VimMode::Normal(ref mut cmd_state) = vim_state.mode {
+                        if let code_agent_ui::vim::VimMode::Normal(ref mut cmd_state) =
+                            vim_state.mode
+                        {
                             let transition = code_agent_ui::vim::handle_normal_key(cmd_state, ch);
                             match transition {
                                 code_agent_ui::vim::VimTransition::EnterInsert => {
                                     vim_state.enter_insert();
+                                    dirty = true;
                                 }
                                 code_agent_ui::vim::VimTransition::MoveCursor(delta) => {
                                     let mut new_pos = input_buffer.cursor as isize + delta;
-                                    if new_pos < 0 { new_pos = 0; }
+                                    if new_pos < 0 {
+                                        new_pos = 0;
+                                    }
                                     let max_pos = input_buffer.chars.len().saturating_sub(1);
                                     if new_pos > max_pos as isize && !input_buffer.is_empty() {
                                         new_pos = max_pos as isize;
                                     }
                                     input_buffer.cursor = new_pos as usize;
+                                    dirty = true;
                                 }
                                 code_agent_ui::vim::VimTransition::SetCursor(pos) => {
                                     let max_pos = input_buffer.chars.len().saturating_sub(1);
                                     input_buffer.cursor = pos.min(max_pos);
+                                    dirty = true;
                                 }
                                 code_agent_ui::vim::VimTransition::DeleteChars(mut amount) => {
-                                    while amount > 0 && input_buffer.cursor < input_buffer.chars.len() {
+                                    while amount > 0
+                                        && input_buffer.cursor < input_buffer.chars.len()
+                                    {
                                         input_buffer.chars.remove(input_buffer.cursor);
                                         amount -= 1;
                                     }
                                     let max_pos = input_buffer.chars.len().saturating_sub(1);
                                     input_buffer.cursor = input_buffer.cursor.min(max_pos);
+                                    dirty = true;
                                 }
                                 code_agent_ui::vim::VimTransition::ReplaceChar(r) => {
                                     if input_buffer.cursor < input_buffer.chars.len() {
                                         input_buffer.chars[input_buffer.cursor] = r;
                                     }
+                                    dirty = true;
                                 }
                                 code_agent_ui::vim::VimTransition::None => {}
                             }
@@ -3018,91 +3751,157 @@ async fn run_interactive_repl(
                     }
                 }
                 KeyCode::Enter => {
+                    let suggestions = sync_command_selection(
+                        registry,
+                        &input_buffer,
+                        &mut selected_command_suggestion,
+                    );
                     let prompt_text = input_buffer.as_str().trim().to_owned();
                     if prompt_text.is_empty() {
                         continue;
                     }
-                    if prompt_text == "/quit" || prompt_text == "/exit" {
+                    if let Some(selected) = suggestions.get(selected_command_suggestion) {
+                        let selected_name = selected.name.as_str();
+                        if prompt_text.starts_with('/')
+                            && !prompt_text.contains(char::is_whitespace)
+                            && prompt_text != selected_name
+                        {
+                            apply_selected_command(&mut input_buffer, selected);
+                            dirty = true;
+                            continue;
+                        }
+                    }
+                    if should_exit_repl(&prompt_text) {
                         break;
                     }
                     input_buffer.clear();
+                    selected_command_suggestion = 0;
                     compact_banner = None;
                     if let Some(invocation) = registry.parse_slash_command(&prompt_text) {
-                        match handle_repl_slash_command(
+                        let base_status_line = repl_status(provider, &active_model, session_id);
+                        let active_model_display = active_model.clone();
+                        let vim_state_display = vim_state.clone();
+                        let preview_messages = raw_messages.to_vec();
+                        match run_pending_repl_operation(
+                            &mut terminal,
                             registry,
-                            invocation,
-                            store,
-                            tool_registry,
+                            &preview_messages,
                             &cwd,
-                            plugin_root,
                             provider,
-                            &mut active_model,
-                            session_id,
-                            raw_messages,
-                            live_runtime,
-                            &mut vim_state,
-                            remote_mode,
+                            &active_model_display,
+                            &input_buffer,
+                            &base_status_line,
+                            &format!("running {}", invocation.name.clone()),
+                            active_pane,
+                            compact_banner.clone(),
+                            transcript_scroll,
+                            &vim_state_display,
+                            handle_repl_slash_command(
+                                registry,
+                                invocation,
+                                store,
+                                tool_registry,
+                                &cwd,
+                                plugin_root,
+                                provider,
+                                &mut active_model,
+                                session_id,
+                                raw_messages,
+                                live_runtime,
+                                &mut vim_state,
+                                remote_mode,
+                            ),
                         )
                         .await
                         {
                             Ok(next_status) if next_status == "exit" => break,
                             Ok(next_status) => {
-                                status_line = format!("{provider}  {active_model}  {next_status}");
+                                status_line = status_with_detail(
+                                    repl_status(provider, &active_model, session_id),
+                                    &next_status,
+                                );
                                 if next_status.starts_with("compacted ") {
                                     compact_banner = Some(next_status.clone());
                                 }
                             }
                             Err(error) => {
-                                status_line = format!("{provider}  {active_model}  error: {error}");
+                                status_line = status_with_detail(
+                                    repl_status(provider, &active_model, session_id),
+                                    format!("error: {error}"),
+                                );
                             }
                         }
+                        dirty = true;
                         continue;
                     }
 
-                    match execute_local_turn(
-                        store,
-                        tool_registry,
-                        cwd.clone(),
+                    let base_status_line = repl_status(provider, &active_model, session_id);
+                    let preview_messages =
+                        optimistic_messages_for_prompt(raw_messages, session_id, &prompt_text);
+                    match run_pending_repl_operation(
+                        &mut terminal,
+                        registry,
+                        &preview_messages,
+                        &cwd,
                         provider,
-                        active_model.clone(),
-                        session_id,
-                        raw_messages,
-                        prompt_text,
-                        live_runtime,
+                        &active_model,
+                        &input_buffer,
+                        &base_status_line,
+                        "waiting for response",
+                        active_pane,
+                        compact_banner.clone(),
+                        transcript_scroll,
+                        &vim_state,
+                        execute_local_turn(
+                            store,
+                            tool_registry,
+                            cwd.clone(),
+                            provider,
+                            active_model.clone(),
+                            session_id,
+                            raw_messages,
+                            prompt_text,
+                            live_runtime,
+                        ),
                     )
                     .await
                     {
                         Ok((applied_compaction, turn_count, stop_reason, _, _)) => {
                             compact_banner = applied_compaction.as_ref().and_then(|outcome| {
-                                compaction_kind_name(outcome).map(|kind| format!("compacted {kind}"))
+                                compaction_kind_name(outcome)
+                                    .map(|kind| format!("compacted {kind}"))
                             });
-                            status_line = if let Some(kind) =
+                            let detail = if let Some(kind) =
                                 applied_compaction.as_ref().and_then(compaction_kind_name)
                             {
-                                format!(
-                                    "{provider}  {active_model}  last turn: {turn_count} steps, {:?}, compacted {}",
-                                    stop_reason, kind
-                                )
+                                format!("{turn_count} steps · {:?} · compact {kind}", stop_reason)
                             } else {
-                                format!(
-                                    "{provider}  {active_model}  last turn: {turn_count} steps, {:?}",
-                                    stop_reason
-                                )
+                                format!("{turn_count} steps · {:?}", stop_reason)
                             };
+                            status_line = status_with_detail(
+                                repl_status(provider, &active_model, session_id),
+                                detail,
+                            );
                         }
                         Err(error) => {
-                            status_line = format!("{provider}  {active_model}  error: {error}");
+                            status_line = status_with_detail(
+                                repl_status(provider, &active_model, session_id),
+                                format!("error: {error}"),
+                            );
                         }
                     }
+                    dirty = true;
                 }
                 KeyCode::Backspace => {
                     if vim_state.is_insert() {
                         input_buffer.pop();
+                        selected_command_suggestion = 0;
                     } else {
                         if input_buffer.cursor > 0 {
                             input_buffer.cursor -= 1;
                         }
                     }
+                    dirty = true;
                 }
                 _ => {}
             }
@@ -3113,7 +3912,7 @@ async fn run_interactive_repl(
     .await;
 
     disable_raw_mode().ok();
-    execute!(out, Show, LeaveAlternateScreen).ok();
+    execute!(terminal.backend_mut(), Show, LeaveAlternateScreen).ok();
     loop_result
 }
 
@@ -3639,10 +4438,12 @@ async fn main() -> Result<()> {
         let title = format!("{provider}  {active_model}");
         let app = RatatuiApp::new(title);
         let mut state = app.state_from_messages(runtime_messages, &registry.all());
+        state.status_line = repl_status(provider, &active_model, session_id);
         if let Some(path) = transcript_path.as_ref() {
-            state.status_line = format!("{}  {}", state.status_line, path.display());
+            state.compact_banner = Some(format!("resume {}", shorten_path(path, 72)));
         }
-        println!("{}", render_tui_to_string(&state, 110, 28)?);
+        let (width, height) = terminal_size().unwrap_or((100, 28));
+        println!("{}", render_tui_to_string(&state, width, height)?);
         return Ok(());
     }
 
@@ -3661,6 +4462,8 @@ async fn main() -> Result<()> {
             session_id,
             &mut existing_messages,
             live_runtime,
+            auth_source.clone(),
+            transcript_path.clone(),
             remote_mode_enabled(&cli),
         )
         .await?;
@@ -3774,19 +4577,25 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_text_message, handle_repl_slash_command, message_text, render_remote_control_command,
-        resolved_command_registry, ActiveSessionStore, Cli, LocalBridgeHandler, Message,
-        MessageRole,
+        build_repl_ui_state, build_startup_screens, build_startup_ui_state, build_text_message,
+        command_suggestions, handle_repl_slash_command, message_text, pane_from_shortcut,
+        render_remote_control_command, resolved_command_registry, should_exit_repl,
+        ActiveSessionStore, Cli, LocalBridgeHandler, Message, MessageRole, StartupPreferences,
     };
     use code_agent_bridge::{
         base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
         BridgeSessionHandler, RemoteEnvelope, RemotePermissionResponse, ResumeSessionRequest,
         VoiceFrame,
     };
-    use code_agent_core::{compatibility_command_registry, CommandInvocation, ContentBlock, SessionId};
-    use code_agent_providers::ApiProvider;
+    use code_agent_core::{
+        compatibility_command_registry, CommandInvocation, ContentBlock, SessionId,
+    };
+    use code_agent_providers::{
+        ApiProvider, DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
+    };
     use code_agent_session::LocalSessionStore;
     use code_agent_tools::compatibility_tool_registry;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde::Deserialize;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -3839,7 +4648,9 @@ mod tests {
     #[test]
     fn parses_fixture_backed_slash_commands() {
         let fixture_path = workspace_root().join("fixtures/command-golden/slash-commands.json");
-        let fixture = serde_json::from_str::<SlashCommandFixture>(&fs::read_to_string(fixture_path).unwrap()).unwrap();
+        let fixture =
+            serde_json::from_str::<SlashCommandFixture>(&fs::read_to_string(fixture_path).unwrap())
+                .unwrap();
         let registry = compatibility_command_registry();
 
         for case in fixture.cases {
@@ -3847,6 +4658,164 @@ mod tests {
             assert_eq!(parsed.name, case.name);
             assert_eq!(parsed.args, case.args);
         }
+    }
+
+    #[test]
+    fn startup_screens_cover_first_run_and_project_setup() {
+        let root = temp_session_root("startup-first-run");
+        let session_root = root.join(".sessions");
+        fs::create_dir_all(&session_root).unwrap();
+
+        let screens = build_startup_screens(
+            ApiProvider::ChatGPTCodex,
+            DEFAULT_OPENAI_REASONING_MODEL,
+            SessionId::new_v4(),
+            &root,
+            &session_root,
+            None,
+            true,
+            Some("codex_auth_token"),
+            &StartupPreferences::default(),
+        );
+
+        assert_eq!(screens.len(), 2);
+        assert_eq!(screens[0].title, "Welcome");
+        assert!(screens[0]
+            .body
+            .iter()
+            .any(|line| line.contains("ratatui runtime")));
+        assert!(screens[1]
+            .body
+            .iter()
+            .any(|line| line.contains("CLAUDE.md") || line.contains("workspace is empty")));
+    }
+
+    #[test]
+    fn startup_screens_skip_completed_workspace() {
+        let root = temp_session_root("startup-complete");
+        let session_root = root.join(".sessions");
+        fs::create_dir_all(&session_root).unwrap();
+        write_test_file(&root.join("CLAUDE.md"), "# instructions\n");
+
+        let screens = build_startup_screens(
+            ApiProvider::ChatGPTCodex,
+            DEFAULT_OPENAI_REASONING_MODEL,
+            SessionId::new_v4(),
+            &root,
+            &session_root,
+            None,
+            true,
+            Some("codex_auth_token"),
+            &StartupPreferences { welcome_seen: true },
+        );
+
+        assert!(screens.is_empty());
+    }
+
+    #[test]
+    fn startup_ui_state_shows_prompt_and_scroll_state() {
+        let app = code_agent_ui::RatatuiApp::new("startup");
+        let screens = vec![super::StartupScreen {
+            title: "Setup".to_owned(),
+            body: vec!["line one".to_owned(), "line two".to_owned()],
+            preview: code_agent_ui::PanePreview {
+                title: "Next".to_owned(),
+                lines: vec!["step".to_owned()],
+            },
+        }];
+
+        let state = build_startup_ui_state(
+            &app,
+            ApiProvider::ChatGPTCodex,
+            DEFAULT_OPENAI_REASONING_MODEL,
+            SessionId::new_v4(),
+            &screens,
+            0,
+            2,
+        );
+
+        assert!(state.show_input);
+        assert_eq!(state.transcript_scroll, 2);
+        assert_eq!(
+            state.prompt_helper.as_deref(),
+            Some("Type to enter the REPL immediately. Enter also continues.")
+        );
+    }
+
+    #[test]
+    fn command_suggestions_follow_slash_prefixes() {
+        let registry = compatibility_command_registry();
+        let mut input = code_agent_ui::InputBuffer::new();
+        input.replace("/h");
+
+        let suggestions = command_suggestions(&registry, &input);
+
+        assert!(!suggestions.is_empty());
+        assert_eq!(suggestions[0].name, "/help");
+        assert!(suggestions.iter().all(|entry| entry.name.starts_with("/h")));
+    }
+
+    #[test]
+    fn command_suggestions_stop_after_command_arguments_start() {
+        let registry = compatibility_command_registry();
+        let mut input = code_agent_ui::InputBuffer::new();
+        input.replace(format!("/model {DEFAULT_OPENAI_REASONING_MODEL}"));
+
+        let suggestions = command_suggestions(&registry, &input);
+
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn pane_shortcut_requires_platform_modifier() {
+        let plain = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert!(pane_from_shortcut(&plain).is_none());
+
+        let shortcut_modifier = if cfg!(target_os = "macos") {
+            KeyModifiers::SUPER
+        } else {
+            KeyModifiers::CONTROL
+        };
+        let shortcut = KeyEvent::new(KeyCode::Char('1'), shortcut_modifier);
+        assert_eq!(
+            pane_from_shortcut(&shortcut),
+            Some(code_agent_ui::PaneKind::Transcript)
+        );
+    }
+
+    #[test]
+    fn repl_exit_detection_accepts_plain_and_slash_forms() {
+        assert!(should_exit_repl("quit"));
+        assert!(should_exit_repl("exit"));
+        assert!(should_exit_repl("/quit"));
+        assert!(should_exit_repl("/exit"));
+        assert!(!should_exit_repl("please exit"));
+    }
+
+    #[test]
+    fn build_repl_ui_state_handles_empty_command_suggestions() {
+        let app = code_agent_ui::RatatuiApp::new("repl");
+        let registry = compatibility_command_registry();
+        let input = code_agent_ui::InputBuffer::new();
+        let state = build_repl_ui_state(
+            &app,
+            &registry,
+            &[],
+            Path::new("."),
+            &input,
+            "status",
+            None,
+            code_agent_ui::PaneKind::Transcript,
+            None,
+            0,
+            Vec::new(),
+            0,
+        );
+
+        assert!(state.show_input);
+        assert_eq!(state.transcript_scroll, 0);
+        assert!(state.selected_command_suggestion.is_none());
+        assert!(state.command_suggestions.is_empty());
     }
 
     #[tokio::test]
@@ -3863,7 +4832,7 @@ mod tests {
             args: vec!["migrate".to_owned()],
             raw_input: "/config migrate".to_owned(),
         };
-        let mut active_model = "gpt-5".to_owned();
+        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
 
         let status = handle_repl_slash_command(
@@ -3932,7 +4901,7 @@ mod tests {
         let tool_registry = compatibility_tool_registry();
         let root = env::temp_dir();
         let registry = resolved_command_registry(&root, None).await;
-        let mut active_model = "gpt-5".to_owned();
+        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let session_id = SessionId::new_v4();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
@@ -3941,8 +4910,8 @@ mod tests {
             &registry,
             CommandInvocation {
                 name: "model".to_owned(),
-                args: vec!["gpt-5-mini".to_owned()],
-                raw_input: "/model gpt-5-mini".to_owned(),
+                args: vec![DEFAULT_OPENAI_COMPLETION_MODEL.to_owned()],
+                raw_input: format!("/model {DEFAULT_OPENAI_COMPLETION_MODEL}"),
             },
             &store,
             &tool_registry,
@@ -3959,7 +4928,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(active_model, "gpt-5-mini");
+        assert_eq!(active_model, DEFAULT_OPENAI_COMPLETION_MODEL);
         assert!(status.contains("model switched"));
     }
 
@@ -4018,7 +4987,7 @@ mod tests {
         let tool_registry = compatibility_tool_registry();
         let registry = resolved_command_registry(&root, None).await;
         let session_id = SessionId::new_v4();
-        let mut active_model = "gpt-5".to_owned();
+        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
 
@@ -4081,7 +5050,7 @@ mod tests {
         let tool_registry = compatibility_tool_registry();
         let registry = resolved_command_registry(&root, None).await;
         let session_id = SessionId::new_v4();
-        let mut active_model = "gpt-5".to_owned();
+        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
         write_test_file(
@@ -4134,7 +5103,7 @@ mod tests {
         let tool_registry = compatibility_tool_registry();
         let registry = resolved_command_registry(&root, None).await;
         let session_id = SessionId::new_v4();
-        let mut active_model = "gpt-5".to_owned();
+        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
         write_test_file(
@@ -4244,7 +5213,7 @@ mod tests {
         let tool_registry = compatibility_tool_registry();
         let registry = resolved_command_registry(&root, None).await;
         let session_id = SessionId::new_v4();
-        let mut active_model = "gpt-5".to_owned();
+        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
         write_test_file(
@@ -4303,7 +5272,7 @@ mod tests {
         let tool_registry = compatibility_tool_registry();
         let registry = resolved_command_registry(&root, None).await;
         let session_id = SessionId::new_v4();
-        let mut active_model = "gpt-5".to_owned();
+        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
 

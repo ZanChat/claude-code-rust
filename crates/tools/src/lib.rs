@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use code_agent_core::{
-    create_agent_task, create_workflow_task_set, AgentTaskRequest, LocalTaskStore,
-    QuestionRequest, SessionId, TaskRecord, TaskStatus, TaskStore, WorkflowTaskRequest,
+    create_agent_task, create_workflow_task_set, AgentTaskRequest, LocalTaskStore, QuestionRequest,
+    SessionId, TaskRecord, TaskStatus, TaskStore, WorkflowTaskRequest,
 };
 use code_agent_mcp::{
     call_tool_from_config, clear_cached_auth_token, clear_pending_device_flow,
@@ -14,6 +14,7 @@ use code_agent_mcp::{
 use code_agent_plugins::{OutOfProcessPluginRuntime, PluginRuntime};
 use reqwest::Method;
 use schemars::schema::RootSchema;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -358,6 +359,29 @@ fn optional_string(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+fn shell_command_input(input: &Value) -> Result<String> {
+    optional_string(input, "command")
+        .or_else(|| optional_string(input, "cmd"))
+        .or_else(|| optional_string(input, "script"))
+        .or_else(|| optional_string(input, "input"))
+        .or_else(|| optional_string(input, "prompt"))
+        .or_else(|| input.as_str().map(str::to_owned))
+        .ok_or_else(|| anyhow!("missing string field 'command'"))
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct ShellCommandToolInput {
+    command: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct TerminalCaptureToolInput {
+    action: Option<String>,
+    command: Option<String>,
+    id: Option<String>,
+    shell: Option<String>,
+}
+
 fn string_list_field(input: &Value, key: &str) -> Result<Vec<String>> {
     let Some(value) = input.get(key) else {
         return Ok(Vec::new());
@@ -644,17 +668,18 @@ struct BashTool;
 #[async_trait]
 impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
-        compatibility_tool(
-            "bash",
-            "Execute a shell command in the project.",
-            ToolKind::Shell,
-            false,
-            true,
-        )
+        ToolSpec {
+            name: "bash".to_owned(),
+            description: "Execute a shell command in the project.".to_owned(),
+            kind: ToolKind::Shell,
+            input_schema: schemars::schema_for!(ShellCommandToolInput),
+            read_only: false,
+            needs_permission: true,
+        }
     }
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let command = input_string(&input, "command")?;
+        let command = shell_command_input(&input)?;
         let output = Command::new("bash")
             .arg("-lc")
             .arg(&command)
@@ -688,17 +713,18 @@ struct PowerShellTool;
 #[async_trait]
 impl Tool for PowerShellTool {
     fn spec(&self) -> ToolSpec {
-        compatibility_tool(
-            "powershell",
-            "Execute a PowerShell command when the runtime requires it.",
-            ToolKind::Shell,
-            false,
-            true,
-        )
+        ToolSpec {
+            name: "powershell".to_owned(),
+            description: "Execute a PowerShell command when the runtime requires it.".to_owned(),
+            kind: ToolKind::Shell,
+            input_schema: schemars::schema_for!(ShellCommandToolInput),
+            read_only: false,
+            needs_permission: true,
+        }
     }
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let command = input_string(&input, "command")?;
+        let command = shell_command_input(&input)?;
         let output = Command::new("pwsh")
             .arg("-NoLogo")
             .arg("-NoProfile")
@@ -733,13 +759,14 @@ struct TerminalCaptureTool;
 #[async_trait]
 impl Tool for TerminalCaptureTool {
     fn spec(&self) -> ToolSpec {
-        compatibility_tool(
-            "terminal_capture",
-            "Capture and resume terminal output streams.",
-            ToolKind::Shell,
-            true,
-            false,
-        )
+        ToolSpec {
+            name: "terminal_capture".to_owned(),
+            description: "Capture and resume terminal output streams.".to_owned(),
+            kind: ToolKind::Shell,
+            input_schema: schemars::schema_for!(TerminalCaptureToolInput),
+            read_only: true,
+            needs_permission: false,
+        }
     }
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -748,7 +775,7 @@ impl Tool for TerminalCaptureTool {
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         match action.as_str() {
             "start" => {
-                let command = input_string(&input, "command")?;
+                let command = shell_command_input(&input)?;
                 let id = optional_string(&input, "id")
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 let shell = input_string_or(&input, "shell", "bash");
@@ -1943,6 +1970,16 @@ mod tests {
     }
 
     #[test]
+    fn bash_tool_schema_declares_command_input() {
+        let registry = compatibility_tool_registry();
+        let spec = registry.get("bash").unwrap().spec();
+        let object = spec.input_schema.schema.object.as_ref().unwrap();
+
+        assert!(object.properties.contains_key("command"));
+        assert!(object.required.contains("command"));
+    }
+
+    #[test]
     fn matches_basic_globs() {
         assert!(glob_matches("src/**/*.rs", "src/cli/main.rs"));
         assert!(glob_matches("*.md", "README.md"));
@@ -1984,6 +2021,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(read.content, "hello from rust");
+    }
+
+    #[tokio::test]
+    async fn bash_tool_accepts_string_and_alias_inputs() {
+        let cwd = make_temp_dir("bash");
+        let registry = compatibility_tool_registry();
+        let context = ToolContext {
+            cwd,
+            ..ToolContext::default()
+        };
+
+        let raw = registry
+            .invoke(
+                ToolCallRequest {
+                    tool_name: "bash".to_owned(),
+                    input: json!("printf raw-shell-input"),
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+        let alias = registry
+            .invoke(
+                ToolCallRequest {
+                    tool_name: "bash".to_owned(),
+                    input: json!({ "input": "printf alias-shell-input" }),
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(raw.content, "raw-shell-input");
+        assert_eq!(alias.content, "alias-shell-input");
+        assert!(!raw.is_error);
+        assert!(!alias.is_error);
     }
 
     #[tokio::test]

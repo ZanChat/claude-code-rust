@@ -449,7 +449,11 @@ pub fn create_workflow_task_set<S: TaskStore>(
     let workflow = store.create_task(workflow)?;
 
     let mut children = Vec::new();
-    for step in request.steps.into_iter().filter(|step| !step.trim().is_empty()) {
+    for step in request
+        .steps
+        .into_iter()
+        .filter(|step| !step.trim().is_empty())
+    {
         let mut child = TaskRecord::new("workflow_step", step.clone());
         child.parent_task_id = Some(workflow.id);
         child.session_id = request.session_id;
@@ -780,11 +784,15 @@ impl CommandRegistry {
     }
 
     pub fn is_remote_safe(&self, name: &str) -> bool {
-        self.resolve(name).map(|spec| spec.remote_safe).unwrap_or(false)
+        self.resolve(name)
+            .map(|spec| spec.remote_safe)
+            .unwrap_or(false)
     }
 
     pub fn is_bridge_safe(&self, name: &str) -> bool {
-        self.resolve(name).map(|spec| spec.bridge_safe).unwrap_or(false)
+        self.resolve(name)
+            .map(|spec| spec.bridge_safe)
+            .unwrap_or(false)
     }
 }
 
@@ -1463,7 +1471,9 @@ mod tests {
     fn resumes_waiting_tasks_for_answered_question() {
         let root = std::env::temp_dir().join(format!("code-agent-core-{}", uuid::Uuid::new_v4()));
         let store = LocalTaskStore::new(root);
-        let question = store.record_question(QuestionRequest::new("approve?")) .unwrap();
+        let question = store
+            .record_question(QuestionRequest::new("approve?"))
+            .unwrap();
         let mut task = TaskRecord::new("agent", "needs input");
         task.status = TaskStatus::WaitingForInput;
         task.question_id = Some(question.id);

@@ -1167,14 +1167,18 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf();
-        let fixture = workspace
-            .join("fixtures/transcripts/77777777-7777-4777-8777-777777777777.jsonl");
+        let fixture =
+            workspace.join("fixtures/transcripts/77777777-7777-4777-8777-777777777777.jsonl");
         let root = make_temp_dir("fixture-import");
-        let imported = super::import_transcript_to_session_root(&JsonlTranscriptCodec, &fixture, &root)
-            .await
-            .unwrap();
+        let imported =
+            super::import_transcript_to_session_root(&JsonlTranscriptCodec, &fixture, &root)
+                .await
+                .unwrap();
 
-        assert_eq!(imported.session_id.to_string(), "77777777-7777-4777-8777-777777777777");
+        assert_eq!(
+            imported.session_id.to_string(),
+            "77777777-7777-4777-8777-777777777777"
+        );
         assert!(imported.destination_path.exists());
         assert_eq!(imported.message_count, 6);
     }
@@ -1187,8 +1191,8 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf();
-        let fixture = workspace
-            .join("fixtures/transcripts/77777777-7777-4777-8777-777777777777.jsonl");
+        let fixture =
+            workspace.join("fixtures/transcripts/77777777-7777-4777-8777-777777777777.jsonl");
         let messages = JsonlTranscriptCodec.read_messages(&fixture).await.unwrap();
         let runtime = materialize_runtime_messages(&messages);
         let root = make_temp_dir("fixture-resume");
@@ -1199,7 +1203,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(path, fixture);
-        assert_eq!(session_id.to_string(), "77777777-7777-4777-8777-777777777777");
+        assert_eq!(
+            session_id.to_string(),
+            "77777777-7777-4777-8777-777777777777"
+        );
         assert_eq!(runtime.len(), 3);
         assert!(runtime[0]
             .metadata

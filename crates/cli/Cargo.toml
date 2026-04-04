@@ -16,6 +16,7 @@ code-agent-session = { path = "../session" }
 code-agent-tools = { path = "../tools" }
 code-agent-ui = { path = "../ui" }
 crossterm.workspace = true
+ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

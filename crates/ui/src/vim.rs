@@ -22,16 +22,46 @@ pub enum TextObjScope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandState {
     Idle,
-    Count { digits: String },
-    Operator { op: Operator, count: usize },
-    OperatorCount { op: Operator, count: usize, digits: String },
-    OperatorFind { op: Operator, count: usize, find: FindType },
-    OperatorTextObj { op: Operator, count: usize, scope: TextObjScope },
-    Find { find: FindType, count: usize },
-    G { count: usize },
-    OperatorG { op: Operator, count: usize },
-    Replace { count: usize },
-    Indent { dir: char, count: usize },
+    Count {
+        digits: String,
+    },
+    Operator {
+        op: Operator,
+        count: usize,
+    },
+    OperatorCount {
+        op: Operator,
+        count: usize,
+        digits: String,
+    },
+    OperatorFind {
+        op: Operator,
+        count: usize,
+        find: FindType,
+    },
+    OperatorTextObj {
+        op: Operator,
+        count: usize,
+        scope: TextObjScope,
+    },
+    Find {
+        find: FindType,
+        count: usize,
+    },
+    G {
+        count: usize,
+    },
+    OperatorG {
+        op: Operator,
+        count: usize,
+    },
+    Replace {
+        count: usize,
+    },
+    Indent {
+        dir: char,
+        count: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,7 +84,10 @@ pub struct VimState {
 
 impl Default for VimState {
     fn default() -> Self {
-        Self { enabled: false, mode: VimMode::Insert }
+        Self {
+            enabled: false,
+            mode: VimMode::Insert,
+        }
     }
 }
 
@@ -94,18 +127,26 @@ pub fn handle_normal_key(state: &mut CommandState, key: char) -> VimTransition {
                 'x' => VimTransition::DeleteChars(1),
                 '0' => VimTransition::SetCursor(0),
                 '1'..='9' => {
-                    *state = CommandState::Count { digits: key.to_string() };
+                    *state = CommandState::Count {
+                        digits: key.to_string(),
+                    };
                     VimTransition::None
                 }
                 'd' => {
-                    *state = CommandState::Operator { op: Operator::Delete, count: 1 };
+                    *state = CommandState::Operator {
+                        op: Operator::Delete,
+                        count: 1,
+                    };
                     VimTransition::None
                 }
                 'c' => {
-                    *state = CommandState::Operator { op: Operator::Change, count: 1 };
+                    *state = CommandState::Operator {
+                        op: Operator::Change,
+                        count: 1,
+                    };
                     VimTransition::None
                 }
-                _ => VimTransition::None
+                _ => VimTransition::None,
             }
         }
         CommandState::Count { digits } => {
@@ -116,28 +157,46 @@ pub fn handle_normal_key(state: &mut CommandState, key: char) -> VimTransition {
                 let count = digits.parse::<usize>().unwrap_or(1);
                 // process key with count
                 match key {
-                    'h' => { *state = CommandState::Idle; VimTransition::MoveCursor(-(count as isize)) }
-                    'l' => { *state = CommandState::Idle; VimTransition::MoveCursor(count as isize) }
-                    'x' => { *state = CommandState::Idle; VimTransition::DeleteChars(count) }
+                    'h' => {
+                        *state = CommandState::Idle;
+                        VimTransition::MoveCursor(-(count as isize))
+                    }
+                    'l' => {
+                        *state = CommandState::Idle;
+                        VimTransition::MoveCursor(count as isize)
+                    }
+                    'x' => {
+                        *state = CommandState::Idle;
+                        VimTransition::DeleteChars(count)
+                    }
                     'd' => {
-                        *state = CommandState::Operator { op: Operator::Delete, count };
+                        *state = CommandState::Operator {
+                            op: Operator::Delete,
+                            count,
+                        };
                         VimTransition::None
                     }
                     'c' => {
-                        *state = CommandState::Operator { op: Operator::Change, count };
+                        *state = CommandState::Operator {
+                            op: Operator::Change,
+                            count,
+                        };
                         VimTransition::None
                     }
-                    _ => { *state = CommandState::Idle; VimTransition::None }
+                    _ => {
+                        *state = CommandState::Idle;
+                        VimTransition::None
+                    }
                 }
             }
         }
         CommandState::Operator { op, count } => {
-            let count = *count;
+            let _count = *count;
             // very basic
             if *op == Operator::Delete && key == 'd' {
                 *state = CommandState::Idle;
                 // delete line (simplified)
-                VimTransition::DeleteChars(9999) 
+                VimTransition::DeleteChars(9999)
             } else if *op == Operator::Change && key == 'c' {
                 *state = CommandState::Idle;
                 // change line -> simplify to delete

@@ -368,7 +368,11 @@ fn command_metadata_from_entry(entry: &CommandMetadata) -> (String, Vec<String>)
         .unwrap_or_else(|| "Plugin command".to_owned());
     let mut aliases = Vec::new();
     if let Some(argument_hint) = &entry.argument_hint {
-        for alias in argument_hint.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        for alias in argument_hint
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             aliases.push(alias.to_owned());
         }
     }
@@ -386,7 +390,11 @@ fn plugin_command_specs(root: &Path, manifest: &PluginManifest) -> Vec<CommandSp
             format!("Plugin command from {}", path.trim_start_matches("./")),
             Vec::new(),
             CommandSource::Plugin,
-            Some(root.join(path.trim_start_matches("./")).display().to_string()),
+            Some(
+                root.join(path.trim_start_matches("./"))
+                    .display()
+                    .to_string(),
+            ),
         )],
         CommandDefinitions::List(paths) => paths
             .iter()
@@ -396,7 +404,11 @@ fn plugin_command_specs(root: &Path, manifest: &PluginManifest) -> Vec<CommandSp
                     format!("Plugin command from {}", path.trim_start_matches("./")),
                     Vec::new(),
                     CommandSource::Plugin,
-                    Some(root.join(path.trim_start_matches("./")).display().to_string()),
+                    Some(
+                        root.join(path.trim_start_matches("./"))
+                            .display()
+                            .to_string(),
+                    ),
                 )
             })
             .collect(),
@@ -409,7 +421,13 @@ fn plugin_command_specs(root: &Path, manifest: &PluginManifest) -> Vec<CommandSp
                         .display()
                         .to_string()
                 });
-                command_spec(name.clone(), description, aliases, CommandSource::Plugin, origin)
+                command_spec(
+                    name.clone(),
+                    description,
+                    aliases,
+                    CommandSource::Plugin,
+                    origin,
+                )
             })
             .collect(),
     }
@@ -421,7 +439,9 @@ fn skill_command_specs(entries: &[SkillEntry]) -> Vec<CommandSpec> {
         .map(|entry| {
             let source = match entry.source {
                 SkillSource::Manifest => CommandSource::Plugin,
-                SkillSource::LegacySkillsDir | SkillSource::LegacyCommandsDir => CommandSource::Skill,
+                SkillSource::LegacySkillsDir | SkillSource::LegacyCommandsDir => {
+                    CommandSource::Skill
+                }
             };
             command_spec(
                 entry.name.clone(),
@@ -530,7 +550,11 @@ impl PluginRuntime for OutOfProcessPluginRuntime {
         };
         let skills = self.discover_skills(root).await?;
         commands.extend(skill_command_specs(&skills));
-        commands.sort_by(|left, right| left.name.cmp(&right.name).then(left.origin.cmp(&right.origin)));
+        commands.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.origin.cmp(&right.origin))
+        });
         commands.dedup_by(|left, right| left.name == right.name && left.origin == right.origin);
         Ok(commands)
     }
@@ -767,7 +791,10 @@ mod tests {
         let runtime = OutOfProcessPluginRuntime;
         let plugin = runtime.load_manifest(&root).await.unwrap();
         let skills = runtime.discover_skills(&root).await.unwrap();
-        let mut names = skills.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>();
+        let mut names = skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>();
         names.sort_unstable();
 
         assert_eq!(plugin.manifest.name, "review-tools");
