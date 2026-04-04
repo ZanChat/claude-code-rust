@@ -2979,6 +2979,22 @@ fn resume_command_for_session(session_id: SessionId) -> String {
     format!("code-agent-rust --resume {session_id}")
 }
 
+fn resume_hint_text(resume_hint: &ResumeTargetHint) -> Option<String> {
+    if !resume_hint.transcript_path.exists() {
+        return None;
+    }
+    Some(format!(
+        "\nResume this session with:\n{}\n",
+        resume_command_for_session(resume_hint.session_id)
+    ))
+}
+
+fn print_resume_hint(resume_hint: &ResumeTargetHint) {
+    if let Some(hint) = resume_hint_text(resume_hint) {
+        print!("{hint}");
+    }
+}
+
 async fn latest_resume_hint(store: &ActiveSessionStore) -> Result<Option<ResumeTargetHint>> {
     Ok(store
         .list_sessions()
@@ -5223,6 +5239,9 @@ async fn main() -> Result<()> {
             ide_bridge_enabled(&cli),
         )
         .await?;
+        if let Ok(resume_hint) = current_resume_hint(&store, session_id).await {
+            print_resume_hint(&resume_hint);
+        }
         return Ok(());
     }
 
@@ -5339,8 +5358,9 @@ mod tests {
         handle_repl_slash_command, message_text, navigate_prompt_history_down,
         navigate_prompt_history_up, pane_from_shortcut, prompt_history_from_messages,
         render_auth_command_with_resume, render_remote_control_command, resolve_continue_target,
-        resolved_command_registry, should_exit_repl, ActiveSessionStore, Cli, LocalBridgeHandler,
-        Message, MessageRole, PendingReplStep, PendingReplView, StartupPreferences,
+        resolved_command_registry, resume_hint_text, should_exit_repl, ActiveSessionStore, Cli,
+        LocalBridgeHandler, Message, MessageRole, PendingReplStep, PendingReplView,
+        ResumeTargetHint, StartupPreferences,
     };
     use code_agent_bridge::{
         base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
@@ -5769,6 +5789,41 @@ mod tests {
                 .map(str::to_owned),
             Some(format!("code-agent-rust --resume {session_id}"))
         );
+    }
+
+    #[tokio::test]
+    async fn resume_hint_text_matches_repl_exit_message() {
+        let store =
+            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("resume-hint")));
+        let session_id = SessionId::new_v4();
+        let transcript_path = store.transcript_path(session_id).await.unwrap();
+        fs::write(&transcript_path, "{}\n").unwrap();
+
+        let hint = ResumeTargetHint {
+            session_id,
+            transcript_path,
+        };
+
+        assert_eq!(
+            resume_hint_text(&hint),
+            Some(format!(
+                "\nResume this session with:\ncode-agent-rust --resume {session_id}\n"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_hint_text_skips_missing_transcript() {
+        let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
+            "resume-hint-missing",
+        )));
+        let session_id = SessionId::new_v4();
+        let hint = ResumeTargetHint {
+            session_id,
+            transcript_path: store.transcript_path(session_id).await.unwrap(),
+        };
+
+        assert_eq!(resume_hint_text(&hint), None);
     }
 
     #[test]
