@@ -1341,8 +1341,10 @@ async fn process_repl_submission(
         queued_submissions.extend(take_pending_repl_inputs(&pending_view));
 
         match result {
-            Ok(next_status) if next_status == "exit" => return Ok(ReplSubmissionOutcome::Exit),
-            Ok(next_status) => {
+            Ok(PendingReplOperationResult::Completed(next_status)) if next_status == "exit" => {
+                return Ok(ReplSubmissionOutcome::Exit)
+            }
+            Ok(PendingReplOperationResult::Completed(next_status)) => {
                 if command_recorded {
                     append_session_message(
                         store,
@@ -1378,6 +1380,19 @@ async fn process_repl_submission(
                 if next_status.starts_with("compacted ") {
                     *compact_banner = Some(next_status.clone());
                 }
+            }
+            Ok(PendingReplOperationResult::Interrupted) => {
+                let interruption_messages = pending_interrupt_messages(
+                    repl_session.session_id,
+                    raw_messages,
+                    &pending_repl_snapshot(&pending_view),
+                );
+                append_session_messages(store, raw_messages, interruption_messages).await?;
+                *status_line = status_with_detail(
+                    repl_status(provider, active_model, repl_session.session_id),
+                    "Interrupted by user",
+                );
+                *status_marquee_tick = 0;
             }
             Err(error) => {
                 let error_detail = format!("error: {error}");
@@ -1452,7 +1467,13 @@ async fn process_repl_submission(
     queued_submissions.extend(take_pending_repl_inputs(&pending_view));
 
     match result {
-        Ok((applied_compaction, turn_count, stop_reason, _, _)) => {
+        Ok(PendingReplOperationResult::Completed((
+            applied_compaction,
+            turn_count,
+            stop_reason,
+            _,
+            _,
+        ))) => {
             *compact_banner = applied_compaction.as_ref().and_then(|outcome| {
                 compaction_kind_name(outcome).map(|kind| format!("compacted {kind}"))
             });
@@ -1472,6 +1493,19 @@ async fn process_repl_submission(
             *status_line = status_with_detail(
                 repl_status(provider, active_model, repl_session.session_id),
                 format!("error: {error}"),
+            );
+            *status_marquee_tick = 0;
+        }
+        Ok(PendingReplOperationResult::Interrupted) => {
+            let interruption_messages = pending_interrupt_messages(
+                repl_session.session_id,
+                raw_messages,
+                &pending_repl_snapshot(&pending_view),
+            );
+            append_session_messages(store, raw_messages, interruption_messages).await?;
+            *status_line = status_with_detail(
+                repl_status(provider, active_model, repl_session.session_id),
+                "Interrupted by user",
             );
             *status_marquee_tick = 0;
         }

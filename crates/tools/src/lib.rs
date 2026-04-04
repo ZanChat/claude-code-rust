@@ -15,13 +15,13 @@ use code_agent_plugins::{OutOfProcessPluginRuntime, PluginRuntime};
 use reqwest::Method;
 use schemars::schema::RootSchema;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
+use tokio::process::Command;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolKind {
@@ -146,27 +146,30 @@ fn compatibility_tool(
 
 pub fn compatibility_tool_specs() -> Vec<ToolSpec> {
     vec![
-        compatibility_tool(
-            "file_read",
-            "Read files from the active workspace.",
-            ToolKind::FileSystem,
-            true,
-            false,
-        ),
-        compatibility_tool(
-            "file_write",
-            "Write or replace workspace files.",
-            ToolKind::FileSystem,
-            false,
-            true,
-        ),
-        compatibility_tool(
-            "file_edit",
-            "Apply targeted edits to an existing file.",
-            ToolKind::FileSystem,
-            false,
-            true,
-        ),
+        ToolSpec {
+            name: "file_read".to_owned(),
+            description: "Read files from the active workspace.".to_owned(),
+            kind: ToolKind::FileSystem,
+            input_schema: schemars::schema_for!(FileReadToolInput),
+            read_only: true,
+            needs_permission: false,
+        },
+        ToolSpec {
+            name: "file_write".to_owned(),
+            description: "Write or replace workspace files.".to_owned(),
+            kind: ToolKind::FileSystem,
+            input_schema: schemars::schema_for!(FileWriteToolInput),
+            read_only: false,
+            needs_permission: true,
+        },
+        ToolSpec {
+            name: "file_edit".to_owned(),
+            description: "Apply targeted edits to an existing file.".to_owned(),
+            kind: ToolKind::FileSystem,
+            input_schema: schemars::schema_for!(FileEditToolInput),
+            read_only: false,
+            needs_permission: true,
+        },
         compatibility_tool(
             "glob",
             "Expand glob patterns against the workspace.",
@@ -369,6 +372,45 @@ fn shell_command_input(input: &Value) -> Result<String> {
         .ok_or_else(|| anyhow!("missing string field 'command'"))
 }
 
+fn parse_tool_input<T>(input: Value) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    Ok(serde_json::from_value(input)?)
+}
+
+fn file_read_input(input: Value) -> Result<FileReadToolInput> {
+    match input {
+        Value::String(path) => Ok(FileReadToolInput { path }),
+        other => parse_tool_input(other),
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct FileReadToolInput {
+    #[serde(alias = "filePath")]
+    path: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct FileWriteToolInput {
+    #[serde(alias = "filePath")]
+    path: String,
+    content: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct FileEditToolInput {
+    #[serde(alias = "filePath")]
+    path: String,
+    #[serde(alias = "oldString", alias = "old_str")]
+    old_string: String,
+    #[serde(alias = "newString", alias = "new_str")]
+    new_string: String,
+    #[serde(default, alias = "replaceAll")]
+    replace_all: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 struct ShellCommandToolInput {
     command: String,
@@ -563,17 +605,19 @@ struct FileReadTool;
 #[async_trait]
 impl Tool for FileReadTool {
     fn spec(&self) -> ToolSpec {
-        compatibility_tool(
-            "file_read",
-            "Read files from the active workspace.",
-            ToolKind::FileSystem,
-            true,
-            false,
-        )
+        ToolSpec {
+            name: "file_read".to_owned(),
+            description: "Read files from the active workspace.".to_owned(),
+            kind: ToolKind::FileSystem,
+            input_schema: schemars::schema_for!(FileReadToolInput),
+            read_only: true,
+            needs_permission: false,
+        }
     }
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let path = resolve_path(&context.cwd, &input_string(&input, "path")?);
+        let FileReadToolInput { path } = file_read_input(input)?;
+        let path = resolve_path(&context.cwd, &path);
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         Ok(ToolOutput {
@@ -590,18 +634,19 @@ struct FileWriteTool;
 #[async_trait]
 impl Tool for FileWriteTool {
     fn spec(&self) -> ToolSpec {
-        compatibility_tool(
-            "file_write",
-            "Write or replace workspace files.",
-            ToolKind::FileSystem,
-            false,
-            true,
-        )
+        ToolSpec {
+            name: "file_write".to_owned(),
+            description: "Write or replace workspace files.".to_owned(),
+            kind: ToolKind::FileSystem,
+            input_schema: schemars::schema_for!(FileWriteToolInput),
+            read_only: false,
+            needs_permission: true,
+        }
     }
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let path = resolve_path(&context.cwd, &input_string(&input, "path")?);
-        let content = input_string(&input, "content")?;
+        let FileWriteToolInput { path, content } = parse_tool_input(input)?;
+        let path = resolve_path(&context.cwd, &path);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -622,20 +667,24 @@ struct FileEditTool;
 #[async_trait]
 impl Tool for FileEditTool {
     fn spec(&self) -> ToolSpec {
-        compatibility_tool(
-            "file_edit",
-            "Apply targeted edits to an existing file.",
-            ToolKind::FileSystem,
-            false,
-            true,
-        )
+        ToolSpec {
+            name: "file_edit".to_owned(),
+            description: "Apply targeted edits to an existing file.".to_owned(),
+            kind: ToolKind::FileSystem,
+            input_schema: schemars::schema_for!(FileEditToolInput),
+            read_only: false,
+            needs_permission: true,
+        }
     }
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let path = resolve_path(&context.cwd, &input_string(&input, "path")?);
-        let old_string = input_string(&input, "old_string")?;
-        let new_string = input_string(&input, "new_string")?;
-        let replace_all = input_bool_or(&input, "replace_all", false);
+        let FileEditToolInput {
+            path,
+            old_string,
+            new_string,
+            replace_all,
+        } = parse_tool_input(input)?;
+        let path = resolve_path(&context.cwd, &path);
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let matches = content.matches(&old_string).count();
@@ -681,11 +730,13 @@ impl Tool for BashTool {
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
         let command = shell_command_input(&input)?;
         let output = Command::new("bash")
+            .kill_on_drop(true)
             .arg("-lc")
             .arg(&command)
             .current_dir(&context.cwd)
             .envs(&context.environment)
             .output()
+            .await
             .with_context(|| format!("failed to execute bash command: {command}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -726,6 +777,7 @@ impl Tool for PowerShellTool {
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
         let command = shell_command_input(&input)?;
         let output = Command::new("pwsh")
+            .kill_on_drop(true)
             .arg("-NoLogo")
             .arg("-NoProfile")
             .arg("-Command")
@@ -733,6 +785,7 @@ impl Tool for PowerShellTool {
             .current_dir(&context.cwd)
             .envs(&context.environment)
             .output()
+            .await
             .with_context(|| format!("failed to execute pwsh command: {command}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -780,11 +833,13 @@ impl Tool for TerminalCaptureTool {
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 let shell = input_string_or(&input, "shell", "bash");
                 let output = Command::new(&shell)
+                    .kill_on_drop(true)
                     .arg("-lc")
                     .arg(&command)
                     .current_dir(&context.cwd)
                     .envs(&context.environment)
                     .output()
+                    .await
                     .with_context(|| {
                         format!("failed to execute capture command with {shell}: {command}")
                     })?;
@@ -1980,6 +2035,21 @@ mod tests {
     }
 
     #[test]
+    fn file_edit_tool_schema_declares_expected_fields() {
+        let registry = compatibility_tool_registry();
+        let spec = registry.get("file_edit").unwrap().spec();
+        let object = spec.input_schema.schema.object.as_ref().unwrap();
+
+        assert!(object.properties.contains_key("path"));
+        assert!(object.properties.contains_key("old_string"));
+        assert!(object.properties.contains_key("new_string"));
+        assert!(object.properties.contains_key("replace_all"));
+        assert!(object.required.contains("path"));
+        assert!(object.required.contains("old_string"));
+        assert!(object.required.contains("new_string"));
+    }
+
+    #[test]
     fn matches_basic_globs() {
         assert!(glob_matches("src/**/*.rs", "src/cli/main.rs"));
         assert!(glob_matches("*.md", "README.md"));
@@ -2108,6 +2178,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(edited.content, "alpha delta gamma");
+
+        registry
+            .invoke(
+                ToolCallRequest {
+                    tool_name: "file_write".to_owned(),
+                    input: json!({
+                        "filePath": "notes/example.txt",
+                        "content": "beta beta"
+                    }),
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+
+        registry
+            .invoke(
+                ToolCallRequest {
+                    tool_name: "file_edit".to_owned(),
+                    input: json!({
+                        "filePath": "notes/example.txt",
+                        "oldString": "beta",
+                        "new_str": "omega",
+                        "replaceAll": true
+                    }),
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+
+        let aliased = registry
+            .invoke(
+                ToolCallRequest {
+                    tool_name: "file_read".to_owned(),
+                    input: json!({ "filePath": "notes/example.txt" }),
+                },
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(aliased.content, "omega omega");
 
         registry
             .invoke(

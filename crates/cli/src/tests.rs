@@ -3,9 +3,9 @@ use super::{
     build_resume_choice_list, build_startup_screens, build_startup_ui_state, build_text_message,
     build_tool_result_message, choose_active_session, command_suggestions,
     handle_repl_slash_command, message_text, navigate_prompt_history_down,
-    navigate_prompt_history_up, pane_from_shortcut, prompt_history_from_messages,
-    render_auth_command_with_resume, render_remote_control_command, resolve_continue_target,
-    resolved_command_registry, resumable_sessions, resume_hint_text,
+    navigate_prompt_history_up, pane_from_shortcut, pending_interrupt_messages,
+    prompt_history_from_messages, render_auth_command_with_resume, render_remote_control_command,
+    resolve_continue_target, resolved_command_registry, resumable_sessions, resume_hint_text,
     should_echo_command_result_in_footer, should_exit_repl, ActiveSessionStore, Cli,
     LocalBridgeHandler, Message, MessageRole, PendingReplStep, PendingReplView, ReplSessionState,
     ResumePickerState, ResumeTargetHint, StartupPreferences,
@@ -577,6 +577,34 @@ fn build_repl_ui_state_groups_pending_steps() {
         .is_some_and(|subtitle| subtitle.contains("src/main.rs")));
     assert!(!state.transcript_groups[0].expanded);
     assert_eq!(state.queued_inputs, vec!["follow up after this".to_owned()]);
+}
+
+#[test]
+fn pending_interrupt_messages_preserve_partial_preview_before_marker() {
+    let session_id = SessionId::new_v4();
+    let user = build_text_message(session_id, MessageRole::User, "inspect".to_owned(), None);
+    let partial = build_text_message(
+        session_id,
+        MessageRole::Assistant,
+        "partial answer".to_owned(),
+        Some(user.id),
+    );
+    let pending_view = PendingReplView {
+        messages: vec![user.clone(), partial.clone()],
+        progress_label: "Working".to_owned(),
+        steps: Vec::new(),
+        queued_inputs: Vec::new(),
+    };
+
+    let interrupt_messages = pending_interrupt_messages(session_id, &[user], &pending_view);
+
+    assert_eq!(interrupt_messages.len(), 2);
+    assert_eq!(message_text(&interrupt_messages[0]), "partial answer");
+    assert_eq!(interrupt_messages[1].role, MessageRole::User);
+    assert_eq!(
+        message_text(&interrupt_messages[1]),
+        "[Request interrupted by user]"
+    );
 }
 
 #[tokio::test]

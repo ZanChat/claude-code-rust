@@ -79,6 +79,7 @@ use code_agent_providers::EchoProvider;
 const UI_EVENT_TAG: &str = "ui_event";
 const UI_ROLE_ATTRIBUTE: &str = "ui_role";
 const UI_AUTHOR_ATTRIBUTE: &str = "ui_author";
+const REQUEST_INTERRUPTED_MESSAGE: &str = "[Request interrupted by user]";
 
 fn should_exit_repl(prompt_text: &str) -> bool {
     matches!(prompt_text.trim(), "quit" | "exit" | "/quit" | "/exit")
@@ -113,6 +114,15 @@ fn build_text_message(
     message.session_id = Some(session_id);
     message.parent_id = parent_id;
     message
+}
+
+fn build_user_interruption_message(session_id: SessionId, parent_id: Option<Uuid>) -> Message {
+    build_text_message(
+        session_id,
+        MessageRole::User,
+        REQUEST_INTERRUPTED_MESSAGE.to_owned(),
+        parent_id,
+    )
 }
 
 fn build_ui_event_message(
@@ -1467,6 +1477,29 @@ fn pending_repl_snapshot(pending_view: &Arc<Mutex<PendingReplView>>) -> PendingR
         .unwrap_or_else(|_| PendingReplView::new(Vec::new(), "working"))
 }
 
+fn pending_interrupt_messages(
+    session_id: SessionId,
+    raw_messages: &[Message],
+    pending_view: &PendingReplView,
+) -> Vec<Message> {
+    let mut interrupt_messages = pending_view
+        .messages
+        .iter()
+        .filter(|message| {
+            raw_messages
+                .iter()
+                .all(|existing| existing.id != message.id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let parent_id = interrupt_messages
+        .last()
+        .map(|message| message.id)
+        .or_else(|| raw_messages.last().map(|message| message.id));
+    interrupt_messages.push(build_user_interruption_message(session_id, parent_id));
+    interrupt_messages
+}
+
 fn provider_assistant_message(
     session_id: SessionId,
     parent_id: Option<Uuid>,
@@ -1504,7 +1537,7 @@ async fn run_pending_repl_operation<F, T>(
     selected_command_suggestion: &mut usize,
     vim_state: &mut code_agent_ui::vim::VimState,
     operation: F,
-) -> Result<T>
+) -> Result<PendingReplOperationResult<T>>
 where
     F: Future<Output = Result<T>>,
 {
@@ -1563,6 +1596,11 @@ where
                     _ => {}
                 },
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if matches!(key.code, KeyCode::Char('c'))
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        return Ok(PendingReplOperationResult::Interrupted);
+                    }
                     if let Some(pane) = pane_from_shortcut(&key) {
                         *active_pane = pane;
                         continue;
@@ -1690,12 +1728,17 @@ where
         )?;
 
         tokio::select! {
-            result = &mut operation => return result,
+            result = &mut operation => return result.map(PendingReplOperationResult::Completed),
             _ = tokio::time::sleep(Duration::from_millis(120)) => {
                 tick = tick.wrapping_add(1);
             }
         }
     }
+}
+
+enum PendingReplOperationResult<T> {
+    Completed(T),
+    Interrupted,
 }
 
 fn persist_voice_capture(

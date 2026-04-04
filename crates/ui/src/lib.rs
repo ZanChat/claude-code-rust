@@ -1412,10 +1412,13 @@ fn footer_primary_text(state: &UiState, suggestions_visible: bool) -> String {
         return "Waiting for permission".to_owned();
     }
     if !state.queued_inputs.is_empty() {
-        return format!("Working · {} queued", state.queued_inputs.len());
+        return format!(
+            "Working · Ctrl+C to interrupt · {} queued",
+            state.queued_inputs.len()
+        );
     }
     if state.progress_message.is_some() {
-        return "Working".to_owned();
+        return "Working · Ctrl+C to interrupt".to_owned();
     }
     if let Some(helper) = state.prompt_helper.as_deref() {
         return helper.to_owned();
@@ -2171,9 +2174,9 @@ pub fn render_to_string(state: &UiState, width: u16, height: u16) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        mouse_action_for_position, render_to_string, ChoiceListItem, ChoiceListState, Notification,
-        PaneKind, PermissionPromptState, RatatuiApp, StatusLevel, TranscriptGroup, TranscriptLine,
-        UiMouseAction,
+        footer_primary_text, mouse_action_for_position, render_to_string, ChoiceListItem,
+        ChoiceListState, Notification, PaneKind, PermissionPromptState, RatatuiApp, StatusLevel,
+        TranscriptGroup, TranscriptLine, UiMouseAction,
     };
     use code_agent_core::{compatibility_command_registry, ContentBlock, Message, MessageRole};
     use std::collections::BTreeMap;
@@ -2308,6 +2311,8 @@ mod tests {
     fn renders_queued_follow_up_prompts_during_activity() {
         let mut state = RatatuiApp::new("queue").initial_state();
         state.show_input = true;
+        state.vim_state.enabled = true;
+        state.vim_state.enter_normal();
         state.progress_message = Some("/ Waiting for response".to_owned());
         state.queued_inputs = vec![
             "follow up with the failing test details".to_owned(),
@@ -2316,6 +2321,10 @@ mod tests {
 
         let rendered = render_to_string(&state, 100, 24).unwrap();
 
+        assert_eq!(
+            footer_primary_text(&state, false),
+            "Working · Ctrl+C to interrupt · 2 queued"
+        );
         assert!(rendered.contains("Waiting for response"));
         assert!(rendered.contains("queue"));
         assert!(rendered.contains("follow up with the failing test details"));
