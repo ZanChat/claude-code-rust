@@ -1,5 +1,7 @@
 use super::*;
 
+use std::collections::VecDeque;
+
 pub(crate) async fn render_auth_command(provider: ApiProvider, action: &str) -> Result<String> {
     render_auth_command_with_resume(provider, action, None).await
 }
@@ -8,8 +10,9 @@ pub(crate) fn resume_command_for_session(session_id: SessionId) -> String {
     format!("code-agent-rust --resume {session_id}")
 }
 
-
-pub(crate) async fn latest_resume_hint(store: &ActiveSessionStore) -> Result<Option<ResumeTargetHint>> {
+pub(crate) async fn latest_resume_hint(
+    store: &ActiveSessionStore,
+) -> Result<Option<ResumeTargetHint>> {
     Ok(store
         .list_sessions()
         .await?
@@ -126,7 +129,10 @@ pub(crate) async fn render_memory_command(
     Ok(report.content)
 }
 
-pub(crate) async fn render_skills_command(cwd: &Path, plugin_root: Option<&PathBuf>) -> Result<String> {
+pub(crate) async fn render_skills_command(
+    cwd: &Path,
+    plugin_root: Option<&PathBuf>,
+) -> Result<String> {
     let runtime = OutOfProcessPluginRuntime;
     let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
     let skills = runtime.discover_skills(&root).await?;
@@ -215,7 +221,10 @@ pub(crate) fn render_statusline_command(
     }))?)
 }
 
-pub(crate) fn render_ide_command(ide_bridge_active: bool, ide_address: Option<&str>) -> Result<String> {
+pub(crate) fn render_ide_command(
+    ide_bridge_active: bool,
+    ide_address: Option<&str>,
+) -> Result<String> {
     Ok(serde_json::to_string_pretty(&json!({
         "connected": ide_bridge_active,
         "bridge_address": ide_address,
@@ -291,7 +300,10 @@ pub(crate) fn render_usage_command(raw_messages: &[Message]) -> Result<String> {
     }))?)
 }
 
-pub(crate) fn render_export_command(store: &ActiveSessionStore, session_id: SessionId) -> Result<String> {
+pub(crate) fn render_export_command(
+    store: &ActiveSessionStore,
+    session_id: SessionId,
+) -> Result<String> {
     Ok(serde_json::to_string_pretty(&json!({
         "session_id": session_id,
         "transcript_path": store.root_dir().join(format!("{session_id}.jsonl")),
@@ -1194,6 +1206,280 @@ pub(crate) async fn handle_repl_slash_command(
     }
 }
 
+enum ReplSubmissionOutcome {
+    Continue,
+    Exit,
+}
+
+async fn process_repl_submission(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    store: &ActiveSessionStore,
+    registry: &code_agent_core::CommandRegistry,
+    tool_registry: &ToolRegistry,
+    cwd: &PathBuf,
+    plugin_root: Option<&PathBuf>,
+    provider: ApiProvider,
+    active_model: &mut String,
+    repl_session: &mut ReplSessionState,
+    raw_messages: &mut Vec<Message>,
+    live_runtime: bool,
+    prompt_text: String,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    prompt_history: &mut Vec<String>,
+    prompt_history_index: &mut Option<usize>,
+    prompt_history_draft: &mut Option<code_agent_ui::InputBuffer>,
+    transcript_scroll: &mut u16,
+    status_line: &mut String,
+    status_marquee_tick: &mut usize,
+    active_pane: &mut PaneKind,
+    compact_banner: &mut Option<String>,
+    resume_picker: &mut Option<ResumePickerState>,
+    selected_command_suggestion: &mut usize,
+    vim_state: &mut code_agent_ui::vim::VimState,
+    remote_mode: bool,
+    ide_bridge_active: bool,
+    queued_submissions: &mut VecDeque<String>,
+) -> Result<ReplSubmissionOutcome> {
+    if prompt_text.trim().is_empty() {
+        return Ok(ReplSubmissionOutcome::Continue);
+    }
+    if should_exit_repl(&prompt_text) {
+        return Ok(ReplSubmissionOutcome::Exit);
+    }
+
+    push_prompt_history_entry(prompt_history, &prompt_text);
+    reset_prompt_history_navigation(prompt_history_index, prompt_history_draft);
+    *selected_command_suggestion = 0;
+    *compact_banner = None;
+
+    if let Some(invocation) = registry.parse_slash_command(&prompt_text) {
+        if invocation.name == "resume" && invocation.args.is_empty() {
+            let sessions =
+                resumable_sessions(store.list_sessions().await?, repl_session.session_id);
+            if sessions.is_empty() {
+                *status_line = status_with_detail(
+                    repl_status(provider, active_model, repl_session.session_id),
+                    "No conversations found to resume",
+                );
+            } else {
+                *resume_picker = Some(ResumePickerState {
+                    sessions,
+                    selected: 0,
+                });
+                *status_line = repl_status(provider, active_model, repl_session.session_id);
+            }
+            *status_marquee_tick = 0;
+            return Ok(ReplSubmissionOutcome::Continue);
+        }
+
+        let command_name = invocation.name.clone();
+        let command_input = invocation.raw_input.clone();
+        let command_recorded = should_record_repl_command(&command_name);
+        if command_recorded {
+            append_session_message(
+                store,
+                raw_messages,
+                build_repl_command_input_message(
+                    repl_session.session_id,
+                    raw_messages.last().map(|message| message.id),
+                    command_input.clone(),
+                ),
+            )
+            .await?;
+        }
+
+        let previous_session_id = repl_session.session_id;
+        let base_status_line = repl_status(provider, active_model, repl_session.session_id);
+        let preview_messages = if command_recorded {
+            materialize_runtime_messages(raw_messages)
+        } else {
+            materialize_runtime_messages(&optimistic_messages_for_command(
+                raw_messages,
+                repl_session.session_id,
+                &command_input,
+            ))
+        };
+        let pending_view = Arc::new(Mutex::new(PendingReplView::new(
+            preview_messages,
+            format!("running {command_name}"),
+        )));
+        let active_model_display = active_model.clone();
+        let mut pending_vim_state = vim_state.clone();
+        let result = run_pending_repl_operation(
+            terminal,
+            registry,
+            pending_view.clone(),
+            cwd,
+            provider,
+            &active_model_display,
+            repl_session.session_id,
+            input_buffer,
+            &base_status_line,
+            active_pane,
+            compact_banner.clone(),
+            transcript_scroll,
+            selected_command_suggestion,
+            &mut pending_vim_state,
+            handle_repl_slash_command(
+                registry,
+                invocation,
+                store,
+                tool_registry,
+                cwd,
+                plugin_root,
+                provider,
+                active_model,
+                repl_session,
+                raw_messages,
+                live_runtime,
+                vim_state,
+                remote_mode,
+                ide_bridge_active,
+            ),
+        )
+        .await;
+        queued_submissions.extend(take_pending_repl_inputs(&pending_view));
+
+        match result {
+            Ok(next_status) if next_status == "exit" => return Ok(ReplSubmissionOutcome::Exit),
+            Ok(next_status) => {
+                if command_recorded {
+                    append_session_message(
+                        store,
+                        raw_messages,
+                        build_repl_command_output_message(
+                            repl_session.session_id,
+                            raw_messages.last().map(|message| message.id),
+                            &command_name,
+                            next_status.clone(),
+                        ),
+                    )
+                    .await?;
+                }
+                if repl_session.session_id != previous_session_id {
+                    *prompt_history = prompt_history_from_messages(raw_messages);
+                    reset_prompt_history_navigation(prompt_history_index, prompt_history_draft);
+                    *transcript_scroll = 0;
+                    *compact_banner = repl_session
+                        .transcript_path
+                        .as_ref()
+                        .map(|path| format!("resume {}", shorten_path(path, 72)));
+                }
+                *status_line = slash_command_footer_status(
+                    provider,
+                    active_model,
+                    repl_session.session_id,
+                    &command_name,
+                    command_recorded,
+                    false,
+                    &next_status,
+                );
+                *status_marquee_tick = 0;
+                if next_status.starts_with("compacted ") {
+                    *compact_banner = Some(next_status.clone());
+                }
+            }
+            Err(error) => {
+                let error_detail = format!("error: {error}");
+                *status_line = slash_command_footer_status(
+                    provider,
+                    active_model,
+                    repl_session.session_id,
+                    &command_name,
+                    command_recorded,
+                    true,
+                    &error_detail,
+                );
+                if command_recorded {
+                    append_session_message(
+                        store,
+                        raw_messages,
+                        build_repl_command_output_message(
+                            repl_session.session_id,
+                            raw_messages.last().map(|message| message.id),
+                            &command_name,
+                            format!("error: {error}"),
+                        ),
+                    )
+                    .await?;
+                }
+                *status_marquee_tick = 0;
+            }
+        }
+
+        return Ok(ReplSubmissionOutcome::Continue);
+    }
+
+    let base_status_line = repl_status(provider, active_model, repl_session.session_id);
+    let preview_messages = materialize_runtime_messages(&optimistic_messages_for_prompt(
+        raw_messages,
+        repl_session.session_id,
+        &prompt_text,
+    ));
+    let pending_view = Arc::new(Mutex::new(PendingReplView::new(
+        preview_messages,
+        "waiting for response",
+    )));
+    let result = run_pending_repl_operation(
+        terminal,
+        registry,
+        pending_view.clone(),
+        cwd,
+        provider,
+        active_model,
+        repl_session.session_id,
+        input_buffer,
+        &base_status_line,
+        active_pane,
+        compact_banner.clone(),
+        transcript_scroll,
+        selected_command_suggestion,
+        vim_state,
+        execute_local_turn(
+            store,
+            tool_registry,
+            cwd.clone(),
+            provider,
+            active_model.clone(),
+            repl_session.session_id,
+            raw_messages,
+            prompt_text,
+            live_runtime,
+            Some(pending_view.clone()),
+        ),
+    )
+    .await;
+    queued_submissions.extend(take_pending_repl_inputs(&pending_view));
+
+    match result {
+        Ok((applied_compaction, turn_count, stop_reason, _, _)) => {
+            *compact_banner = applied_compaction.as_ref().and_then(|outcome| {
+                compaction_kind_name(outcome).map(|kind| format!("compacted {kind}"))
+            });
+            let detail =
+                if let Some(kind) = applied_compaction.as_ref().and_then(compaction_kind_name) {
+                    format!("{turn_count} steps · {:?} · compact {kind}", stop_reason)
+                } else {
+                    format!("{turn_count} steps · {:?}", stop_reason)
+                };
+            *status_line = status_with_detail(
+                repl_status(provider, active_model, repl_session.session_id),
+                detail,
+            );
+            *status_marquee_tick = 0;
+        }
+        Err(error) => {
+            *status_line = status_with_detail(
+                repl_status(provider, active_model, repl_session.session_id),
+                format!("error: {error}"),
+            );
+            *status_marquee_tick = 0;
+        }
+    }
+
+    Ok(ReplSubmissionOutcome::Continue)
+}
+
 pub(crate) async fn run_interactive_repl(
     store: &ActiveSessionStore,
     registry: &code_agent_core::CommandRegistry,
@@ -1255,7 +1541,7 @@ pub(crate) async fn run_interactive_repl(
         let mut input_buffer = initial_input_buffer;
         let mut prompt_history = prompt_history_from_messages(raw_messages);
         let mut prompt_history_index = None;
-        let mut prompt_history_draft = None;
+        let mut prompt_history_draft: Option<code_agent_ui::InputBuffer> = None;
         let mut transcript_scroll = 0u16;
         let mut status_line = repl_status(provider, &active_model, repl_session.session_id);
         let mut status_marquee_tick = 0usize;
@@ -1263,6 +1549,7 @@ pub(crate) async fn run_interactive_repl(
         let mut selected_command_suggestion = 0usize;
         let mut compact_banner = None;
         let mut resume_picker = None;
+        let mut queued_submissions = VecDeque::new();
         let mut dirty = true;
         loop {
             if dirty {
@@ -1287,6 +1574,48 @@ pub(crate) async fn run_interactive_repl(
                     status_marquee_tick,
                 )?;
                 dirty = false;
+            }
+
+            if resume_picker.is_none() {
+                if let Some(prompt_text) = queued_submissions.pop_front() {
+                    match process_repl_submission(
+                        &mut terminal,
+                        store,
+                        registry,
+                        tool_registry,
+                        &cwd,
+                        plugin_root,
+                        provider,
+                        &mut active_model,
+                        &mut repl_session,
+                        raw_messages,
+                        live_runtime,
+                        prompt_text,
+                        &mut input_buffer,
+                        &mut prompt_history,
+                        &mut prompt_history_index,
+                        &mut prompt_history_draft,
+                        &mut transcript_scroll,
+                        &mut status_line,
+                        &mut status_marquee_tick,
+                        &mut active_pane,
+                        &mut compact_banner,
+                        &mut resume_picker,
+                        &mut selected_command_suggestion,
+                        &mut vim_state,
+                        remote_mode,
+                        ide_bridge_active,
+                        &mut queued_submissions,
+                    )
+                    .await?
+                    {
+                        ReplSubmissionOutcome::Continue => {
+                            dirty = true;
+                            continue;
+                        }
+                        ReplSubmissionOutcome::Exit => break,
+                    }
+                }
             }
 
             let event = if status_line_needs_marquee(&status_line) {
@@ -1631,245 +1960,40 @@ pub(crate) async fn run_interactive_repl(
                             continue;
                         }
                     }
-                    if should_exit_repl(&prompt_text) {
-                        break;
-                    }
-                    push_prompt_history_entry(&mut prompt_history, &prompt_text);
-                    reset_prompt_history_navigation(
+                    input_buffer.clear();
+                    match process_repl_submission(
+                        &mut terminal,
+                        store,
+                        registry,
+                        tool_registry,
+                        &cwd,
+                        plugin_root,
+                        provider,
+                        &mut active_model,
+                        &mut repl_session,
+                        raw_messages,
+                        live_runtime,
+                        prompt_text,
+                        &mut input_buffer,
+                        &mut prompt_history,
                         &mut prompt_history_index,
                         &mut prompt_history_draft,
-                    );
-                    input_buffer.clear();
-                    selected_command_suggestion = 0;
-                    compact_banner = None;
-                    if let Some(invocation) = registry.parse_slash_command(&prompt_text) {
-                        if invocation.name == "resume" && invocation.args.is_empty() {
-                            let sessions = resumable_sessions(
-                                store.list_sessions().await?,
-                                repl_session.session_id,
-                            );
-                            if sessions.is_empty() {
-                                status_line = status_with_detail(
-                                    repl_status(provider, &active_model, repl_session.session_id),
-                                    "No conversations found to resume",
-                                );
-                            } else {
-                                resume_picker = Some(ResumePickerState {
-                                    sessions,
-                                    selected: 0,
-                                });
-                                status_line =
-                                    repl_status(provider, &active_model, repl_session.session_id);
-                            }
-                            status_marquee_tick = 0;
-                            dirty = true;
-                            continue;
-                        }
-                        let command_name = invocation.name.clone();
-                        let command_input = invocation.raw_input.clone();
-                        let command_recorded = should_record_repl_command(&command_name);
-                        if command_recorded {
-                            append_session_message(
-                                store,
-                                raw_messages,
-                                build_repl_command_input_message(
-                                    repl_session.session_id,
-                                    raw_messages.last().map(|message| message.id),
-                                    command_input.clone(),
-                                ),
-                            )
-                            .await?;
-                        }
-
-                        let previous_session_id = repl_session.session_id;
-                        let base_status_line =
-                            repl_status(provider, &active_model, repl_session.session_id);
-                        let active_model_display = active_model.clone();
-                        let vim_state_display = vim_state.clone();
-                        let preview_messages = if command_recorded {
-                            materialize_runtime_messages(raw_messages)
-                        } else {
-                            materialize_runtime_messages(&optimistic_messages_for_command(
-                                raw_messages,
-                                repl_session.session_id,
-                                &command_input,
-                            ))
-                        };
-                        let pending_view = Arc::new(Mutex::new(PendingReplView::new(
-                            preview_messages,
-                            format!("running {command_name}"),
-                        )));
-                        match run_pending_repl_operation(
-                            &mut terminal,
-                            registry,
-                            pending_view,
-                            &cwd,
-                            provider,
-                            &active_model_display,
-                            repl_session.session_id,
-                            &input_buffer,
-                            &base_status_line,
-                            active_pane,
-                            compact_banner.clone(),
-                            transcript_scroll,
-                            &vim_state_display,
-                            handle_repl_slash_command(
-                                registry,
-                                invocation,
-                                store,
-                                tool_registry,
-                                &cwd,
-                                plugin_root,
-                                provider,
-                                &mut active_model,
-                                &mut repl_session,
-                                raw_messages,
-                                live_runtime,
-                                &mut vim_state,
-                                remote_mode,
-                                ide_bridge_active,
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(next_status) if next_status == "exit" => break,
-                            Ok(next_status) => {
-                                if command_recorded {
-                                    append_session_message(
-                                        store,
-                                        raw_messages,
-                                        build_repl_command_output_message(
-                                            repl_session.session_id,
-                                            raw_messages.last().map(|message| message.id),
-                                            &command_name,
-                                            next_status.clone(),
-                                        ),
-                                    )
-                                    .await?;
-                                }
-                                if repl_session.session_id != previous_session_id {
-                                    prompt_history = prompt_history_from_messages(raw_messages);
-                                    reset_prompt_history_navigation(
-                                        &mut prompt_history_index,
-                                        &mut prompt_history_draft,
-                                    );
-                                    transcript_scroll = 0;
-                                    compact_banner = repl_session
-                                        .transcript_path
-                                        .as_ref()
-                                        .map(|path| format!("resume {}", shorten_path(path, 72)));
-                                }
-                                status_line = slash_command_footer_status(
-                                    provider,
-                                    &active_model,
-                                    repl_session.session_id,
-                                    &command_name,
-                                    command_recorded,
-                                    false,
-                                    &next_status,
-                                );
-                                status_marquee_tick = 0;
-                                if next_status.starts_with("compacted ") {
-                                    compact_banner = Some(next_status.clone());
-                                }
-                            }
-                            Err(error) => {
-                                let error_detail = format!("error: {error}");
-                                status_line = slash_command_footer_status(
-                                    provider,
-                                    &active_model,
-                                    repl_session.session_id,
-                                    &command_name,
-                                    command_recorded,
-                                    true,
-                                    &error_detail,
-                                );
-                                if command_recorded {
-                                    append_session_message(
-                                        store,
-                                        raw_messages,
-                                        build_repl_command_output_message(
-                                            repl_session.session_id,
-                                            raw_messages.last().map(|message| message.id),
-                                            &command_name,
-                                            format!("error: {error}"),
-                                        ),
-                                    )
-                                    .await?;
-                                }
-                                status_marquee_tick = 0;
-                            }
-                        }
-                        dirty = true;
-                        continue;
-                    }
-
-                    let base_status_line =
-                        repl_status(provider, &active_model, repl_session.session_id);
-                    let preview_messages =
-                        materialize_runtime_messages(&optimistic_messages_for_prompt(
-                            raw_messages,
-                            repl_session.session_id,
-                            &prompt_text,
-                        ));
-                    let pending_view = Arc::new(Mutex::new(PendingReplView::new(
-                        preview_messages,
-                        "waiting for response",
-                    )));
-                    match run_pending_repl_operation(
-                        &mut terminal,
-                        registry,
-                        pending_view.clone(),
-                        &cwd,
-                        provider,
-                        &active_model,
-                        repl_session.session_id,
-                        &input_buffer,
-                        &base_status_line,
-                        active_pane,
-                        compact_banner.clone(),
-                        transcript_scroll,
-                        &vim_state,
-                        execute_local_turn(
-                            store,
-                            tool_registry,
-                            cwd.clone(),
-                            provider,
-                            active_model.clone(),
-                            repl_session.session_id,
-                            raw_messages,
-                            prompt_text,
-                            live_runtime,
-                            Some(pending_view),
-                        ),
+                        &mut transcript_scroll,
+                        &mut status_line,
+                        &mut status_marquee_tick,
+                        &mut active_pane,
+                        &mut compact_banner,
+                        &mut resume_picker,
+                        &mut selected_command_suggestion,
+                        &mut vim_state,
+                        remote_mode,
+                        ide_bridge_active,
+                        &mut queued_submissions,
                     )
-                    .await
+                    .await?
                     {
-                        Ok((applied_compaction, turn_count, stop_reason, _, _)) => {
-                            compact_banner = applied_compaction.as_ref().and_then(|outcome| {
-                                compaction_kind_name(outcome)
-                                    .map(|kind| format!("compacted {kind}"))
-                            });
-                            let detail = if let Some(kind) =
-                                applied_compaction.as_ref().and_then(compaction_kind_name)
-                            {
-                                format!("{turn_count} steps · {:?} · compact {kind}", stop_reason)
-                            } else {
-                                format!("{turn_count} steps · {:?}", stop_reason)
-                            };
-                            status_line = status_with_detail(
-                                repl_status(provider, &active_model, repl_session.session_id),
-                                detail,
-                            );
-                            status_marquee_tick = 0;
-                        }
-                        Err(error) => {
-                            status_line = status_with_detail(
-                                repl_status(provider, &active_model, repl_session.session_id),
-                                format!("error: {error}"),
-                            );
-                            status_marquee_tick = 0;
-                        }
+                        ReplSubmissionOutcome::Continue => {}
+                        ReplSubmissionOutcome::Exit => break,
                     }
                     dirty = true;
                 }
@@ -2172,4 +2296,3 @@ pub(crate) async fn handle_slash_command(
     }
     Ok(())
 }
-

@@ -1,1088 +1,1086 @@
-    use super::{
-        build_repl_command_input_message, build_repl_command_output_message, build_repl_ui_state,
-        build_resume_choice_list, build_startup_screens, build_startup_ui_state,
-        build_text_message, build_tool_result_message, choose_active_session, command_suggestions,
-        handle_repl_slash_command, message_text, navigate_prompt_history_down,
-        navigate_prompt_history_up, pane_from_shortcut, prompt_history_from_messages,
-        render_auth_command_with_resume, render_remote_control_command, resolve_continue_target,
-        resolved_command_registry, resumable_sessions, resume_hint_text,
-        should_echo_command_result_in_footer, should_exit_repl, ActiveSessionStore, Cli,
-        LocalBridgeHandler, Message, MessageRole, PendingReplStep, PendingReplView,
-        ReplSessionState, ResumePickerState, ResumeTargetHint, StartupPreferences,
+use super::{
+    build_repl_command_input_message, build_repl_command_output_message, build_repl_ui_state,
+    build_resume_choice_list, build_startup_screens, build_startup_ui_state, build_text_message,
+    build_tool_result_message, choose_active_session, command_suggestions,
+    handle_repl_slash_command, message_text, navigate_prompt_history_down,
+    navigate_prompt_history_up, pane_from_shortcut, prompt_history_from_messages,
+    render_auth_command_with_resume, render_remote_control_command, resolve_continue_target,
+    resolved_command_registry, resumable_sessions, resume_hint_text,
+    should_echo_command_result_in_footer, should_exit_repl, ActiveSessionStore, Cli,
+    LocalBridgeHandler, Message, MessageRole, PendingReplStep, PendingReplView, ReplSessionState,
+    ResumePickerState, ResumeTargetHint, StartupPreferences,
+};
+use code_agent_bridge::{
+    base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
+    BridgeSessionHandler, RemoteEnvelope, RemotePermissionResponse, ResumeSessionRequest,
+    VoiceFrame,
+};
+use code_agent_core::{compatibility_command_registry, CommandInvocation, ContentBlock, SessionId};
+use code_agent_providers::{
+    ApiProvider, DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
+};
+use code_agent_session::{materialize_runtime_messages, LocalSessionStore, SessionSummary};
+use code_agent_tools::compatibility_tool_registry;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+fn repl_session_state(session_id: SessionId) -> ReplSessionState {
+    ReplSessionState {
+        session_id,
+        transcript_path: None,
+    }
+}
+use serde::Deserialize;
+use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
+
+#[derive(Deserialize)]
+struct SlashCommandFixture {
+    cases: Vec<SlashCommandCase>,
+}
+
+#[derive(Deserialize)]
+struct SlashCommandCase {
+    input: String,
+    name: String,
+    args: Vec<String>,
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+fn temp_session_root(label: &str) -> PathBuf {
+    let root = env::temp_dir().join(format!("code-agent-rust-{label}-{}", Uuid::new_v4()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    root
+}
+
+fn temp_tcp_address() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    format!("tcp://{address}")
+}
+
+fn write_test_file(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, content).unwrap();
+}
+
+fn repl_handled_command_names() -> BTreeSet<&'static str> {
+    BTreeSet::from([
+        "help",
+        "version",
+        "config",
+        "status",
+        "ide",
+        "statusline",
+        "theme",
+        "vim",
+        "plan",
+        "fast",
+        "passes",
+        "effort",
+        "model",
+        "compact",
+        "clear",
+        "resume",
+        "session",
+        "login",
+        "logout",
+        "permissions",
+        "plugin",
+        "skills",
+        "reload-plugins",
+        "hooks",
+        "output-style",
+        "mcp",
+        "memory",
+        "files",
+        "diff",
+        "usage",
+        "cost",
+        "stats",
+        "remote-env",
+        "export",
+        "tasks",
+        "agents",
+        "remote-control",
+        "voice",
+        "exit",
+    ])
+}
+
+fn noninteractive_handled_command_names() -> BTreeSet<&'static str> {
+    repl_handled_command_names()
+}
+
+#[test]
+fn parses_fixture_backed_slash_commands() {
+    let fixture_path = workspace_root().join("fixtures/command-golden/slash-commands.json");
+    let fixture =
+        serde_json::from_str::<SlashCommandFixture>(&fs::read_to_string(fixture_path).unwrap())
+            .unwrap();
+    let registry = compatibility_command_registry();
+
+    for case in fixture.cases {
+        let parsed = registry.parse_slash_command(&case.input).unwrap();
+        assert_eq!(parsed.name, case.name);
+        assert_eq!(parsed.args, case.args);
+    }
+}
+
+#[test]
+fn builtin_commands_are_wired_for_repl_and_noninteractive_handlers() {
+    let registry_commands = compatibility_command_registry()
+        .all_owned()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect::<BTreeSet<_>>();
+    let repl_commands = repl_handled_command_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let noninteractive_commands = noninteractive_handled_command_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(repl_commands, registry_commands);
+    assert_eq!(noninteractive_commands, registry_commands);
+}
+
+#[test]
+fn startup_screens_cover_first_run_and_project_setup() {
+    let root = temp_session_root("startup-first-run");
+    let session_root = root.join(".sessions");
+    fs::create_dir_all(&session_root).unwrap();
+
+    let screens = build_startup_screens(
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        SessionId::new_v4(),
+        &root,
+        &session_root,
+        None,
+        true,
+        Some("codex_auth_token"),
+        &StartupPreferences::default(),
+    );
+
+    assert_eq!(screens.len(), 2);
+    assert_eq!(screens[0].title, "Welcome");
+    assert!(screens[0]
+        .body
+        .iter()
+        .any(|line| line.contains("ratatui runtime")));
+    assert!(screens[1]
+        .body
+        .iter()
+        .any(|line| line.contains("CLAUDE.md") || line.contains("workspace is empty")));
+}
+
+#[test]
+fn startup_screens_skip_completed_workspace() {
+    let root = temp_session_root("startup-complete");
+    let session_root = root.join(".sessions");
+    fs::create_dir_all(&session_root).unwrap();
+    write_test_file(&root.join("CLAUDE.md"), "# instructions\n");
+
+    let screens = build_startup_screens(
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        SessionId::new_v4(),
+        &root,
+        &session_root,
+        None,
+        true,
+        Some("codex_auth_token"),
+        &StartupPreferences { welcome_seen: true },
+    );
+
+    assert!(screens.is_empty());
+}
+
+#[test]
+fn startup_ui_state_shows_prompt_and_scroll_state() {
+    let app = code_agent_ui::RatatuiApp::new("startup");
+    let screens = vec![super::StartupScreen {
+        title: "Setup".to_owned(),
+        body: vec!["line one".to_owned(), "line two".to_owned()],
+        preview: code_agent_ui::PanePreview {
+            title: "Next".to_owned(),
+            lines: vec!["step".to_owned()],
+        },
+    }];
+
+    let state = build_startup_ui_state(
+        &app,
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        SessionId::new_v4(),
+        Path::new("/tmp/project"),
+        &screens,
+        0,
+        2,
+    );
+
+    assert!(state.show_input);
+    assert_eq!(state.transcript_scroll, 2);
+    assert_eq!(
+        state.prompt_helper.as_deref(),
+        Some("Type to enter the REPL immediately. Enter also continues.")
+    );
+    assert_eq!(state.active_pane, Some(code_agent_ui::PaneKind::Transcript));
+    assert!(state
+        .header_context
+        .as_deref()
+        .is_some_and(|value| value.contains("/tmp/project")));
+}
+
+#[test]
+fn command_suggestions_follow_slash_prefixes() {
+    let registry = compatibility_command_registry();
+    let mut input = code_agent_ui::InputBuffer::new();
+    input.replace("/h");
+
+    let suggestions = command_suggestions(&registry, &input);
+
+    assert!(!suggestions.is_empty());
+    assert_eq!(suggestions[0].name, "/help");
+    assert!(suggestions.iter().all(|entry| entry.name.starts_with("/h")));
+}
+
+#[test]
+fn command_suggestions_stop_after_command_arguments_start() {
+    let registry = compatibility_command_registry();
+    let mut input = code_agent_ui::InputBuffer::new();
+    input.replace(format!("/model {DEFAULT_OPENAI_REASONING_MODEL}"));
+
+    let suggestions = command_suggestions(&registry, &input);
+
+    assert!(suggestions.is_empty());
+}
+
+#[test]
+fn pane_shortcut_requires_platform_modifier() {
+    let plain = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
+    assert!(pane_from_shortcut(&plain).is_none());
+
+    let shortcut_modifier = if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::CONTROL
     };
-    use code_agent_bridge::{
-        base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
-        BridgeSessionHandler, RemoteEnvelope, RemotePermissionResponse, ResumeSessionRequest,
-        VoiceFrame,
-    };
-    use code_agent_core::{
-        compatibility_command_registry, CommandInvocation, ContentBlock, SessionId,
-    };
-    use code_agent_providers::{
-        ApiProvider, DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
-    };
-    use code_agent_session::{materialize_runtime_messages, LocalSessionStore, SessionSummary};
-    use code_agent_tools::compatibility_tool_registry;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let shortcut = KeyEvent::new(KeyCode::Char('1'), shortcut_modifier);
+    assert_eq!(
+        pane_from_shortcut(&shortcut),
+        Some(code_agent_ui::PaneKind::Transcript)
+    );
+}
 
-    fn repl_session_state(session_id: SessionId) -> ReplSessionState {
-        ReplSessionState {
-            session_id,
-            transcript_path: None,
-        }
-    }
-    use serde::Deserialize;
-    use serde_json::json;
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::env;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use uuid::Uuid;
+#[test]
+fn repl_exit_detection_accepts_plain_and_slash_forms() {
+    assert!(should_exit_repl("quit"));
+    assert!(should_exit_repl("exit"));
+    assert!(should_exit_repl("/quit"));
+    assert!(should_exit_repl("/exit"));
+    assert!(!should_exit_repl("please exit"));
+}
 
-    #[derive(Deserialize)]
-    struct SlashCommandFixture {
-        cases: Vec<SlashCommandCase>,
-    }
-
-    #[derive(Deserialize)]
-    struct SlashCommandCase {
-        input: String,
-        name: String,
-        args: Vec<String>,
-    }
-
-    fn workspace_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf()
-    }
-
-    fn temp_session_root(label: &str) -> PathBuf {
-        let root = env::temp_dir().join(format!("code-agent-rust-{label}-{}", Uuid::new_v4()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        root
-    }
-
-    fn temp_tcp_address() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        format!("tcp://{address}")
-    }
-
-    fn write_test_file(path: &Path, content: &str) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, content).unwrap();
-    }
-
-    fn repl_handled_command_names() -> BTreeSet<&'static str> {
-        BTreeSet::from([
-            "help",
-            "version",
-            "config",
-            "status",
-            "ide",
-            "statusline",
-            "theme",
-            "vim",
-            "plan",
-            "fast",
-            "passes",
-            "effort",
-            "model",
-            "compact",
-            "clear",
-            "resume",
-            "session",
-            "login",
-            "logout",
-            "permissions",
-            "plugin",
-            "skills",
-            "reload-plugins",
-            "hooks",
-            "output-style",
-            "mcp",
-            "memory",
-            "files",
-            "diff",
-            "usage",
-            "cost",
-            "stats",
-            "remote-env",
-            "export",
-            "tasks",
-            "agents",
-            "remote-control",
-            "voice",
-            "exit",
-        ])
-    }
-
-    fn noninteractive_handled_command_names() -> BTreeSet<&'static str> {
-        repl_handled_command_names()
-    }
-
-    #[test]
-    fn parses_fixture_backed_slash_commands() {
-        let fixture_path = workspace_root().join("fixtures/command-golden/slash-commands.json");
-        let fixture =
-            serde_json::from_str::<SlashCommandFixture>(&fs::read_to_string(fixture_path).unwrap())
-                .unwrap();
-        let registry = compatibility_command_registry();
-
-        for case in fixture.cases {
-            let parsed = registry.parse_slash_command(&case.input).unwrap();
-            assert_eq!(parsed.name, case.name);
-            assert_eq!(parsed.args, case.args);
-        }
-    }
-
-    #[test]
-    fn builtin_commands_are_wired_for_repl_and_noninteractive_handlers() {
-        let registry_commands = compatibility_command_registry()
-            .all_owned()
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect::<BTreeSet<_>>();
-        let repl_commands = repl_handled_command_names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
-        let noninteractive_commands = noninteractive_handled_command_names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(repl_commands, registry_commands);
-        assert_eq!(noninteractive_commands, registry_commands);
-    }
-
-    #[test]
-    fn startup_screens_cover_first_run_and_project_setup() {
-        let root = temp_session_root("startup-first-run");
-        let session_root = root.join(".sessions");
-        fs::create_dir_all(&session_root).unwrap();
-
-        let screens = build_startup_screens(
-            ApiProvider::ChatGPTCodex,
-            DEFAULT_OPENAI_REASONING_MODEL,
-            SessionId::new_v4(),
-            &root,
-            &session_root,
-            None,
-            true,
-            Some("codex_auth_token"),
-            &StartupPreferences::default(),
-        );
-
-        assert_eq!(screens.len(), 2);
-        assert_eq!(screens[0].title, "Welcome");
-        assert!(screens[0]
-            .body
-            .iter()
-            .any(|line| line.contains("ratatui runtime")));
-        assert!(screens[1]
-            .body
-            .iter()
-            .any(|line| line.contains("CLAUDE.md") || line.contains("workspace is empty")));
-    }
-
-    #[test]
-    fn startup_screens_skip_completed_workspace() {
-        let root = temp_session_root("startup-complete");
-        let session_root = root.join(".sessions");
-        fs::create_dir_all(&session_root).unwrap();
-        write_test_file(&root.join("CLAUDE.md"), "# instructions\n");
-
-        let screens = build_startup_screens(
-            ApiProvider::ChatGPTCodex,
-            DEFAULT_OPENAI_REASONING_MODEL,
-            SessionId::new_v4(),
-            &root,
-            &session_root,
-            None,
-            true,
-            Some("codex_auth_token"),
-            &StartupPreferences { welcome_seen: true },
-        );
-
-        assert!(screens.is_empty());
-    }
-
-    #[test]
-    fn startup_ui_state_shows_prompt_and_scroll_state() {
-        let app = code_agent_ui::RatatuiApp::new("startup");
-        let screens = vec![super::StartupScreen {
-            title: "Setup".to_owned(),
-            body: vec!["line one".to_owned(), "line two".to_owned()],
-            preview: code_agent_ui::PanePreview {
-                title: "Next".to_owned(),
-                lines: vec!["step".to_owned()],
-            },
-        }];
-
-        let state = build_startup_ui_state(
-            &app,
-            ApiProvider::ChatGPTCodex,
-            DEFAULT_OPENAI_REASONING_MODEL,
-            SessionId::new_v4(),
-            Path::new("/tmp/project"),
-            &screens,
-            0,
-            2,
-        );
-
-        assert!(state.show_input);
-        assert_eq!(state.transcript_scroll, 2);
-        assert_eq!(
-            state.prompt_helper.as_deref(),
-            Some("Type to enter the REPL immediately. Enter also continues.")
-        );
-        assert_eq!(state.active_pane, Some(code_agent_ui::PaneKind::Transcript));
-        assert!(state
-            .header_context
-            .as_deref()
-            .is_some_and(|value| value.contains("/tmp/project")));
-    }
-
-    #[test]
-    fn command_suggestions_follow_slash_prefixes() {
-        let registry = compatibility_command_registry();
-        let mut input = code_agent_ui::InputBuffer::new();
-        input.replace("/h");
-
-        let suggestions = command_suggestions(&registry, &input);
-
-        assert!(!suggestions.is_empty());
-        assert_eq!(suggestions[0].name, "/help");
-        assert!(suggestions.iter().all(|entry| entry.name.starts_with("/h")));
-    }
-
-    #[test]
-    fn command_suggestions_stop_after_command_arguments_start() {
-        let registry = compatibility_command_registry();
-        let mut input = code_agent_ui::InputBuffer::new();
-        input.replace(format!("/model {DEFAULT_OPENAI_REASONING_MODEL}"));
-
-        let suggestions = command_suggestions(&registry, &input);
-
-        assert!(suggestions.is_empty());
-    }
-
-    #[test]
-    fn pane_shortcut_requires_platform_modifier() {
-        let plain = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
-        assert!(pane_from_shortcut(&plain).is_none());
-
-        let shortcut_modifier = if cfg!(target_os = "macos") {
-            KeyModifiers::SUPER
-        } else {
-            KeyModifiers::CONTROL
-        };
-        let shortcut = KeyEvent::new(KeyCode::Char('1'), shortcut_modifier);
-        assert_eq!(
-            pane_from_shortcut(&shortcut),
-            Some(code_agent_ui::PaneKind::Transcript)
-        );
-    }
-
-    #[test]
-    fn repl_exit_detection_accepts_plain_and_slash_forms() {
-        assert!(should_exit_repl("quit"));
-        assert!(should_exit_repl("exit"));
-        assert!(should_exit_repl("/quit"));
-        assert!(should_exit_repl("/exit"));
-        assert!(!should_exit_repl("please exit"));
-    }
-
-    #[test]
-    fn prompt_history_seeds_from_user_messages_only() {
-        let session_id = SessionId::new_v4();
-        let messages = vec![
-            build_text_message(session_id, MessageRole::User, "first".to_owned(), None),
-            build_text_message(
-                session_id,
-                MessageRole::Assistant,
-                "ignore".to_owned(),
-                None,
-            ),
-            build_text_message(session_id, MessageRole::User, "second".to_owned(), None),
-            build_text_message(session_id, MessageRole::User, "second".to_owned(), None),
-            build_text_message(session_id, MessageRole::User, "first".to_owned(), None),
-        ];
-
-        let history = prompt_history_from_messages(&messages);
-
-        assert_eq!(history, vec!["first", "second", "first"]);
-    }
-
-    #[test]
-    fn prompt_history_navigation_restores_draft_after_latest_entry() {
-        let history = vec!["alpha".to_owned(), "beta".to_owned()];
-        let mut input = code_agent_ui::InputBuffer::new();
-        input.replace("draft");
-        let mut history_index = None;
-        let mut history_draft = None;
-
-        assert!(navigate_prompt_history_up(
-            &history,
-            &mut input,
-            &mut history_index,
-            &mut history_draft
-        ));
-        assert_eq!(input.as_str(), "beta");
-        assert_eq!(history_index, Some(1));
-
-        assert!(navigate_prompt_history_up(
-            &history,
-            &mut input,
-            &mut history_index,
-            &mut history_draft
-        ));
-        assert_eq!(input.as_str(), "alpha");
-        assert_eq!(history_index, Some(0));
-
-        assert!(navigate_prompt_history_down(
-            &history,
-            &mut input,
-            &mut history_index,
-            &mut history_draft
-        ));
-        assert_eq!(input.as_str(), "beta");
-        assert_eq!(history_index, Some(1));
-
-        assert!(navigate_prompt_history_down(
-            &history,
-            &mut input,
-            &mut history_index,
-            &mut history_draft
-        ));
-        assert_eq!(input.as_str(), "draft");
-        assert_eq!(history_index, None);
-        assert!(history_draft.is_none());
-    }
-
-    #[tokio::test]
-    async fn continue_flag_resolves_latest_session_explicitly() {
-        let root = temp_session_root("continue-latest");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root));
-        let session_id = SessionId::new_v4();
-        let persisted =
-            build_text_message(session_id, MessageRole::User, "resume me".to_owned(), None);
-        store.append_message(session_id, &persisted).await.unwrap();
-
-        let mut cli = Cli::default();
-        resolve_continue_target(&mut cli, &store).await.unwrap();
-        assert!(cli.resume.is_none());
-
-        cli.continue_latest = true;
-        resolve_continue_target(&mut cli, &store).await.unwrap();
-        assert_eq!(cli.resume, Some(session_id.to_string()));
-    }
-
-    #[tokio::test]
-    async fn continue_flag_errors_when_no_session_exists() {
-        let store =
-            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("continue-none")));
-        let mut cli = Cli {
-            continue_latest: true,
-            ..Cli::default()
-        };
-
-        let error = resolve_continue_target(&mut cli, &store).await.unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("No conversation found to continue"));
-    }
-
-    #[test]
-    fn choose_active_session_starts_new_session_without_explicit_resume() {
-        let cli = Cli::default();
-
-        let (session_id, transcript_path, messages) = choose_active_session(&cli, None).unwrap();
-
-        assert!(transcript_path.is_none());
-        assert!(messages.is_empty());
-        assert_ne!(session_id, SessionId::nil());
-    }
-
-    #[tokio::test]
-    async fn logout_report_includes_resume_command() {
-        let store =
-            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("logout-resume")));
-        let session_id = SessionId::new_v4();
-        let report = render_auth_command_with_resume(
-            ApiProvider::ChatGPTCodex,
-            "logout",
-            Some(super::ResumeTargetHint {
-                session_id,
-                transcript_path: store.transcript_path(session_id).await.unwrap(),
-            }),
-        )
-        .await
-        .unwrap();
-        let output: serde_json::Value = serde_json::from_str(&report).unwrap();
-
-        assert_eq!(
-            output
-                .get("resume_session_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned),
-            Some(session_id.to_string())
-        );
-        assert_eq!(
-            output
-                .get("resume_command")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned),
-            Some(format!("code-agent-rust --resume {session_id}"))
-        );
-    }
-
-    #[tokio::test]
-    async fn resume_hint_text_matches_repl_exit_message() {
-        let store =
-            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("resume-hint")));
-        let session_id = SessionId::new_v4();
-        let transcript_path = store.transcript_path(session_id).await.unwrap();
-        fs::write(&transcript_path, "{}\n").unwrap();
-
-        let hint = ResumeTargetHint {
-            session_id,
-            transcript_path,
-        };
-
-        assert_eq!(
-            resume_hint_text(&hint),
-            Some(format!(
-                "\nResume this session with:\ncode-agent-rust --resume {session_id}\n"
-            ))
-        );
-    }
-
-    #[tokio::test]
-    async fn resume_hint_text_skips_missing_transcript() {
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
-            "resume-hint-missing",
-        )));
-        let session_id = SessionId::new_v4();
-        let hint = ResumeTargetHint {
-            session_id,
-            transcript_path: store.transcript_path(session_id).await.unwrap(),
-        };
-
-        assert_eq!(resume_hint_text(&hint), None);
-    }
-
-    #[test]
-    fn build_repl_ui_state_handles_empty_command_suggestions() {
-        let app = code_agent_ui::RatatuiApp::new("repl");
-        let registry = compatibility_command_registry();
-        let input = code_agent_ui::InputBuffer::new();
-        let state = build_repl_ui_state(
-            &app,
-            &registry,
-            &[],
-            None,
-            Path::new("."),
-            ApiProvider::ChatGPTCodex,
-            DEFAULT_OPENAI_REASONING_MODEL,
-            SessionId::new_v4(),
-            &input,
-            "status",
-            None,
-            code_agent_ui::PaneKind::Transcript,
-            None,
-            0,
-            None,
-            Vec::new(),
-            0,
-            0,
-        );
-
-        assert!(state.show_input);
-        assert_eq!(state.transcript_scroll, 0);
-        assert!(state.selected_command_suggestion.is_none());
-        assert!(state.command_suggestions.is_empty());
-        assert_eq!(
-            state.header_subtitle.as_deref(),
-            Some("gpt-5.4 · chatgpt-codex")
-        );
-    }
-
-    #[test]
-    fn build_repl_ui_state_groups_pending_steps() {
-        let app = code_agent_ui::RatatuiApp::new("repl");
-        let registry = compatibility_command_registry();
-        let session_id = SessionId::new_v4();
-        let user = build_text_message(session_id, MessageRole::User, "inspect".to_owned(), None);
-        let assistant = build_text_message(
+#[test]
+fn prompt_history_seeds_from_user_messages_only() {
+    let session_id = SessionId::new_v4();
+    let messages = vec![
+        build_text_message(session_id, MessageRole::User, "first".to_owned(), None),
+        build_text_message(
             session_id,
             MessageRole::Assistant,
-            "calling list_dir".to_owned(),
-            Some(user.id),
-        );
-        let tool = build_tool_result_message(
-            session_id,
-            "tool-call-1".to_owned(),
-            "src\nCargo.toml".to_owned(),
-            false,
-            Some(assistant.id),
-        );
-        let messages = vec![user, assistant, tool];
-        let pending_view = PendingReplView {
-            messages: materialize_runtime_messages(&messages),
-            progress_label: "running list_dir".to_owned(),
-            steps: vec![PendingReplStep {
-                step: 1,
-                start_index: 1,
-                status_label: "running list_dir".to_owned(),
-                expanded: false,
-                touched: false,
-            }],
-        };
-
-        let state = build_repl_ui_state(
-            &app,
-            &registry,
-            &messages,
-            Some(&pending_view),
-            Path::new("."),
-            ApiProvider::ChatGPTCodex,
-            DEFAULT_OPENAI_REASONING_MODEL,
-            session_id,
-            &code_agent_ui::InputBuffer::new(),
-            "status",
-            Some("working".to_owned()),
-            code_agent_ui::PaneKind::Transcript,
+            "ignore".to_owned(),
             None,
-            0,
-            None,
-            Vec::new(),
-            0,
-            0,
-        );
+        ),
+        build_text_message(session_id, MessageRole::User, "second".to_owned(), None),
+        build_text_message(session_id, MessageRole::User, "second".to_owned(), None),
+        build_text_message(session_id, MessageRole::User, "first".to_owned(), None),
+    ];
 
-        assert_eq!(state.transcript_lines.len(), 1);
-        assert_eq!(state.transcript_groups.len(), 1);
-        assert!(state.transcript_groups[0].title.contains("Step 1"));
-        assert!(!state.transcript_groups[0].expanded);
-    }
+    let history = prompt_history_from_messages(&messages);
 
-    #[tokio::test]
-    async fn config_migrate_reports_compatibility_inputs() {
-        let store =
-            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("config-migrate")));
-        let tool_registry = compatibility_tool_registry();
-        let session_id = SessionId::new_v4();
-        let root = env::temp_dir();
-        let registry = resolved_command_registry(&root, None).await;
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let invocation = CommandInvocation {
+    assert_eq!(history, vec!["first", "second", "first"]);
+}
+
+#[test]
+fn prompt_history_navigation_restores_draft_after_latest_entry() {
+    let history = vec!["alpha".to_owned(), "beta".to_owned()];
+    let mut input = code_agent_ui::InputBuffer::new();
+    input.replace("draft");
+    let mut history_index = None;
+    let mut history_draft = None;
+
+    assert!(navigate_prompt_history_up(
+        &history,
+        &mut input,
+        &mut history_index,
+        &mut history_draft
+    ));
+    assert_eq!(input.as_str(), "beta");
+    assert_eq!(history_index, Some(1));
+
+    assert!(navigate_prompt_history_up(
+        &history,
+        &mut input,
+        &mut history_index,
+        &mut history_draft
+    ));
+    assert_eq!(input.as_str(), "alpha");
+    assert_eq!(history_index, Some(0));
+
+    assert!(navigate_prompt_history_down(
+        &history,
+        &mut input,
+        &mut history_index,
+        &mut history_draft
+    ));
+    assert_eq!(input.as_str(), "beta");
+    assert_eq!(history_index, Some(1));
+
+    assert!(navigate_prompt_history_down(
+        &history,
+        &mut input,
+        &mut history_index,
+        &mut history_draft
+    ));
+    assert_eq!(input.as_str(), "draft");
+    assert_eq!(history_index, None);
+    assert!(history_draft.is_none());
+}
+
+#[tokio::test]
+async fn continue_flag_resolves_latest_session_explicitly() {
+    let root = temp_session_root("continue-latest");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root));
+    let session_id = SessionId::new_v4();
+    let persisted = build_text_message(session_id, MessageRole::User, "resume me".to_owned(), None);
+    store.append_message(session_id, &persisted).await.unwrap();
+
+    let mut cli = Cli::default();
+    resolve_continue_target(&mut cli, &store).await.unwrap();
+    assert!(cli.resume.is_none());
+
+    cli.continue_latest = true;
+    resolve_continue_target(&mut cli, &store).await.unwrap();
+    assert_eq!(cli.resume, Some(session_id.to_string()));
+}
+
+#[tokio::test]
+async fn continue_flag_errors_when_no_session_exists() {
+    let store =
+        ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("continue-none")));
+    let mut cli = Cli {
+        continue_latest: true,
+        ..Cli::default()
+    };
+
+    let error = resolve_continue_target(&mut cli, &store).await.unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("No conversation found to continue"));
+}
+
+#[test]
+fn choose_active_session_starts_new_session_without_explicit_resume() {
+    let cli = Cli::default();
+
+    let (session_id, transcript_path, messages) = choose_active_session(&cli, None).unwrap();
+
+    assert!(transcript_path.is_none());
+    assert!(messages.is_empty());
+    assert_ne!(session_id, SessionId::nil());
+}
+
+#[tokio::test]
+async fn logout_report_includes_resume_command() {
+    let store =
+        ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("logout-resume")));
+    let session_id = SessionId::new_v4();
+    let report = render_auth_command_with_resume(
+        ApiProvider::ChatGPTCodex,
+        "logout",
+        Some(super::ResumeTargetHint {
+            session_id,
+            transcript_path: store.transcript_path(session_id).await.unwrap(),
+        }),
+    )
+    .await
+    .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&report).unwrap();
+
+    assert_eq!(
+        output
+            .get("resume_session_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned),
+        Some(session_id.to_string())
+    );
+    assert_eq!(
+        output
+            .get("resume_command")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned),
+        Some(format!("code-agent-rust --resume {session_id}"))
+    );
+}
+
+#[tokio::test]
+async fn resume_hint_text_matches_repl_exit_message() {
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("resume-hint")));
+    let session_id = SessionId::new_v4();
+    let transcript_path = store.transcript_path(session_id).await.unwrap();
+    fs::write(&transcript_path, "{}\n").unwrap();
+
+    let hint = ResumeTargetHint {
+        session_id,
+        transcript_path,
+    };
+
+    assert_eq!(
+        resume_hint_text(&hint),
+        Some(format!(
+            "\nResume this session with:\ncode-agent-rust --resume {session_id}\n"
+        ))
+    );
+}
+
+#[tokio::test]
+async fn resume_hint_text_skips_missing_transcript() {
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
+        "resume-hint-missing",
+    )));
+    let session_id = SessionId::new_v4();
+    let hint = ResumeTargetHint {
+        session_id,
+        transcript_path: store.transcript_path(session_id).await.unwrap(),
+    };
+
+    assert_eq!(resume_hint_text(&hint), None);
+}
+
+#[test]
+fn build_repl_ui_state_handles_empty_command_suggestions() {
+    let app = code_agent_ui::RatatuiApp::new("repl");
+    let registry = compatibility_command_registry();
+    let input = code_agent_ui::InputBuffer::new();
+    let state = build_repl_ui_state(
+        &app,
+        &registry,
+        &[],
+        None,
+        Path::new("."),
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        SessionId::new_v4(),
+        &input,
+        "status",
+        None,
+        code_agent_ui::PaneKind::Transcript,
+        None,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+    );
+
+    assert!(state.show_input);
+    assert_eq!(state.transcript_scroll, 0);
+    assert!(state.selected_command_suggestion.is_none());
+    assert!(state.command_suggestions.is_empty());
+    assert_eq!(
+        state.header_subtitle.as_deref(),
+        Some("gpt-5.4 · chatgpt-codex")
+    );
+}
+
+#[test]
+fn build_repl_ui_state_groups_pending_steps() {
+    let app = code_agent_ui::RatatuiApp::new("repl");
+    let registry = compatibility_command_registry();
+    let session_id = SessionId::new_v4();
+    let user = build_text_message(session_id, MessageRole::User, "inspect".to_owned(), None);
+    let assistant = build_text_message(
+        session_id,
+        MessageRole::Assistant,
+        "calling list_dir".to_owned(),
+        Some(user.id),
+    );
+    let tool = build_tool_result_message(
+        session_id,
+        "tool-call-1".to_owned(),
+        "src\nCargo.toml".to_owned(),
+        false,
+        Some(assistant.id),
+    );
+    let messages = vec![user, assistant, tool];
+    let pending_view = PendingReplView {
+        messages: materialize_runtime_messages(&messages),
+        progress_label: "running list_dir".to_owned(),
+        steps: vec![PendingReplStep {
+            step: 1,
+            start_index: 1,
+            status_label: "running list_dir".to_owned(),
+            status_detail: Some("src/main.rs".to_owned()),
+            expanded: false,
+            touched: false,
+        }],
+        queued_inputs: vec!["follow up after this".to_owned()],
+    };
+
+    let state = build_repl_ui_state(
+        &app,
+        &registry,
+        &messages,
+        Some(&pending_view),
+        Path::new("."),
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        session_id,
+        &code_agent_ui::InputBuffer::new(),
+        "status",
+        Some("working".to_owned()),
+        code_agent_ui::PaneKind::Transcript,
+        None,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+    );
+
+    assert_eq!(state.transcript_lines.len(), 1);
+    assert_eq!(state.transcript_groups.len(), 1);
+    assert!(state.transcript_groups[0].title.contains("Step 1"));
+    assert!(state.transcript_groups[0]
+        .subtitle
+        .as_deref()
+        .is_some_and(|subtitle| subtitle.contains("src/main.rs")));
+    assert!(!state.transcript_groups[0].expanded);
+    assert_eq!(state.queued_inputs, vec!["follow up after this".to_owned()]);
+}
+
+#[tokio::test]
+async fn config_migrate_reports_compatibility_inputs() {
+    let store =
+        ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("config-migrate")));
+    let tool_registry = compatibility_tool_registry();
+    let session_id = SessionId::new_v4();
+    let root = env::temp_dir();
+    let registry = resolved_command_registry(&root, None).await;
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let invocation = CommandInvocation {
+        name: "config".to_owned(),
+        args: vec!["migrate".to_owned()],
+        raw_input: "/config migrate".to_owned(),
+    };
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = Vec::new();
+    let mut repl_session = repl_session_state(session_id);
+
+    let status = handle_repl_slash_command(
+        &registry,
+        invocation,
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAI,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(status.contains("\"provider\": \"openai\""));
+}
+
+#[tokio::test]
+async fn repl_config_command_reports_runtime_state() {
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-config")));
+    let tool_registry = compatibility_tool_registry();
+    let root = env::temp_dir();
+    let registry = resolved_command_registry(&root, None).await;
+    let mut active_model = "claude-sonnet-4-6".to_owned();
+    let session_id = SessionId::new_v4();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
             name: "config".to_owned(),
-            args: vec!["migrate".to_owned()],
-            raw_input: "/config migrate".to_owned(),
-        };
-        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-        let mut raw_messages = Vec::new();
-        let mut repl_session = repl_session_state(session_id);
+            raw_input: "/config".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::FirstParty,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
 
-        let status = handle_repl_slash_command(
-            &registry,
-            invocation,
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::OpenAI,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            false,
-        )
+    assert!(status.contains("provider=firstParty"));
+    assert!(status.contains("runtime=offline"));
+}
+
+#[tokio::test]
+async fn repl_ide_command_reports_bridge_state() {
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-ide")));
+    let tool_registry = compatibility_tool_registry();
+    let root = env::temp_dir();
+    let registry = resolved_command_registry(&root, None).await;
+    let mut active_model = "claude-sonnet-4-6".to_owned();
+    let session_id = SessionId::new_v4();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let disconnected = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "ide".to_owned(),
+            raw_input: "/ide".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::FirstParty,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let connected = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "ide".to_owned(),
+            raw_input: "/ide".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::FirstParty,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+
+    assert!(disconnected.contains("\"status\": \"not_connected\""));
+    assert!(connected.contains("\"status\": \"connected\""));
+}
+
+#[tokio::test]
+async fn repl_model_command_switches_active_model() {
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-model")));
+    let tool_registry = compatibility_tool_registry();
+    let root = env::temp_dir();
+    let registry = resolved_command_registry(&root, None).await;
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let session_id = SessionId::new_v4();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "model".to_owned(),
+            args: vec![DEFAULT_OPENAI_COMPLETION_MODEL.to_owned()],
+            raw_input: format!("/model {DEFAULT_OPENAI_COMPLETION_MODEL}"),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAI,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        true,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(active_model, DEFAULT_OPENAI_COMPLETION_MODEL);
+    assert!(status.contains("model switched"));
+}
+
+#[tokio::test]
+async fn repl_model_command_accepts_openai_compatible_custom_model() {
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
+        "repl-model-openai-compatible",
+    )));
+    let tool_registry = compatibility_tool_registry();
+    let root = env::temp_dir();
+    let registry = resolved_command_registry(&root, None).await;
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let session_id = SessionId::new_v4();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "model".to_owned(),
+            args: vec!["gemini-3.1-pro-preview".to_owned()],
+            raw_input: "/model gemini-3.1-pro-preview".to_owned(),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        true,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(active_model, "gemini-3.1-pro-preview");
+    assert!(status.contains("model switched"));
+}
+
+#[tokio::test]
+async fn repl_clear_command_resets_transcript_state() {
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-clear")));
+    let tool_registry = compatibility_tool_registry();
+    let root = env::temp_dir();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let transcript_path = store.transcript_path(session_id).await.unwrap();
+    let mut raw_messages = vec![Message::new(
+        MessageRole::User,
+        vec![ContentBlock::Text {
+            text: "hello".to_owned(),
+        }],
+    )];
+    let persisted = build_text_message(session_id, MessageRole::User, "persist".to_owned(), None);
+    store.append_message(session_id, &persisted).await.unwrap();
+    let mut active_model = "claude-sonnet-4-6".to_owned();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "clear".to_owned(),
+            raw_input: "/clear".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::FirstParty,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(status.contains("cleared session"));
+    assert!(raw_messages.is_empty());
+    assert!(!transcript_path.exists());
+}
+
+#[test]
+fn repl_command_ui_event_messages_use_attachment_metadata() {
+    let session_id = SessionId::new_v4();
+    let input = build_repl_command_input_message(session_id, None, "/config");
+    let output = build_repl_command_output_message(session_id, Some(input.id), "config", "ok");
+
+    assert_eq!(input.role, MessageRole::Attachment);
+    assert_eq!(
+        input.metadata.attributes.get("ui_role").map(String::as_str),
+        Some("command")
+    );
+    assert_eq!(output.role, MessageRole::Attachment);
+    assert_eq!(
+        output
+            .metadata
+            .attributes
+            .get("ui_role")
+            .map(String::as_str),
+        Some("command_output")
+    );
+    assert_eq!(
+        output
+            .metadata
+            .attributes
+            .get("ui_author")
+            .map(String::as_str),
+        Some("/config")
+    );
+}
+
+#[test]
+fn resumable_sessions_exclude_current_session() {
+    let current_session = SessionId::new_v4();
+    let other_session = SessionId::new_v4();
+    let sessions = vec![
+        SessionSummary {
+            session_id: current_session,
+            transcript_path: PathBuf::from(format!("{current_session}.jsonl")),
+            modified_at_unix_ms: 20,
+            message_count: 3,
+            first_prompt: "current".to_owned(),
+        },
+        SessionSummary {
+            session_id: other_session,
+            transcript_path: PathBuf::from(format!("{other_session}.jsonl")),
+            modified_at_unix_ms: 10,
+            message_count: 8,
+            first_prompt: "pick me".to_owned(),
+        },
+    ];
+
+    let filtered = resumable_sessions(sessions, current_session);
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].session_id, other_session);
+}
+
+#[test]
+fn resume_picker_builds_choice_list_entries() {
+    let session_id = SessionId::new_v4();
+    let picker = ResumePickerState {
+        sessions: vec![SessionSummary {
+            session_id,
+            transcript_path: PathBuf::from(format!("{session_id}.jsonl")),
+            modified_at_unix_ms: 10,
+            message_count: 6,
+            first_prompt: "Continue with the latest auth edge cases.".to_owned(),
+        }],
+        selected: 0,
+    };
+
+    let choice_list = build_resume_choice_list(&picker);
+
+    assert_eq!(choice_list.title, "Resume conversation");
+    assert_eq!(choice_list.items.len(), 1);
+    assert!(choice_list.items[0]
+        .label
+        .contains("Continue with the latest auth edge cases."));
+    assert!(choice_list.items[0]
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains("6 messages"));
+}
+
+#[test]
+fn transcript_backed_commands_do_not_echo_results_in_footer() {
+    assert!(!should_echo_command_result_in_footer("tasks", true, false));
+    assert!(!should_echo_command_result_in_footer(
+        "resume", false, false
+    ));
+    assert!(should_echo_command_result_in_footer("clear", false, false));
+    assert!(should_echo_command_result_in_footer("resume", false, true));
+}
+
+#[tokio::test]
+async fn repl_resume_command_switches_live_session() {
+    let root = temp_session_root("repl-resume");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let current_session = SessionId::new_v4();
+    let resumed_session = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = vec![build_text_message(
+        current_session,
+        MessageRole::User,
+        "current prompt".to_owned(),
+        None,
+    )];
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(current_session);
+
+    let resumed_message = build_text_message(
+        resumed_session,
+        MessageRole::User,
+        "resumed output".to_owned(),
+        None,
+    );
+    store
+        .append_message(resumed_session, &resumed_message)
         .await
         .unwrap();
 
-        assert!(status.contains("\"provider\": \"openai\""));
-    }
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "resume".to_owned(),
+            args: vec![resumed_session.to_string()],
+            raw_input: format!("/resume {resumed_session}"),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
 
-    #[tokio::test]
-    async fn repl_config_command_reports_runtime_state() {
-        let store =
-            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-config")));
-        let tool_registry = compatibility_tool_registry();
-        let root = env::temp_dir();
-        let registry = resolved_command_registry(&root, None).await;
-        let mut active_model = "claude-sonnet-4-6".to_owned();
-        let session_id = SessionId::new_v4();
-        let mut raw_messages = Vec::new();
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let mut repl_session = repl_session_state(session_id);
+    assert!(status.contains("resumed"));
+    assert_eq!(repl_session.session_id, resumed_session);
+    assert_eq!(raw_messages.len(), 1);
+    assert_eq!(message_text(&raw_messages[0]), "resumed output");
+}
 
-        let status = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "config".to_owned(),
-                raw_input: "/config".to_owned(),
-                ..CommandInvocation::default()
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::FirstParty,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
+#[tokio::test]
+async fn repl_tasks_command_creates_and_lists_tasks() {
+    let root = temp_session_root("repl-tasks");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
 
-        assert!(status.contains("provider=firstParty"));
-        assert!(status.contains("runtime=offline"));
-    }
+    let created = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "tasks".to_owned(),
+            args: vec![
+                "create".to_owned(),
+                "title=review".to_owned(),
+                "status=running".to_owned(),
+            ],
+            raw_input: "/tasks create title=review status=running".to_owned(),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAI,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let listed = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "tasks".to_owned(),
+            raw_input: "/tasks".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAI,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
 
-    #[tokio::test]
-    async fn repl_ide_command_reports_bridge_state() {
-        let store =
-            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-ide")));
-        let tool_registry = compatibility_tool_registry();
-        let root = env::temp_dir();
-        let registry = resolved_command_registry(&root, None).await;
-        let mut active_model = "claude-sonnet-4-6".to_owned();
-        let session_id = SessionId::new_v4();
-        let mut raw_messages = Vec::new();
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let mut repl_session = repl_session_state(session_id);
+    assert!(created.contains("\"title\": \"review\""));
+    assert!(listed.contains("\"count\": 1"));
+    assert!(listed.contains("\"status\": \"Running\""));
+}
 
-        let disconnected = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "ide".to_owned(),
-                raw_input: "/ide".to_owned(),
-                ..CommandInvocation::default()
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::FirstParty,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-
-        let connected = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "ide".to_owned(),
-                raw_input: "/ide".to_owned(),
-                ..CommandInvocation::default()
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::FirstParty,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            true,
-        )
-        .await
-        .unwrap();
-
-        assert!(disconnected.contains("\"status\": \"not_connected\""));
-        assert!(connected.contains("\"status\": \"connected\""));
-    }
-
-    #[tokio::test]
-    async fn repl_model_command_switches_active_model() {
-        let store =
-            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-model")));
-        let tool_registry = compatibility_tool_registry();
-        let root = env::temp_dir();
-        let registry = resolved_command_registry(&root, None).await;
-        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-        let session_id = SessionId::new_v4();
-        let mut raw_messages = Vec::new();
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let mut repl_session = repl_session_state(session_id);
-
-        let status = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "model".to_owned(),
-                args: vec![DEFAULT_OPENAI_COMPLETION_MODEL.to_owned()],
-                raw_input: format!("/model {DEFAULT_OPENAI_COMPLETION_MODEL}"),
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::OpenAI,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            true,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(active_model, DEFAULT_OPENAI_COMPLETION_MODEL);
-        assert!(status.contains("model switched"));
-    }
-
-    #[tokio::test]
-    async fn repl_model_command_accepts_openai_compatible_custom_model() {
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
-            "repl-model-openai-compatible",
-        )));
-        let tool_registry = compatibility_tool_registry();
-        let root = env::temp_dir();
-        let registry = resolved_command_registry(&root, None).await;
-        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-        let session_id = SessionId::new_v4();
-        let mut raw_messages = Vec::new();
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let mut repl_session = repl_session_state(session_id);
-
-        let status = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "model".to_owned(),
-                args: vec!["gemini-3.1-pro-preview".to_owned()],
-                raw_input: "/model gemini-3.1-pro-preview".to_owned(),
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::OpenAICompatible,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            true,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(active_model, "gemini-3.1-pro-preview");
-        assert!(status.contains("model switched"));
-    }
-
-    #[tokio::test]
-    async fn repl_clear_command_resets_transcript_state() {
-        let store =
-            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-clear")));
-        let tool_registry = compatibility_tool_registry();
-        let root = env::temp_dir();
-        let registry = resolved_command_registry(&root, None).await;
-        let session_id = SessionId::new_v4();
-        let transcript_path = store.transcript_path(session_id).await.unwrap();
-        let mut raw_messages = vec![Message::new(
-            MessageRole::User,
-            vec![ContentBlock::Text {
-                text: "hello".to_owned(),
-            }],
-        )];
-        let persisted =
-            build_text_message(session_id, MessageRole::User, "persist".to_owned(), None);
-        store.append_message(session_id, &persisted).await.unwrap();
-        let mut active_model = "claude-sonnet-4-6".to_owned();
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let mut repl_session = repl_session_state(session_id);
-
-        let status = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "clear".to_owned(),
-                raw_input: "/clear".to_owned(),
-                ..CommandInvocation::default()
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::FirstParty,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert!(status.contains("cleared session"));
-        assert!(raw_messages.is_empty());
-        assert!(!transcript_path.exists());
-    }
-
-    #[test]
-    fn repl_command_ui_event_messages_use_attachment_metadata() {
-        let session_id = SessionId::new_v4();
-        let input = build_repl_command_input_message(session_id, None, "/config");
-        let output = build_repl_command_output_message(session_id, Some(input.id), "config", "ok");
-
-        assert_eq!(input.role, MessageRole::Attachment);
-        assert_eq!(
-            input.metadata.attributes.get("ui_role").map(String::as_str),
-            Some("command")
-        );
-        assert_eq!(output.role, MessageRole::Attachment);
-        assert_eq!(
-            output
-                .metadata
-                .attributes
-                .get("ui_role")
-                .map(String::as_str),
-            Some("command_output")
-        );
-        assert_eq!(
-            output
-                .metadata
-                .attributes
-                .get("ui_author")
-                .map(String::as_str),
-            Some("/config")
-        );
-    }
-
-    #[test]
-    fn resumable_sessions_exclude_current_session() {
-        let current_session = SessionId::new_v4();
-        let other_session = SessionId::new_v4();
-        let sessions = vec![
-            SessionSummary {
-                session_id: current_session,
-                transcript_path: PathBuf::from(format!("{current_session}.jsonl")),
-                modified_at_unix_ms: 20,
-                message_count: 3,
-                first_prompt: "current".to_owned(),
-            },
-            SessionSummary {
-                session_id: other_session,
-                transcript_path: PathBuf::from(format!("{other_session}.jsonl")),
-                modified_at_unix_ms: 10,
-                message_count: 8,
-                first_prompt: "pick me".to_owned(),
-            },
-        ];
-
-        let filtered = resumable_sessions(sessions, current_session);
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].session_id, other_session);
-    }
-
-    #[test]
-    fn resume_picker_builds_choice_list_entries() {
-        let session_id = SessionId::new_v4();
-        let picker = ResumePickerState {
-            sessions: vec![SessionSummary {
-                session_id,
-                transcript_path: PathBuf::from(format!("{session_id}.jsonl")),
-                modified_at_unix_ms: 10,
-                message_count: 6,
-                first_prompt: "Continue with the latest auth edge cases.".to_owned(),
-            }],
-            selected: 0,
-        };
-
-        let choice_list = build_resume_choice_list(&picker);
-
-        assert_eq!(choice_list.title, "Resume conversation");
-        assert_eq!(choice_list.items.len(), 1);
-        assert!(choice_list.items[0]
-            .label
-            .contains("Continue with the latest auth edge cases."));
-        assert!(choice_list.items[0]
-            .detail
-            .as_deref()
-            .unwrap()
-            .contains("6 messages"));
-    }
-
-    #[test]
-    fn transcript_backed_commands_do_not_echo_results_in_footer() {
-        assert!(!should_echo_command_result_in_footer("tasks", true, false));
-        assert!(!should_echo_command_result_in_footer(
-            "resume", false, false
-        ));
-        assert!(should_echo_command_result_in_footer("clear", false, false));
-        assert!(should_echo_command_result_in_footer("resume", false, true));
-    }
-
-    #[tokio::test]
-    async fn repl_resume_command_switches_live_session() {
-        let root = temp_session_root("repl-resume");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-        let tool_registry = compatibility_tool_registry();
-        let registry = resolved_command_registry(&root, None).await;
-        let current_session = SessionId::new_v4();
-        let resumed_session = SessionId::new_v4();
-        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-        let mut raw_messages = vec![build_text_message(
-            current_session,
-            MessageRole::User,
-            "current prompt".to_owned(),
-            None,
-        )];
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let mut repl_session = repl_session_state(current_session);
-
-        let resumed_message = build_text_message(
-            resumed_session,
-            MessageRole::User,
-            "resumed output".to_owned(),
-            None,
-        );
-        store
-            .append_message(resumed_session, &resumed_message)
-            .await
-            .unwrap();
-
-        let status = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "resume".to_owned(),
-                args: vec![resumed_session.to_string()],
-                raw_input: format!("/resume {resumed_session}"),
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::OpenAICompatible,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert!(status.contains("resumed"));
-        assert_eq!(repl_session.session_id, resumed_session);
-        assert_eq!(raw_messages.len(), 1);
-        assert_eq!(message_text(&raw_messages[0]), "resumed output");
-    }
-
-    #[tokio::test]
-    async fn repl_tasks_command_creates_and_lists_tasks() {
-        let root = temp_session_root("repl-tasks");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-        let tool_registry = compatibility_tool_registry();
-        let registry = resolved_command_registry(&root, None).await;
-        let session_id = SessionId::new_v4();
-        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-        let mut raw_messages = Vec::new();
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let mut repl_session = repl_session_state(session_id);
-
-        let created = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "tasks".to_owned(),
-                args: vec![
-                    "create".to_owned(),
-                    "title=review".to_owned(),
-                    "status=running".to_owned(),
-                ],
-                raw_input: "/tasks create title=review status=running".to_owned(),
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::OpenAI,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-        let listed = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "tasks".to_owned(),
-                raw_input: "/tasks".to_owned(),
-                ..CommandInvocation::default()
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::OpenAI,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert!(created.contains("\"title\": \"review\""));
-        assert!(listed.contains("\"count\": 1"));
-        assert!(listed.contains("\"status\": \"Running\""));
-    }
-
-    #[tokio::test]
-    async fn repl_plugin_command_reports_manifest_details() {
-        let root = temp_session_root("repl-plugin");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-        let tool_registry = compatibility_tool_registry();
-        let registry = resolved_command_registry(&root, None).await;
-        let session_id = SessionId::new_v4();
-        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-        let mut raw_messages = Vec::new();
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let mut repl_session = repl_session_state(session_id);
-        write_test_file(
-            &root.join(".claude-plugin/plugin.json"),
-            r#"{
+#[tokio::test]
+async fn repl_plugin_command_reports_manifest_details() {
+    let root = temp_session_root("repl-plugin");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+    write_test_file(
+        &root.join(".claude-plugin/plugin.json"),
+        r#"{
               "name": "review-tools",
               "version": "1.0.0",
               "description": "Review helpers",
@@ -1093,51 +1091,51 @@
                 }
               }
             }"#,
-        );
-        write_test_file(&root.join("skills/review/SKILL.md"), "# Review\n");
+    );
+    write_test_file(&root.join("skills/review/SKILL.md"), "# Review\n");
 
-        let status = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "plugin".to_owned(),
-                raw_input: "/plugin".to_owned(),
-                ..CommandInvocation::default()
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::OpenAI,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "plugin".to_owned(),
+            raw_input: "/plugin".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAI,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
 
-        assert!(status.contains("\"name\": \"review-tools\""));
-        assert!(status.contains("\"mcp_server_names\""));
-        assert!(status.contains("\"skill_names\""));
-    }
+    assert!(status.contains("\"name\": \"review-tools\""));
+    assert!(status.contains("\"mcp_server_names\""));
+    assert!(status.contains("\"skill_names\""));
+}
 
-    #[tokio::test]
-    async fn repl_mcp_command_lists_parsed_servers_and_auth() {
-        let root = temp_session_root("repl-mcp");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-        let tool_registry = compatibility_tool_registry();
-        let registry = resolved_command_registry(&root, None).await;
-        let session_id = SessionId::new_v4();
-        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-        let mut raw_messages = Vec::new();
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let mut repl_session = repl_session_state(session_id);
-        write_test_file(
-            &root.join(".claude-plugin/plugin.json"),
-            r#"{
+#[tokio::test]
+async fn repl_mcp_command_lists_parsed_servers_and_auth() {
+    let root = temp_session_root("repl-mcp");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+    write_test_file(
+        &root.join(".claude-plugin/plugin.json"),
+        r#"{
               "name": "mcp-tools",
               "mcpServers": {
                 "example": {
@@ -1150,107 +1148,107 @@
                 }
               }
             }"#,
-        );
+    );
 
-        let status = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "mcp".to_owned(),
-                raw_input: "/mcp".to_owned(),
-                ..CommandInvocation::default()
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::OpenAI,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "mcp".to_owned(),
+            raw_input: "/mcp".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAI,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
 
-        assert!(status.contains("\"example\""));
-        assert!(status.contains("\"oauth_device\""));
-        assert!(status.contains("\"client_id\": \"client-123\""));
-    }
+    assert!(status.contains("\"example\""));
+    assert!(status.contains("\"oauth_device\""));
+    assert!(status.contains("\"client_id\": \"client-123\""));
+}
 
-    #[tokio::test]
-    async fn repl_mcp_auth_login_starts_device_flow() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0u8; 4096];
-                loop {
-                    let read = std::io::Read::read(&mut stream, &mut buffer).unwrap();
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
+#[tokio::test]
+async fn repl_mcp_auth_login_starts_device_flow() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = std::io::Read::read(&mut stream, &mut buffer).unwrap();
+                if read == 0 {
+                    break;
                 }
-                let header_end = request
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .map(|index| index + 4)
-                    .unwrap();
-                let header_text = String::from_utf8(request[..header_end].to_vec()).unwrap();
-                let path = header_text
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or_default()
-                    .to_owned();
-                let response = match path.as_str() {
-                    "/.well-known/oauth-authorization-server" => json!({
-                        "device_authorization_endpoint": format!("http://{address}/device_authorization"),
-                        "token_endpoint": format!("http://{address}/token")
-                    }),
-                    "/device_authorization" => json!({
-                        "device_code": "device-123",
-                        "user_code": "ABCD-EFGH",
-                        "verification_uri": "https://verify.example.com",
-                        "verification_uri_complete": "https://verify.example.com/complete",
-                        "expires_in": 900,
-                        "interval": 5
-                    }),
-                    other => panic!("unexpected auth path: {other}"),
-                };
-                let body = response.to_string();
-                let response_text = format!(
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+                .unwrap();
+            let header_text = String::from_utf8(request[..header_end].to_vec()).unwrap();
+            let path = header_text
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            let response = match path.as_str() {
+                "/.well-known/oauth-authorization-server" => json!({
+                    "device_authorization_endpoint": format!("http://{address}/device_authorization"),
+                    "token_endpoint": format!("http://{address}/token")
+                }),
+                "/device_authorization" => json!({
+                    "device_code": "device-123",
+                    "user_code": "ABCD-EFGH",
+                    "verification_uri": "https://verify.example.com",
+                    "verification_uri_complete": "https://verify.example.com/complete",
+                    "expires_in": 900,
+                    "interval": 5
+                }),
+                other => panic!("unexpected auth path: {other}"),
+            };
+            let body = response.to_string();
+            let response_text = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
-                std::io::Write::write_all(&mut stream, response_text.as_bytes()).unwrap();
-            }
-        });
+            std::io::Write::write_all(&mut stream, response_text.as_bytes()).unwrap();
+        }
+    });
 
-        let root = temp_session_root("repl-mcp-auth");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-        let tool_registry = compatibility_tool_registry();
-        let registry = resolved_command_registry(&root, None).await;
-        let session_id = SessionId::new_v4();
-        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-        let mut raw_messages = Vec::new();
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let mut repl_session = repl_session_state(session_id);
-        write_test_file(
-            &root.join(".claude-plugin/plugin.json"),
-            &format!(
-                r#"{{
+    let root = temp_session_root("repl-mcp-auth");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+    write_test_file(
+        &root.join(".claude-plugin/plugin.json"),
+        &format!(
+            r#"{{
                   "name": "mcp-tools",
                   "mcpServers": {{
                     "example": {{
@@ -1263,582 +1261,581 @@
                     }}
                   }}
                 }}"#
+        ),
+    );
+
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "mcp".to_owned(),
+            args: vec![
+                "auth-login".to_owned(),
+                root.display().to_string(),
+                "example".to_owned(),
+            ],
+            raw_input: format!("/mcp auth-login {} example", root.display()),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAI,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(status.contains("\"device_code\": \"device-123\""));
+    assert!(status.contains("\"verification_uri\""));
+}
+
+#[tokio::test]
+async fn repl_remote_control_reports_local_state() {
+    let root = temp_session_root("repl-remote");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "remote-control".to_owned(),
+            raw_input: "/remote-control".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAI,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(status.contains("\"session_id\""));
+    assert!(status.contains("\"task_count\""));
+    assert!(status.contains("\"question_count\""));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_control_directive_command_reaches_bridge() {
+    let root = temp_session_root("remote-directive");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let address = temp_tcp_address();
+    let server_root = root.clone();
+    let server_address = address.clone();
+    let server = tokio::spawn(async move {
+        let server_store = ActiveSessionStore::Local(LocalSessionStore::new(server_root.clone()));
+        let server_tool_registry = compatibility_tool_registry();
+        let handler = LocalBridgeHandler {
+            store: &server_store,
+            tool_registry: &server_tool_registry,
+            cwd: server_root,
+            provider: ApiProvider::FirstParty,
+            active_model: "claude-sonnet-4-6".to_owned(),
+            session_id,
+            raw_messages: Vec::new(),
+            live_runtime: false,
+            allow_remote_tools: true,
+            pending_permission: None,
+            voice_streams: BTreeMap::new(),
+        };
+        serve_direct_session(
+            BridgeServerConfig {
+                bind_address: server_address,
+                session_id: Some(session_id),
+                allow_remote_tools: true,
+            },
+            handler,
+        )
+        .await
+        .unwrap()
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let output = render_remote_control_command(
+        &registry,
+        &CommandInvocation {
+            name: "remote-control".to_owned(),
+            args: vec![
+                "directive".to_owned(),
+                address.clone(),
+                "agent=coordinator".to_owned(),
+                "delegate the review".to_owned(),
+            ],
+            raw_input: format!(
+                "/remote-control directive {address} agent=coordinator delegate the review"
             ),
-        );
+        },
+        &Cli {
+            bridge_receive_count: Some(24),
+            ..Cli::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        ApiProvider::FirstParty,
+        "claude-sonnet-4-6",
+        session_id,
+        &[],
+        false,
+    )
+    .await
+    .unwrap();
+    let record = server.await.unwrap();
 
-        let status = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "mcp".to_owned(),
-                args: vec![
-                    "auth-login".to_owned(),
-                    root.display().to_string(),
-                    "example".to_owned(),
-                ],
-                raw_input: format!("/mcp auth-login {} example", root.display()),
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::OpenAI,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
+    assert!(output.contains("assistant_synthesis") || output.contains("delegate the review"));
+    assert!(record
+        .envelopes
+        .iter()
+        .any(|envelope| matches!(envelope, RemoteEnvelope::AssistantDirective { .. })));
+}
 
-        assert!(status.contains("\"device_code\": \"device-123\""));
-        assert!(status.contains("\"verification_uri\""));
-    }
-
-    #[tokio::test]
-    async fn repl_remote_control_reports_local_state() {
-        let root = temp_session_root("repl-remote");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-        let tool_registry = compatibility_tool_registry();
-        let registry = resolved_command_registry(&root, None).await;
-        let session_id = SessionId::new_v4();
-        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-        let mut raw_messages = Vec::new();
-        let mut vim_state = code_agent_ui::vim::VimState::default();
-        let mut repl_session = repl_session_state(session_id);
-
-        let status = handle_repl_slash_command(
-            &registry,
-            CommandInvocation {
-                name: "remote-control".to_owned(),
-                raw_input: "/remote-control".to_owned(),
-                ..CommandInvocation::default()
-            },
-            &store,
-            &tool_registry,
-            &root,
-            None,
-            ApiProvider::OpenAI,
-            &mut active_model,
-            &mut repl_session,
-            &mut raw_messages,
-            false,
-            &mut vim_state,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert!(status.contains("\"session_id\""));
-        assert!(status.contains("\"task_count\""));
-        assert!(status.contains("\"question_count\""));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn remote_control_directive_command_reaches_bridge() {
-        let root = temp_session_root("remote-directive");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-        let tool_registry = compatibility_tool_registry();
-        let registry = resolved_command_registry(&root, None).await;
-        let session_id = SessionId::new_v4();
-        let address = temp_tcp_address();
-        let server_root = root.clone();
-        let server_address = address.clone();
-        let server = tokio::spawn(async move {
-            let server_store =
-                ActiveSessionStore::Local(LocalSessionStore::new(server_root.clone()));
-            let server_tool_registry = compatibility_tool_registry();
-            let handler = LocalBridgeHandler {
-                store: &server_store,
-                tool_registry: &server_tool_registry,
-                cwd: server_root,
-                provider: ApiProvider::FirstParty,
-                active_model: "claude-sonnet-4-6".to_owned(),
-                session_id,
-                raw_messages: Vec::new(),
-                live_runtime: false,
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_control_answer_command_round_trips_question_response() {
+    let root = temp_session_root("remote-answer");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let question_id = Uuid::new_v4();
+    let address = temp_tcp_address();
+    let server_root = root.clone();
+    let server_address = address.clone();
+    let server = tokio::spawn(async move {
+        let server_store = ActiveSessionStore::Local(LocalSessionStore::new(server_root.clone()));
+        let server_tool_registry = compatibility_tool_registry();
+        let handler = LocalBridgeHandler {
+            store: &server_store,
+            tool_registry: &server_tool_registry,
+            cwd: server_root,
+            provider: ApiProvider::FirstParty,
+            active_model: "claude-sonnet-4-6".to_owned(),
+            session_id,
+            raw_messages: Vec::new(),
+            live_runtime: false,
+            allow_remote_tools: true,
+            pending_permission: None,
+            voice_streams: BTreeMap::new(),
+        };
+        serve_direct_session(
+            BridgeServerConfig {
+                bind_address: server_address,
+                session_id: Some(session_id),
                 allow_remote_tools: true,
-                pending_permission: None,
-                voice_streams: BTreeMap::new(),
-            };
-            serve_direct_session(
-                BridgeServerConfig {
-                    bind_address: server_address,
-                    session_id: Some(session_id),
-                    allow_remote_tools: true,
-                },
-                handler,
-            )
-            .await
-            .unwrap()
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let output = render_remote_control_command(
-            &registry,
-            &CommandInvocation {
-                name: "remote-control".to_owned(),
-                args: vec![
-                    "directive".to_owned(),
-                    address.clone(),
-                    "agent=coordinator".to_owned(),
-                    "delegate the review".to_owned(),
-                ],
-                raw_input: format!(
-                    "/remote-control directive {address} agent=coordinator delegate the review"
-                ),
             },
-            &Cli {
-                bridge_receive_count: Some(24),
-                ..Cli::default()
-            },
-            &store,
-            &tool_registry,
-            &root,
-            ApiProvider::FirstParty,
-            "claude-sonnet-4-6",
-            session_id,
-            &[],
-            false,
+            handler,
         )
         .await
-        .unwrap();
-        let record = server.await.unwrap();
+        .unwrap()
+    });
 
-        assert!(output.contains("assistant_synthesis") || output.contains("delegate the review"));
-        assert!(record
-            .envelopes
-            .iter()
-            .any(|envelope| matches!(envelope, RemoteEnvelope::AssistantDirective { .. })));
-    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let output = render_remote_control_command(
+        &registry,
+        &CommandInvocation {
+            name: "remote-control".to_owned(),
+            args: vec![
+                "answer".to_owned(),
+                address.clone(),
+                question_id.to_string(),
+                "approved".to_owned(),
+            ],
+            raw_input: format!("/remote-control answer {address} {question_id} approved"),
+        },
+        &Cli {
+            bridge_receive_count: Some(8),
+            ..Cli::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        ApiProvider::FirstParty,
+        "claude-sonnet-4-6",
+        session_id,
+        &[],
+        false,
+    )
+    .await
+    .unwrap();
+    let record = server.await.unwrap();
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn remote_control_answer_command_round_trips_question_response() {
-        let root = temp_session_root("remote-answer");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-        let tool_registry = compatibility_tool_registry();
-        let registry = resolved_command_registry(&root, None).await;
-        let session_id = SessionId::new_v4();
-        let question_id = Uuid::new_v4();
-        let address = temp_tcp_address();
-        let server_root = root.clone();
-        let server_address = address.clone();
-        let server = tokio::spawn(async move {
-            let server_store =
-                ActiveSessionStore::Local(LocalSessionStore::new(server_root.clone()));
-            let server_tool_registry = compatibility_tool_registry();
-            let handler = LocalBridgeHandler {
-                store: &server_store,
-                tool_registry: &server_tool_registry,
-                cwd: server_root,
-                provider: ApiProvider::FirstParty,
-                active_model: "claude-sonnet-4-6".to_owned(),
+    assert!(output.contains(&question_id.to_string()));
+    assert!(record.envelopes.iter().any(|envelope| {
+        matches!(
+            envelope,
+            RemoteEnvelope::QuestionResponse { response }
+                if response.question_id == question_id
+        )
+    }));
+}
+
+#[tokio::test]
+async fn local_bridge_handler_runs_prompt_turns() {
+    let store =
+        ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("bridge-prompt")));
+    let tool_registry = compatibility_tool_registry();
+    let session_id = SessionId::new_v4();
+    let mut handler = LocalBridgeHandler {
+        store: &store,
+        tool_registry: &tool_registry,
+        cwd: env::temp_dir(),
+        provider: ApiProvider::FirstParty,
+        active_model: "claude-sonnet-4-6".to_owned(),
+        session_id,
+        raw_messages: Vec::new(),
+        live_runtime: false,
+        allow_remote_tools: true,
+        pending_permission: None,
+        voice_streams: BTreeMap::new(),
+    };
+
+    let envelopes = handler
+        .on_envelope(&RemoteEnvelope::Message {
+            message: build_text_message(
                 session_id,
-                raw_messages: Vec::new(),
-                live_runtime: false,
-                allow_remote_tools: true,
-                pending_permission: None,
-                voice_streams: BTreeMap::new(),
-            };
-            serve_direct_session(
-                BridgeServerConfig {
-                    bind_address: server_address,
-                    session_id: Some(session_id),
-                    allow_remote_tools: true,
-                },
-                handler,
-            )
-            .await
-            .unwrap()
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let output = render_remote_control_command(
-            &registry,
-            &CommandInvocation {
-                name: "remote-control".to_owned(),
-                args: vec![
-                    "answer".to_owned(),
-                    address.clone(),
-                    question_id.to_string(),
-                    "approved".to_owned(),
-                ],
-                raw_input: format!("/remote-control answer {address} {question_id} approved"),
-            },
-            &Cli {
-                bridge_receive_count: Some(8),
-                ..Cli::default()
-            },
-            &store,
-            &tool_registry,
-            &root,
-            ApiProvider::FirstParty,
-            "claude-sonnet-4-6",
-            session_id,
-            &[],
-            false,
-        )
+                MessageRole::User,
+                "bridge hello".to_owned(),
+                None,
+            ),
+        })
         .await
         .unwrap();
-        let record = server.await.unwrap();
 
-        assert!(output.contains(&question_id.to_string()));
-        assert!(record.envelopes.iter().any(|envelope| {
-            matches!(
-                envelope,
-                RemoteEnvelope::QuestionResponse { response }
-                    if response.question_id == question_id
-            )
-        }));
-    }
+    assert!(envelopes.iter().any(|envelope| match envelope {
+        RemoteEnvelope::Message { message } => message.blocks.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text.contains("bridge hello"))
+        ),
+        _ => false,
+    }));
+}
 
-    #[tokio::test]
-    async fn local_bridge_handler_runs_prompt_turns() {
-        let store =
-            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("bridge-prompt")));
-        let tool_registry = compatibility_tool_registry();
-        let session_id = SessionId::new_v4();
-        let mut handler = LocalBridgeHandler {
-            store: &store,
-            tool_registry: &tool_registry,
-            cwd: env::temp_dir(),
-            provider: ApiProvider::FirstParty,
-            active_model: "claude-sonnet-4-6".to_owned(),
-            session_id,
-            raw_messages: Vec::new(),
-            live_runtime: false,
-            allow_remote_tools: true,
-            pending_permission: None,
-            voice_streams: BTreeMap::new(),
-        };
+#[tokio::test]
+async fn local_bridge_handler_supports_assistant_and_voice_inputs() {
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
+        "bridge-assistant",
+    )));
+    let tool_registry = compatibility_tool_registry();
+    let session_id = SessionId::new_v4();
+    let mut handler = LocalBridgeHandler {
+        store: &store,
+        tool_registry: &tool_registry,
+        cwd: env::temp_dir(),
+        provider: ApiProvider::FirstParty,
+        active_model: "claude-sonnet-4-6".to_owned(),
+        session_id,
+        raw_messages: Vec::new(),
+        live_runtime: false,
+        allow_remote_tools: true,
+        pending_permission: None,
+        voice_streams: BTreeMap::new(),
+    };
 
-        let envelopes = handler
-            .on_envelope(&RemoteEnvelope::Message {
-                message: build_text_message(
-                    session_id,
-                    MessageRole::User,
-                    "bridge hello".to_owned(),
-                    None,
-                ),
-            })
-            .await
-            .unwrap();
+    let directive = handler
+        .on_envelope(&RemoteEnvelope::AssistantDirective {
+            directive: AssistantDirective {
+                agent_id: Some("coordinator".to_owned()),
+                instruction: "delegate the review".to_owned(),
+                ..AssistantDirective::default()
+            },
+        })
+        .await
+        .unwrap();
+    let voice = handler
+        .on_envelope(&RemoteEnvelope::VoiceFrame {
+            frame: VoiceFrame {
+                format: "text/plain".to_owned(),
+                payload_base64: base64_encode(b"voice hello"),
+                sequence: 1,
+                stream_id: Some("voice".to_owned()),
+                is_final: true,
+            },
+        })
+        .await
+        .unwrap();
 
-        assert!(envelopes.iter().any(|envelope| match envelope {
-            RemoteEnvelope::Message { message } => message
-                .blocks
-                .iter()
-                .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("bridge hello"))),
-            _ => false,
-        }));
-    }
+    let directive_messages = directive
+        .iter()
+        .filter(|envelope| matches!(envelope, RemoteEnvelope::Message { .. }))
+        .count();
+    assert!(directive_messages >= 2);
+    assert!(voice
+        .iter()
+        .any(|envelope| matches!(envelope, RemoteEnvelope::Message { .. })));
+}
 
-    #[tokio::test]
-    async fn local_bridge_handler_supports_assistant_and_voice_inputs() {
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
-            "bridge-assistant",
-        )));
-        let tool_registry = compatibility_tool_registry();
-        let session_id = SessionId::new_v4();
-        let mut handler = LocalBridgeHandler {
-            store: &store,
-            tool_registry: &tool_registry,
-            cwd: env::temp_dir(),
-            provider: ApiProvider::FirstParty,
-            active_model: "claude-sonnet-4-6".to_owned(),
-            session_id,
-            raw_messages: Vec::new(),
-            live_runtime: false,
-            allow_remote_tools: true,
-            pending_permission: None,
-            voice_streams: BTreeMap::new(),
-        };
+#[tokio::test]
+async fn local_bridge_handler_emits_tool_call_and_result_envelopes() {
+    let root = temp_session_root("bridge-tool");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let session_id = SessionId::new_v4();
+    let mut handler = LocalBridgeHandler {
+        store: &store,
+        tool_registry: &tool_registry,
+        cwd: root,
+        provider: ApiProvider::FirstParty,
+        active_model: "claude-sonnet-4-6".to_owned(),
+        session_id,
+        raw_messages: Vec::new(),
+        live_runtime: false,
+        allow_remote_tools: true,
+        pending_permission: None,
+        voice_streams: BTreeMap::new(),
+    };
 
-        let directive = handler
-            .on_envelope(&RemoteEnvelope::AssistantDirective {
-                directive: AssistantDirective {
-                    agent_id: Some("coordinator".to_owned()),
-                    instruction: "delegate the review".to_owned(),
-                    ..AssistantDirective::default()
-                },
-            })
-            .await
-            .unwrap();
-        let voice = handler
-            .on_envelope(&RemoteEnvelope::VoiceFrame {
-                frame: VoiceFrame {
-                    format: "text/plain".to_owned(),
-                    payload_base64: base64_encode(b"voice hello"),
-                    sequence: 1,
-                    stream_id: Some("voice".to_owned()),
-                    is_final: true,
-                },
-            })
-            .await
-            .unwrap();
+    let envelopes = handler
+        .on_envelope(&RemoteEnvelope::Message {
+            message: build_text_message(
+                session_id,
+                MessageRole::User,
+                "tool:memory {\"action\":\"write\",\"value\":{\"note\":\"ok\"}}".to_owned(),
+                None,
+            ),
+        })
+        .await
+        .unwrap();
 
-        let directive_messages = directive
-            .iter()
-            .filter(|envelope| matches!(envelope, RemoteEnvelope::Message { .. }))
-            .count();
-        assert!(directive_messages >= 2);
-        assert!(voice
-            .iter()
-            .any(|envelope| matches!(envelope, RemoteEnvelope::Message { .. })));
-    }
+    assert!(envelopes.iter().any(
+        |envelope| matches!(envelope, RemoteEnvelope::ToolCall { call } if call.name == "memory")
+    ));
+    assert!(envelopes.iter().any(|envelope| matches!(envelope, RemoteEnvelope::ToolResult { result } if result.tool_call_id == "echo_tool_call")));
+}
 
-    #[tokio::test]
-    async fn local_bridge_handler_emits_tool_call_and_result_envelopes() {
-        let root = temp_session_root("bridge-tool");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-        let tool_registry = compatibility_tool_registry();
-        let session_id = SessionId::new_v4();
-        let mut handler = LocalBridgeHandler {
-            store: &store,
-            tool_registry: &tool_registry,
-            cwd: root,
-            provider: ApiProvider::FirstParty,
-            active_model: "claude-sonnet-4-6".to_owned(),
-            session_id,
-            raw_messages: Vec::new(),
-            live_runtime: false,
-            allow_remote_tools: true,
-            pending_permission: None,
-            voice_streams: BTreeMap::new(),
-        };
+#[tokio::test]
+async fn local_bridge_handler_buffers_streamed_voice_frames() {
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
+        "bridge-voice-stream",
+    )));
+    let tool_registry = compatibility_tool_registry();
+    let session_id = SessionId::new_v4();
+    let mut handler = LocalBridgeHandler {
+        store: &store,
+        tool_registry: &tool_registry,
+        cwd: env::temp_dir(),
+        provider: ApiProvider::FirstParty,
+        active_model: "claude-sonnet-4-6".to_owned(),
+        session_id,
+        raw_messages: Vec::new(),
+        live_runtime: false,
+        allow_remote_tools: true,
+        pending_permission: None,
+        voice_streams: BTreeMap::new(),
+    };
 
-        let envelopes = handler
-            .on_envelope(&RemoteEnvelope::Message {
-                message: build_text_message(
-                    session_id,
-                    MessageRole::User,
-                    "tool:memory {\"action\":\"write\",\"value\":{\"note\":\"ok\"}}".to_owned(),
-                    None,
-                ),
-            })
-            .await
-            .unwrap();
+    let partial = handler
+        .on_envelope(&RemoteEnvelope::VoiceFrame {
+            frame: VoiceFrame {
+                format: "text/plain".to_owned(),
+                payload_base64: base64_encode(b"voice "),
+                sequence: 1,
+                stream_id: Some("stream-a".to_owned()),
+                is_final: false,
+            },
+        })
+        .await
+        .unwrap();
+    let final_chunk = handler
+        .on_envelope(&RemoteEnvelope::VoiceFrame {
+            frame: VoiceFrame {
+                format: "text/plain".to_owned(),
+                payload_base64: base64_encode(b"hello"),
+                sequence: 2,
+                stream_id: Some("stream-a".to_owned()),
+                is_final: true,
+            },
+        })
+        .await
+        .unwrap();
 
-        assert!(envelopes.iter().any(|envelope| matches!(envelope, RemoteEnvelope::ToolCall { call } if call.name == "memory")));
-        assert!(envelopes.iter().any(|envelope| matches!(envelope, RemoteEnvelope::ToolResult { result } if result.tool_call_id == "echo_tool_call")));
-    }
+    assert!(partial.iter().any(|envelope| matches!(envelope, RemoteEnvelope::Ack { note } if note.starts_with("voice_frame_buffered:"))));
+    assert!(final_chunk
+        .iter()
+        .any(|envelope| matches!(envelope, RemoteEnvelope::Message { .. })));
+}
 
-    #[tokio::test]
-    async fn local_bridge_handler_buffers_streamed_voice_frames() {
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
-            "bridge-voice-stream",
-        )));
-        let tool_registry = compatibility_tool_registry();
-        let session_id = SessionId::new_v4();
-        let mut handler = LocalBridgeHandler {
-            store: &store,
-            tool_registry: &tool_registry,
-            cwd: env::temp_dir(),
-            provider: ApiProvider::FirstParty,
-            active_model: "claude-sonnet-4-6".to_owned(),
-            session_id,
-            raw_messages: Vec::new(),
-            live_runtime: false,
-            allow_remote_tools: true,
-            pending_permission: None,
-            voice_streams: BTreeMap::new(),
-        };
+#[tokio::test]
+async fn local_bridge_handler_persists_binary_voice_frames() {
+    let root = temp_session_root("bridge-voice-binary");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let session_id = SessionId::new_v4();
+    let mut handler = LocalBridgeHandler {
+        store: &store,
+        tool_registry: &tool_registry,
+        cwd: root.clone(),
+        provider: ApiProvider::FirstParty,
+        active_model: "claude-sonnet-4-6".to_owned(),
+        session_id,
+        raw_messages: Vec::new(),
+        live_runtime: false,
+        allow_remote_tools: true,
+        pending_permission: None,
+        voice_streams: BTreeMap::new(),
+    };
 
-        let partial = handler
-            .on_envelope(&RemoteEnvelope::VoiceFrame {
-                frame: VoiceFrame {
-                    format: "text/plain".to_owned(),
-                    payload_base64: base64_encode(b"voice "),
-                    sequence: 1,
-                    stream_id: Some("stream-a".to_owned()),
-                    is_final: false,
-                },
-            })
-            .await
-            .unwrap();
-        let final_chunk = handler
-            .on_envelope(&RemoteEnvelope::VoiceFrame {
-                frame: VoiceFrame {
-                    format: "text/plain".to_owned(),
-                    payload_base64: base64_encode(b"hello"),
-                    sequence: 2,
-                    stream_id: Some("stream-a".to_owned()),
-                    is_final: true,
-                },
-            })
-            .await
-            .unwrap();
+    let first = handler
+        .on_envelope(&RemoteEnvelope::VoiceFrame {
+            frame: VoiceFrame {
+                format: "audio/wav".to_owned(),
+                payload_base64: base64_encode(&[0, 255]),
+                sequence: 1,
+                stream_id: Some("binary-stream".to_owned()),
+                is_final: false,
+            },
+        })
+        .await
+        .unwrap();
+    let second = handler
+        .on_envelope(&RemoteEnvelope::VoiceFrame {
+            frame: VoiceFrame {
+                format: "audio/wav".to_owned(),
+                payload_base64: base64_encode(&[12, 13]),
+                sequence: 2,
+                stream_id: Some("binary-stream".to_owned()),
+                is_final: true,
+            },
+        })
+        .await
+        .unwrap();
 
-        assert!(partial.iter().any(|envelope| matches!(envelope, RemoteEnvelope::Ack { note } if note.starts_with("voice_frame_buffered:"))));
-        assert!(final_chunk
-            .iter()
-            .any(|envelope| matches!(envelope, RemoteEnvelope::Message { .. })));
-    }
+    let saved_path = second
+        .iter()
+        .find_map(|envelope| match envelope {
+            RemoteEnvelope::Ack { note } => {
+                note.strip_prefix("voice_frame_saved:").map(PathBuf::from)
+            }
+            _ => None,
+        })
+        .expect("missing voice_frame_saved ack");
 
-    #[tokio::test]
-    async fn local_bridge_handler_persists_binary_voice_frames() {
-        let root = temp_session_root("bridge-voice-binary");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-        let tool_registry = compatibility_tool_registry();
-        let session_id = SessionId::new_v4();
-        let mut handler = LocalBridgeHandler {
-            store: &store,
-            tool_registry: &tool_registry,
-            cwd: root.clone(),
-            provider: ApiProvider::FirstParty,
-            active_model: "claude-sonnet-4-6".to_owned(),
-            session_id,
-            raw_messages: Vec::new(),
-            live_runtime: false,
-            allow_remote_tools: true,
-            pending_permission: None,
-            voice_streams: BTreeMap::new(),
-        };
+    assert!(first.iter().any(|envelope| matches!(envelope, RemoteEnvelope::Ack { note } if note.starts_with("voice_frame_buffered:"))));
+    assert!(saved_path.exists());
+    assert_eq!(fs::read(saved_path).unwrap(), vec![0, 255, 12, 13]);
+}
 
-        let first = handler
-            .on_envelope(&RemoteEnvelope::VoiceFrame {
-                frame: VoiceFrame {
-                    format: "audio/wav".to_owned(),
-                    payload_base64: base64_encode(&[0, 255]),
-                    sequence: 1,
-                    stream_id: Some("binary-stream".to_owned()),
-                    is_final: false,
-                },
-            })
-            .await
-            .unwrap();
-        let second = handler
-            .on_envelope(&RemoteEnvelope::VoiceFrame {
-                frame: VoiceFrame {
-                    format: "audio/wav".to_owned(),
-                    payload_base64: base64_encode(&[12, 13]),
-                    sequence: 2,
-                    stream_id: Some("binary-stream".to_owned()),
-                    is_final: true,
-                },
-            })
-            .await
-            .unwrap();
+#[tokio::test]
+async fn local_bridge_handler_requires_permission_for_remote_tool_calls() {
+    let root = temp_session_root("bridge-remote-tool");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let session_id = SessionId::new_v4();
+    let mut handler = LocalBridgeHandler {
+        store: &store,
+        tool_registry: &tool_registry,
+        cwd: root,
+        provider: ApiProvider::FirstParty,
+        active_model: "claude-sonnet-4-6".to_owned(),
+        session_id,
+        raw_messages: Vec::new(),
+        live_runtime: false,
+        allow_remote_tools: false,
+        pending_permission: None,
+        voice_streams: BTreeMap::new(),
+    };
 
-        let saved_path = second
-            .iter()
-            .find_map(|envelope| match envelope {
-                RemoteEnvelope::Ack { note } => {
-                    note.strip_prefix("voice_frame_saved:").map(PathBuf::from)
-                }
-                _ => None,
-            })
-            .expect("missing voice_frame_saved ack");
+    let initial = handler
+        .on_envelope(&RemoteEnvelope::ToolCall {
+            call: code_agent_core::ToolCall {
+                id: "remote-write".to_owned(),
+                name: "file_write".to_owned(),
+                input_json: json!({
+                    "path": "remote.txt",
+                    "content": "ok"
+                })
+                .to_string(),
+                thought_signature: None,
+            },
+        })
+        .await
+        .unwrap();
 
-        assert!(first.iter().any(|envelope| matches!(envelope, RemoteEnvelope::Ack { note } if note.starts_with("voice_frame_buffered:"))));
-        assert!(saved_path.exists());
-        assert_eq!(fs::read(saved_path).unwrap(), vec![0, 255, 12, 13]);
-    }
+    let request_id = initial
+        .iter()
+        .find_map(|envelope| match envelope {
+            RemoteEnvelope::PermissionRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("missing permission request");
 
-    #[tokio::test]
-    async fn local_bridge_handler_requires_permission_for_remote_tool_calls() {
-        let root = temp_session_root("bridge-remote-tool");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-        let tool_registry = compatibility_tool_registry();
-        let session_id = SessionId::new_v4();
-        let mut handler = LocalBridgeHandler {
-            store: &store,
-            tool_registry: &tool_registry,
-            cwd: root,
-            provider: ApiProvider::FirstParty,
-            active_model: "claude-sonnet-4-6".to_owned(),
-            session_id,
-            raw_messages: Vec::new(),
-            live_runtime: false,
-            allow_remote_tools: false,
-            pending_permission: None,
-            voice_streams: BTreeMap::new(),
-        };
+    let approved = handler
+        .on_envelope(&RemoteEnvelope::PermissionResponse {
+            response: RemotePermissionResponse {
+                id: request_id,
+                approved: true,
+                note: None,
+            },
+        })
+        .await
+        .unwrap();
 
-        let initial = handler
-            .on_envelope(&RemoteEnvelope::ToolCall {
-                call: code_agent_core::ToolCall {
-                    id: "remote-write".to_owned(),
-                    name: "file_write".to_owned(),
-                    input_json: json!({
-                        "path": "remote.txt",
-                        "content": "ok"
-                    })
-                    .to_string(),
-                    thought_signature: None,
-                },
-            })
-            .await
-            .unwrap();
+    assert!(initial.iter().any(|envelope| matches!(envelope, RemoteEnvelope::PermissionRequest { request } if request.tool_name == "file_write")));
+    assert!(approved.iter().any(
+        |envelope| matches!(envelope, RemoteEnvelope::ToolResult { result } if !result.is_error)
+    ));
+}
 
-        let request_id = initial
-            .iter()
-            .find_map(|envelope| match envelope {
-                RemoteEnvelope::PermissionRequest { request } => Some(request.id.clone()),
-                _ => None,
-            })
-            .expect("missing permission request");
+#[tokio::test]
+async fn local_bridge_handler_resumes_existing_sessions() {
+    let root = temp_session_root("bridge-resume");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root));
+    let tool_registry = compatibility_tool_registry();
+    let resumed_session = SessionId::new_v4();
+    let persisted = build_text_message(
+        resumed_session,
+        MessageRole::Assistant,
+        "resumed output".to_owned(),
+        None,
+    );
+    store
+        .append_message(resumed_session, &persisted)
+        .await
+        .unwrap();
 
-        let approved = handler
-            .on_envelope(&RemoteEnvelope::PermissionResponse {
-                response: RemotePermissionResponse {
-                    id: request_id,
-                    approved: true,
-                    note: None,
-                },
-            })
-            .await
-            .unwrap();
+    let mut handler = LocalBridgeHandler {
+        store: &store,
+        tool_registry: &tool_registry,
+        cwd: env::temp_dir(),
+        provider: ApiProvider::FirstParty,
+        active_model: "claude-sonnet-4-6".to_owned(),
+        session_id: SessionId::new_v4(),
+        raw_messages: Vec::new(),
+        live_runtime: false,
+        allow_remote_tools: true,
+        pending_permission: None,
+        voice_streams: BTreeMap::new(),
+    };
 
-        assert!(initial.iter().any(|envelope| matches!(envelope, RemoteEnvelope::PermissionRequest { request } if request.tool_name == "file_write")));
-        assert!(approved.iter().any(
-            |envelope| matches!(envelope, RemoteEnvelope::ToolResult { result } if !result.is_error)
-        ));
-    }
+    let envelopes = handler
+        .on_envelope(&RemoteEnvelope::ResumeSession {
+            request: ResumeSessionRequest {
+                target: resumed_session.to_string(),
+            },
+        })
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn local_bridge_handler_resumes_existing_sessions() {
-        let root = temp_session_root("bridge-resume");
-        let store = ActiveSessionStore::Local(LocalSessionStore::new(root));
-        let tool_registry = compatibility_tool_registry();
-        let resumed_session = SessionId::new_v4();
-        let persisted = build_text_message(
-            resumed_session,
-            MessageRole::Assistant,
-            "resumed output".to_owned(),
-            None,
-        );
-        store
-            .append_message(resumed_session, &persisted)
-            .await
-            .unwrap();
-
-        let mut handler = LocalBridgeHandler {
-            store: &store,
-            tool_registry: &tool_registry,
-            cwd: env::temp_dir(),
-            provider: ApiProvider::FirstParty,
-            active_model: "claude-sonnet-4-6".to_owned(),
-            session_id: SessionId::new_v4(),
-            raw_messages: Vec::new(),
-            live_runtime: false,
-            allow_remote_tools: true,
-            pending_permission: None,
-            voice_streams: BTreeMap::new(),
-        };
-
-        let envelopes = handler
-            .on_envelope(&RemoteEnvelope::ResumeSession {
-                request: ResumeSessionRequest {
-                    target: resumed_session.to_string(),
-                },
-            })
-            .await
-            .unwrap();
-
-        assert!(envelopes.iter().any(|envelope| matches!(envelope, RemoteEnvelope::Message { message } if message_text(message).contains("resumed output"))));
-        assert!(envelopes.iter().any(|envelope| matches!(envelope, RemoteEnvelope::SessionState { state } if state.session_id == Some(resumed_session))));
-    }
+    assert!(envelopes.iter().any(|envelope| matches!(envelope, RemoteEnvelope::Message { message } if message_text(message).contains("resumed output"))));
+    assert!(envelopes.iter().any(|envelope| matches!(envelope, RemoteEnvelope::SessionState { state } if state.session_id == Some(resumed_session))));
+}

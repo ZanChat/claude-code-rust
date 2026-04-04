@@ -12,11 +12,14 @@ use tokio::time::sleep;
 
 use tokio::process::Command;
 
-use code_agent_core::{SessionId, Message, ContentBlock, MessageRole};
+use code_agent_core::{ContentBlock, Message, MessageRole, SessionId};
 
 use async_trait::async_trait;
 
-use reqwest::{Client, Method, RequestBuilder, header::{HeaderMap, HeaderValue, HeaderName, CONTENT_TYPE, ACCEPT, AUTHORIZATION, USER_AGENT}};
+use reqwest::{
+    header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
+    Client, Method, RequestBuilder,
+};
 
 use serde_json::{json, Value};
 
@@ -27,8 +30,6 @@ use time::OffsetDateTime;
 use hmac::{Hmac, Mac};
 
 use sha2::{Digest, Sha256};
-
-
 
 #[derive(Clone, Debug)]
 pub struct HttpProvider {
@@ -1077,7 +1078,10 @@ pub(crate) fn should_retry_openai_responses_status(status: reqwest::StatusCode) 
     ) || status.is_server_error()
 }
 
-pub(crate) fn openai_responses_retry_delay(attempt: usize, retry_after_header: Option<&str>) -> Duration {
+pub(crate) fn openai_responses_retry_delay(
+    attempt: usize,
+    retry_after_header: Option<&str>,
+) -> Duration {
     if let Some(retry_after_header) = retry_after_header {
         if let Ok(seconds) = retry_after_header.trim().parse::<u64>() {
             return Duration::from_secs(seconds);

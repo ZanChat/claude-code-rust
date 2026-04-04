@@ -9,7 +9,6 @@ use session::*;
 mod cli_args;
 use cli_args::*;
 mod reports;
-use reports::*;
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use code_agent_bridge::{
@@ -36,17 +35,17 @@ use code_agent_providers::{
     ProviderRequest, ProviderToolDefinition,
 };
 use code_agent_session::{
-    agent_transcript_path_for, claude_config_home_dir, compact_messages, estimate_message_tokens,
+    agent_transcript_path_for, compact_messages, estimate_message_tokens,
     extract_last_json_string_field, get_project_dir, import_transcript_to_session_root,
     materialize_runtime_messages, CompactionConfig, CompactionOutcome, JsonlTranscriptCodec,
-    LocalSessionStore, ProjectSessionStore, SessionStore, SessionSummary, TranscriptCodec,
+    SessionSummary, TranscriptCodec,
 };
 use code_agent_tools::{compatibility_tool_registry, ToolCallRequest, ToolContext, ToolRegistry};
 use code_agent_ui::{
     draw_terminal as draw_tui, mouse_action_for_position, render_to_string as render_tui_to_string,
     ChoiceListItem, ChoiceListState, CommandPaletteEntry, Notification, PaneKind, PanePreview,
     PermissionPromptState, QuestionUiEntry, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup,
-    TranscriptLine, UiMouseAction, UiState,
+    UiMouseAction, UiState,
 };
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
@@ -61,13 +60,14 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
-use serde::{Deserialize, Serialize};
+use reports::*;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::future::Future;
 use std::io::stdout;
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -76,12 +76,9 @@ use uuid::Uuid;
 #[cfg(test)]
 use code_agent_providers::EchoProvider;
 
-
 const UI_EVENT_TAG: &str = "ui_event";
 const UI_ROLE_ATTRIBUTE: &str = "ui_role";
 const UI_AUTHOR_ATTRIBUTE: &str = "ui_author";
-
-
 
 fn should_exit_repl(prompt_text: &str) -> bool {
     matches!(prompt_text.trim(), "quit" | "exit" | "/quit" | "/exit")
@@ -90,7 +87,6 @@ fn should_exit_repl(prompt_text: &str) -> bool {
 fn status_line_needs_marquee(status_line: &str) -> bool {
     status_line.chars().count() > 96
 }
-
 
 async fn resolve_continue_target(cli: &mut Cli, store: &ActiveSessionStore) -> Result<()> {
     if cli.resume.is_some() || !cli.continue_latest {
@@ -106,7 +102,6 @@ async fn resolve_continue_target(cli: &mut Cli, store: &ActiveSessionStore) -> R
     cli.resume = Some(summary.session_id.to_string());
     Ok(())
 }
-
 
 fn build_text_message(
     session_id: SessionId,
@@ -221,7 +216,6 @@ fn optimistic_messages_for_command(
     preview_messages
 }
 
-
 pub(crate) fn resume_picker_item(summary: &SessionSummary) -> ChoiceListItem {
     let prompt = preview_lines_from_text(summary.first_prompt.clone(), 1, 56).join(" ");
     ChoiceListItem {
@@ -234,7 +228,6 @@ pub(crate) fn resume_picker_item(summary: &SessionSummary) -> ChoiceListItem {
         secondary: None,
     }
 }
-
 
 async fn resume_repl_session(
     store: &ActiveSessionStore,
@@ -285,6 +278,175 @@ fn preview_detail(text: &str, max_lines: usize, max_width: usize) -> Option<Stri
     Some(preview_lines_from_text(trimmed.to_owned(), max_lines, max_width).join("\n"))
 }
 
+fn task_prefers_input(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Pending | TaskStatus::Running | TaskStatus::WaitingForInput
+    )
+}
+
+fn summarize_task_detail(
+    status: &TaskStatus,
+    input: Option<&str>,
+    output: Option<&str>,
+    max_lines: usize,
+    max_width: usize,
+) -> Option<String> {
+    let detail = if task_prefers_input(status) {
+        input.or(output)
+    } else {
+        output.or(input)
+    };
+    detail.and_then(|text| preview_detail(text, max_lines, max_width))
+}
+
+fn tool_display_name(tool_name: &str) -> String {
+    let normalized = tool_name.replace('_', " ");
+    let mut chars = normalized.chars();
+    match chars.next() {
+        Some(first) => format!(
+            "{}{}",
+            first.to_ascii_uppercase(),
+            chars.collect::<String>()
+        ),
+        None => "Tool".to_owned(),
+    }
+}
+
+fn first_non_empty_string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    })
+}
+
+fn pending_detail_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => preview_detail(text, 1, 96),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Array(items) => {
+            let joined = items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(text) => Some(text.trim().to_owned()),
+                    Value::Number(number) => Some(number.to_string()),
+                    Value::Bool(flag) => Some(flag.to_string()),
+                    _ => None,
+                })
+                .filter(|text| !text.is_empty())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(", ");
+            preview_detail(&joined, 1, 96)
+        }
+        _ => None,
+    }
+}
+
+fn pending_tool_detail_from_json(tool_name: &str, payload: &Value) -> Option<String> {
+    let preferred_keys: &[&str] = match tool_name {
+        "bash" | "powershell" | "terminal_capture" => &["command"],
+        "file_read" | "file_write" | "file_edit" | "apply_patch" => &["path", "filePath"],
+        "grep" => &["pattern", "query"],
+        "glob" => &["pattern"],
+        "web_fetch" | "fetch_webpage" => &["url", "query"],
+        "memory" => &["action", "value"],
+        "run_in_terminal" => &["command", "goal"],
+        _ => &[
+            "command",
+            "path",
+            "filePath",
+            "query",
+            "pattern",
+            "url",
+            "tool_name",
+            "toolName",
+            "action",
+            "title",
+            "prompt",
+        ],
+    };
+
+    if let Some(text) = first_non_empty_string_field(payload, preferred_keys) {
+        return preview_detail(text, 1, 96);
+    }
+
+    payload
+        .as_object()
+        .and_then(|object| object.values().find_map(pending_detail_from_value))
+        .or_else(|| preview_detail(&payload.to_string(), 1, 96))
+}
+
+fn pending_tool_detail_from_call(call: &code_agent_core::ToolCall) -> Option<String> {
+    serde_json::from_str::<Value>(&call.input_json)
+        .ok()
+        .as_ref()
+        .and_then(|payload| pending_tool_detail_from_json(&call.name, payload))
+}
+
+fn pending_tool_detail_from_metadata(tool_name: &str, metadata: &Value) -> Option<String> {
+    if let Ok(task) = serde_json::from_value::<TaskRecord>(metadata.clone()) {
+        return summarize_task_detail(
+            &task.status,
+            task.input.as_deref(),
+            task.output.as_deref(),
+            1,
+            96,
+        );
+    }
+
+    if let Some(workflow_task) = metadata
+        .get("workflow")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskRecord>(value).ok())
+    {
+        return summarize_task_detail(
+            &workflow_task.status,
+            workflow_task.input.as_deref(),
+            workflow_task.output.as_deref(),
+            1,
+            96,
+        );
+    }
+
+    pending_tool_detail_from_json(tool_name, metadata)
+}
+
+fn compose_pending_progress_label(status_label: &str, status_detail: Option<&str>) -> String {
+    match status_detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        Some(detail) => format!("{status_label} · {detail}"),
+        None => status_label.to_owned(),
+    }
+}
+
+fn task_ui_sort_rank(status: &TaskStatus) -> usize {
+    match status {
+        TaskStatus::Running => 0,
+        TaskStatus::WaitingForInput => 1,
+        TaskStatus::Pending => 2,
+        TaskStatus::Completed => 3,
+        TaskStatus::Failed => 4,
+        TaskStatus::Cancelled => 5,
+    }
+}
+
+fn sorted_tasks_for_ui(mut tasks: Vec<TaskRecord>) -> Vec<TaskRecord> {
+    tasks.sort_by(|left, right| {
+        task_ui_sort_rank(&left.status)
+            .cmp(&task_ui_sort_rank(&right.status))
+            .then_with(|| right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+    tasks
+}
+
 fn summarize_task_ui_event(task: &TaskRecord) -> String {
     let mut lines = vec![format!(
         "{} {} [{}]",
@@ -292,12 +454,13 @@ fn summarize_task_ui_event(task: &TaskRecord) -> String {
         task.title,
         task.kind
     )];
-    if let Some(detail) = task
-        .output
-        .as_deref()
-        .or(task.input.as_deref())
-        .and_then(|text| preview_detail(text, 2, 96))
-    {
+    if let Some(detail) = summarize_task_detail(
+        &task.status,
+        task.input.as_deref(),
+        task.output.as_deref(),
+        2,
+        96,
+    ) {
         lines.push(detail);
     }
     lines.join("\n")
@@ -776,9 +939,8 @@ fn recent_task_preview(cwd: &Path) -> PanePreview {
             lines: vec!["No task activity yet.".to_owned()],
         },
         Ok(tasks) => {
-            let lines = tasks
+            let lines = sorted_tasks_for_ui(tasks)
                 .into_iter()
-                .rev()
                 .take(6)
                 .map(|task| format!("{:?} {} [{}]", task.status, task.title, task.kind))
                 .collect::<Vec<_>>();
@@ -813,11 +975,8 @@ fn recent_question_preview(cwd: &Path) -> Option<PanePreview> {
 
 fn load_task_ui_data(cwd: &Path) -> (Vec<TaskUiEntry>, Vec<QuestionUiEntry>) {
     let store = task_store_for(cwd);
-    let tasks = store
-        .list_tasks()
-        .unwrap_or_default()
+    let tasks = sorted_tasks_for_ui(store.list_tasks().unwrap_or_default())
         .into_iter()
-        .rev()
         .take(8)
         .map(|task| TaskUiEntry {
             title: task.title,
@@ -958,6 +1117,14 @@ fn build_repl_ui_state(
 ) -> code_agent_ui::UiState {
     let runtime_messages = materialize_runtime_messages(raw_messages);
     let mut state = app.state_from_messages(runtime_messages.clone(), &registry.all());
+    if let Some(pending_view) = pending_view {
+        state.queued_inputs = pending_view
+            .queued_inputs
+            .iter()
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty())
+            .collect();
+    }
     if let Some(pending_view) = pending_view.filter(|view| !view.steps.is_empty()) {
         let first_step_start = pending_view
             .steps
@@ -1001,6 +1168,13 @@ fn build_repl_ui_state(
                 }
                 if tool_count > 0 {
                     detail_parts.push(format!("{} tool", tool_count));
+                }
+                if let Some(detail) = step
+                    .status_detail
+                    .as_deref()
+                    .filter(|detail| !detail.trim().is_empty())
+                {
+                    detail_parts.insert(0, detail.to_owned());
                 }
                 TranscriptGroup {
                     id: step.id(),
@@ -1174,6 +1348,7 @@ struct PendingReplStep {
     step: usize,
     start_index: usize,
     status_label: String,
+    status_detail: Option<String>,
     expanded: bool,
     touched: bool,
 }
@@ -1189,6 +1364,7 @@ struct PendingReplView {
     messages: Vec<Message>,
     progress_label: String,
     steps: Vec<PendingReplStep>,
+    queued_inputs: Vec<String>,
 }
 
 impl PendingReplView {
@@ -1197,6 +1373,7 @@ impl PendingReplView {
             messages,
             progress_label: progress_label.into(),
             steps: Vec::new(),
+            queued_inputs: Vec::new(),
         }
     }
 }
@@ -1221,6 +1398,7 @@ fn update_pending_repl_step_view(
     step_start_index: usize,
     messages: &[Message],
     progress_label: impl Into<String>,
+    status_detail: Option<String>,
 ) {
     let Some(pending_view) = pending_view else {
         return;
@@ -1238,6 +1416,7 @@ fn update_pending_repl_step_view(
                 step,
                 start_index: runtime_start_index,
                 status_label: String::new(),
+                status_detail: None,
                 expanded: true,
                 touched: false,
             });
@@ -1245,15 +1424,31 @@ fn update_pending_repl_step_view(
         if let Some(entry) = state.steps.iter_mut().find(|entry| entry.step == step) {
             entry.start_index = runtime_start_index.min(runtime_messages.len());
             entry.status_label = progress_label.into();
+            entry.status_detail = status_detail;
         }
         state.messages = runtime_messages;
         state.progress_label = state
             .steps
             .iter()
             .find(|entry| entry.step == step)
-            .map(|entry| entry.status_label.clone())
+            .map(|entry| {
+                compose_pending_progress_label(&entry.status_label, entry.status_detail.as_deref())
+            })
             .unwrap_or_else(|| "working".to_owned());
     }
+}
+
+fn queue_pending_repl_input(pending_view: &Arc<Mutex<PendingReplView>>, prompt_text: String) {
+    if let Ok(mut state) = pending_view.lock() {
+        state.queued_inputs.push(prompt_text);
+    }
+}
+
+fn take_pending_repl_inputs(pending_view: &Arc<Mutex<PendingReplView>>) -> Vec<String> {
+    pending_view
+        .lock()
+        .map(|mut state| mem::take(&mut state.queued_inputs))
+        .unwrap_or_default()
 }
 
 fn toggle_pending_repl_group(pending_view: &Arc<Mutex<PendingReplView>>, group_id: &str) {
@@ -1301,12 +1496,13 @@ async fn run_pending_repl_operation<F, T>(
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &mut code_agent_ui::InputBuffer,
     status_line: &str,
-    active_pane: PaneKind,
+    active_pane: &mut PaneKind,
     compact_banner: Option<String>,
-    transcript_scroll: u16,
-    vim_state: &code_agent_ui::vim::VimState,
+    transcript_scroll: &mut u16,
+    selected_command_suggestion: &mut usize,
+    vim_state: &mut code_agent_ui::vim::VimState,
     operation: F,
 ) -> Result<T>
 where
@@ -1314,9 +1510,6 @@ where
 {
     let mut operation = std::pin::pin!(operation);
     let mut tick = 0usize;
-    let mut selected_command_suggestion = 0usize;
-    let mut active_pane = active_pane;
-    let mut transcript_scroll = transcript_scroll;
 
     loop {
         let pending_snapshot = pending_repl_snapshot(&pending_view);
@@ -1327,10 +1520,10 @@ where
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => {
-                        scroll_up(&mut transcript_scroll, 3);
+                        scroll_up(transcript_scroll, 3);
                     }
                     MouseEventKind::ScrollDown => {
-                        scroll_down(&mut transcript_scroll, 3);
+                        scroll_down(transcript_scroll, 3);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         if let Some(action) = repl_mouse_action(
@@ -1349,17 +1542,17 @@ where
                                 pending_spinner_frame(tick),
                                 pending_snapshot.progress_label
                             )),
-                            active_pane,
+                            *active_pane,
                             compact_banner.clone(),
-                            transcript_scroll,
+                            *transcript_scroll,
                             None,
-                            selected_command_suggestion,
+                            *selected_command_suggestion,
                             tick,
                             &mouse,
                         )? {
                             match action {
                                 UiMouseAction::JumpToBottom => {
-                                    transcript_scroll = 0;
+                                    *transcript_scroll = 0;
                                 }
                                 UiMouseAction::ToggleTranscriptGroup(group_id) => {
                                     toggle_pending_repl_group(&pending_view, &group_id);
@@ -1371,18 +1564,98 @@ where
                 },
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Some(pane) = pane_from_shortcut(&key) {
-                        active_pane = pane;
+                        *active_pane = pane;
                         continue;
                     }
                     match key.code {
-                        KeyCode::Tab => active_pane = rotate_pane(active_pane, true),
-                        KeyCode::BackTab => active_pane = rotate_pane(active_pane, false),
-                        KeyCode::Up => scroll_up(&mut transcript_scroll, 1),
-                        KeyCode::Down => scroll_down(&mut transcript_scroll, 1),
-                        KeyCode::PageUp => scroll_up(&mut transcript_scroll, 5),
-                        KeyCode::PageDown => scroll_down(&mut transcript_scroll, 5),
-                        KeyCode::Home => transcript_scroll = u16::MAX,
-                        KeyCode::End => transcript_scroll = 0,
+                        KeyCode::Esc if vim_state.enabled => {
+                            if matches!(vim_state.mode, code_agent_ui::vim::VimMode::Insert) {
+                                vim_state.enter_normal();
+                            } else {
+                                vim_state.mode = code_agent_ui::vim::VimMode::Normal(
+                                    code_agent_ui::vim::CommandState::Idle,
+                                );
+                            }
+                        }
+                        KeyCode::Tab => *active_pane = rotate_pane(*active_pane, true),
+                        KeyCode::BackTab => *active_pane = rotate_pane(*active_pane, false),
+                        KeyCode::Up => {
+                            let suggestions = sync_command_selection(
+                                registry,
+                                input_buffer,
+                                selected_command_suggestion,
+                            );
+                            if !input_buffer.is_empty() && suggestions.len() > 1 {
+                                *selected_command_suggestion = if *selected_command_suggestion == 0
+                                {
+                                    suggestions.len() - 1
+                                } else {
+                                    *selected_command_suggestion - 1
+                                };
+                            } else {
+                                scroll_up(transcript_scroll, 1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            let suggestions = sync_command_selection(
+                                registry,
+                                input_buffer,
+                                selected_command_suggestion,
+                            );
+                            if !input_buffer.is_empty() && suggestions.len() > 1 {
+                                *selected_command_suggestion =
+                                    (*selected_command_suggestion + 1) % suggestions.len();
+                            } else {
+                                scroll_down(transcript_scroll, 1);
+                            }
+                        }
+                        KeyCode::PageUp => scroll_up(transcript_scroll, 5),
+                        KeyCode::PageDown => scroll_down(transcript_scroll, 5),
+                        KeyCode::Home => *transcript_scroll = u16::MAX,
+                        KeyCode::End => *transcript_scroll = 0,
+                        KeyCode::Left if vim_state.is_insert() => {
+                            input_buffer.cursor = input_buffer.cursor.saturating_sub(1);
+                        }
+                        KeyCode::Right if vim_state.is_insert() => {
+                            input_buffer.cursor =
+                                (input_buffer.cursor + 1).min(input_buffer.chars.len());
+                        }
+                        KeyCode::Backspace if vim_state.is_insert() => {
+                            input_buffer.pop();
+                            *selected_command_suggestion = 0;
+                        }
+                        KeyCode::Char(ch)
+                            if vim_state.is_insert()
+                                && (key.modifiers.is_empty()
+                                    || key.modifiers == KeyModifiers::SHIFT) =>
+                        {
+                            input_buffer.push(ch);
+                            *selected_command_suggestion = 0;
+                        }
+                        KeyCode::Enter => {
+                            let suggestions = sync_command_selection(
+                                registry,
+                                input_buffer,
+                                selected_command_suggestion,
+                            );
+                            let prompt_text = input_buffer.as_str().trim().to_owned();
+                            if prompt_text.is_empty() {
+                                continue;
+                            }
+                            if let Some(selected) = suggestions.get(*selected_command_suggestion) {
+                                let selected_name = selected.name.as_str();
+                                if prompt_text.starts_with('/')
+                                    && !prompt_text.contains(char::is_whitespace)
+                                    && prompt_text != selected_name
+                                {
+                                    apply_selected_command(input_buffer, selected);
+                                    continue;
+                                }
+                            }
+                            queue_pending_repl_input(&pending_view, prompt_text);
+                            input_buffer.clear();
+                            *selected_command_suggestion = 0;
+                        }
                         _ => {}
                     }
                 }
@@ -1407,11 +1680,11 @@ where
                 pending_spinner_frame(tick),
                 snapshot.progress_label
             )),
-            active_pane,
+            *active_pane,
             compact_banner.clone(),
-            transcript_scroll,
+            *transcript_scroll,
             None,
-            &mut selected_command_suggestion,
+            selected_command_suggestion,
             vim_state,
             tick,
         )?;
@@ -2146,7 +2419,8 @@ async fn run_agent_turns(
             step,
             step_start_index,
             messages,
-            format!("waiting for response · step {step}"),
+            format!("Waiting for response · step {step}"),
+            None,
         );
         let provider_client = resolve_provider_client(provider, auth_configured).await?;
         let parent_id = messages.last().map(|message| message.id);
@@ -2183,12 +2457,14 @@ async fn run_agent_turns(
                         step,
                         step_start_index,
                         &preview_messages,
-                        format!("receiving response · step {step}"),
+                        format!("Receiving response · step {step}"),
+                        preview_detail(&response_text, 1, 96),
                     );
                 }
                 ProviderEvent::ToolCall { call } => {
                     let tool_name = call.name.clone();
                     response_tool_calls.push(call);
+                    let current_call = response_tool_calls.last().cloned();
                     let preview_message = provider_assistant_message(
                         session_id,
                         parent_id,
@@ -2205,7 +2481,10 @@ async fn run_agent_turns(
                         step,
                         step_start_index,
                         &preview_messages,
-                        format!("running {tool_name}"),
+                        format!("Running {}", tool_display_name(&tool_name)),
+                        current_call
+                            .as_ref()
+                            .and_then(pending_tool_detail_from_call),
                     );
                 }
                 ProviderEvent::ToolCallBoundary { .. } => {}
@@ -2237,10 +2516,16 @@ async fn run_agent_turns(
             step_start_index,
             messages,
             if response_tool_calls.is_empty() {
-                format!("completed step {step}")
+                format!("Completed step {step}")
             } else {
-                format!("running {}", response_tool_calls[0].name)
+                format!(
+                    "Running {}",
+                    tool_display_name(&response_tool_calls[0].name)
+                )
             },
+            response_tool_calls
+                .first()
+                .and_then(pending_tool_detail_from_call),
         );
 
         if response_tool_calls.is_empty() {
@@ -2253,7 +2538,8 @@ async fn run_agent_turns(
                 step,
                 step_start_index,
                 messages,
-                format!("running {}", call.name),
+                format!("Running {}", tool_display_name(&call.name)),
+                pending_tool_detail_from_call(&call),
             );
             let input = serde_json::from_str(&call.input_json).unwrap_or_else(|_| json!({}));
             let output = tool_registry
@@ -2270,7 +2556,7 @@ async fn run_agent_turns(
             let output_metadata = output.metadata;
             let tool_message = build_tool_result_message(
                 session_id,
-                call.id,
+                call.id.clone(),
                 output_content,
                 output_is_error,
                 messages.last().map(|message| message.id),
@@ -2290,10 +2576,12 @@ async fn run_agent_turns(
                 step_start_index,
                 messages,
                 if output_is_error {
-                    format!("{} failed", call.name)
+                    format!("{} failed", tool_display_name(&call.name))
                 } else {
-                    format!("completed {}", call.name)
+                    format!("{} completed", tool_display_name(&call.name))
                 },
+                pending_tool_detail_from_metadata(&call.name, &output_metadata)
+                    .or_else(|| pending_tool_detail_from_call(&call)),
             );
         }
     }
@@ -2317,12 +2605,12 @@ async fn execute_local_turn(
     let user_message = build_text_message(session_id, MessageRole::User, prompt_text, parent_id);
     store.append_message(session_id, &user_message).await?;
     raw_messages.push(user_message);
-    update_pending_repl_view(pending_view.as_ref(), raw_messages, "waiting for response");
+    update_pending_repl_view(pending_view.as_ref(), raw_messages, "Waiting for response");
 
     let estimated_tokens_before =
         estimate_message_tokens(&materialize_runtime_messages(raw_messages));
     let applied_compaction = maybe_auto_compact(store, session_id, raw_messages).await?;
-    update_pending_repl_view(pending_view.as_ref(), raw_messages, "waiting for response");
+    update_pending_repl_view(pending_view.as_ref(), raw_messages, "Waiting for response");
     let estimated_tokens_after_compaction = applied_compaction
         .as_ref()
         .map(|outcome| outcome.estimated_tokens_after)

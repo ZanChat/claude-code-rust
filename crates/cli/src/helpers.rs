@@ -25,7 +25,10 @@ pub(crate) fn command_report(spec: &CommandSpec) -> CommandReport {
     }
 }
 
-pub(crate) async fn resolved_command_registry(cwd: &Path, plugin_root: Option<&PathBuf>) -> CommandRegistry {
+pub(crate) async fn resolved_command_registry(
+    cwd: &Path,
+    plugin_root: Option<&PathBuf>,
+) -> CommandRegistry {
     let mut registry = compatibility_command_registry();
     let runtime = OutOfProcessPluginRuntime;
     let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
@@ -69,10 +72,6 @@ pub(crate) fn parse_task_status(value: &str) -> Result<TaskStatus> {
         other => bail!("unsupported task status: {other}"),
     }
 }
-
-
-
-
 
 pub(crate) fn prompt_preview(messages: &[Message]) -> Vec<String> {
     messages
@@ -137,7 +136,11 @@ pub(crate) fn short_session_id(session_id: SessionId) -> String {
         .to_owned()
 }
 
-pub(crate) fn repl_status(provider: ApiProvider, active_model: &str, session_id: SessionId) -> String {
+pub(crate) fn repl_status(
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+) -> String {
     format!(
         "{provider} · {active_model} · s:{}",
         short_session_id(session_id)
@@ -184,7 +187,6 @@ pub(crate) fn workspace_is_empty(cwd: &Path) -> bool {
         .unwrap_or(false)
 }
 
-
 pub(crate) fn friendly_auth_source(source: Option<&str>) -> String {
     match source {
         Some("codex_auth_token") => "Codex refreshable token".to_owned(),
@@ -198,7 +200,6 @@ pub(crate) fn friendly_auth_source(source: Option<&str>) -> String {
         None => "not configured".to_owned(),
     }
 }
-
 
 pub(crate) fn command_palette_entries(registry: &CommandRegistry) -> Vec<CommandPaletteEntry> {
     registry
@@ -356,4 +357,3 @@ pub(crate) fn navigate_prompt_history_down(
     }
     true
 }
-

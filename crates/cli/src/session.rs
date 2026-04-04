@@ -1,9 +1,9 @@
-use uuid::Uuid;
+use crate::{resume_command_for_session, resume_picker_item};
 use code_agent_session::SessionStore;
-use crate::{resume_picker_item, resume_command_for_session};
 use code_agent_session::{LocalSessionStore, ProjectSessionStore, SessionSummary};
+use uuid::Uuid;
 
-use code_agent_core::{SessionId, Message};
+use code_agent_core::{Message, SessionId};
 
 use std::path::{Path, PathBuf};
 
@@ -12,8 +12,6 @@ use anyhow::Result;
 use crate::cli_args::Cli;
 
 use code_agent_ui::ChoiceListState;
-
-
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResumeTargetHint {
@@ -67,14 +65,21 @@ impl ActiveSessionStore {
         })
     }
 
-    pub(crate) async fn load_resume_target(&self, value: &str) -> Result<(SessionId, PathBuf, Vec<Message>)> {
+    pub(crate) async fn load_resume_target(
+        &self,
+        value: &str,
+    ) -> Result<(SessionId, PathBuf, Vec<Message>)> {
         match self {
             Self::Local(store) => store.load_resume_target(value).await,
             Self::Project(store) => store.load_resume_target(value).await,
         }
     }
 
-    pub(crate) async fn append_message(&self, session_id: SessionId, message: &Message) -> Result<()> {
+    pub(crate) async fn append_message(
+        &self,
+        session_id: SessionId,
+        message: &Message,
+    ) -> Result<()> {
         match self {
             Self::Local(store) => store.append_message(session_id, message).await,
             Self::Project(store) => store.append_message(session_id, message).await,

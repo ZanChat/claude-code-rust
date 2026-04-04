@@ -204,6 +204,7 @@ pub struct UiState {
     pub messages: Vec<Message>,
     pub transcript_lines: Vec<TranscriptLine>,
     pub transcript_groups: Vec<TranscriptGroup>,
+    pub queued_inputs: Vec<String>,
     pub header_title: Option<String>,
     pub header_subtitle: Option<String>,
     pub header_context: Option<String>,
@@ -988,6 +989,21 @@ fn indented_detail_lines(text: &str, indent: &str, style: Style) -> Vec<Line<'st
         .collect()
 }
 
+fn task_prefers_input(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Pending | TaskStatus::Running | TaskStatus::WaitingForInput
+    )
+}
+
+fn task_detail_text(task: &TaskUiEntry) -> Option<&str> {
+    if task_prefers_input(&task.status) {
+        task.input.as_deref().or(task.output.as_deref())
+    } else {
+        task.output.as_deref().or(task.input.as_deref())
+    }
+}
+
 fn task_lines(state: &UiState, max_items: usize, detailed: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
@@ -1019,7 +1035,7 @@ fn task_lines(state: &UiState, max_items: usize, detailed: bool) -> Vec<Line<'st
         ]));
 
         if detailed {
-            if let Some(detail) = task.output.as_ref().or(task.input.as_ref()) {
+            if let Some(detail) = task_detail_text(task) {
                 lines.extend(indented_detail_lines(
                     detail,
                     "  ",
@@ -1122,13 +1138,34 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
-        if let Some(detail) = task.output.as_ref().or(task.input.as_ref()) {
+        if let Some(detail) = task_detail_text(task) {
             lines.extend(indented_detail_lines(
                 detail,
                 "  ",
                 Style::default().fg(Color::DarkGray),
             ));
         }
+    }
+
+    for queued_input in state.queued_inputs.iter().take(3) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "queue  ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(queued_input.clone(), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    if state.queued_inputs.len() > 3 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "queue  +{} more follow-up messages",
+                state.queued_inputs.len() - 3
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     if let Some(question) = state.question_items.first() {
@@ -1166,6 +1203,18 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn should_show_activity_section(
+    state: &UiState,
+    overlay_visible: bool,
+    suggestions_visible: bool,
+) -> bool {
+    state.show_input
+        && !overlay_visible
+        && (!suggestions_visible
+            || state.progress_message.is_some()
+            || !state.queued_inputs.is_empty())
 }
 
 fn activity_widget(state: &UiState) -> Paragraph<'static> {
@@ -1361,6 +1410,9 @@ fn footer_primary_text(state: &UiState, suggestions_visible: bool) -> String {
     }
     if state.permission_prompt.is_some() {
         return "Waiting for permission".to_owned();
+    }
+    if !state.queued_inputs.is_empty() {
+        return format!("Working · {} queued", state.queued_inputs.len());
     }
     if state.progress_message.is_some() {
         return "Working".to_owned();
@@ -1765,17 +1817,18 @@ pub fn mouse_action_for_position(
     let header_height = header_height(state, header_width);
     let activity_width = area.width.saturating_sub(4);
     let activity_content = activity_lines(state);
-    let mut activity_height = if state.show_input && !overlay_visible && !suggestions_visible {
-        wrapped_lines_height(&activity_content, activity_width).min(
-            if matches!(layout, LayoutMode::Compact) {
-                6
-            } else {
-                10
-            },
-        )
-    } else {
-        0
-    };
+    let mut activity_height =
+        if should_show_activity_section(state, overlay_visible, suggestions_visible) {
+            wrapped_lines_height(&activity_content, activity_width).min(
+                if matches!(layout, LayoutMode::Compact) {
+                    6
+                } else {
+                    10
+                },
+            )
+        } else {
+            0
+        };
     let mut suggestion_height = if suggestions_visible {
         let suggestion_lines = state
             .command_suggestions
@@ -1911,17 +1964,18 @@ fn render_frame(frame: &mut Frame<'_>, state: &UiState) {
     let header_height = header_height(state, header_width);
     let activity_width = area.width.saturating_sub(4);
     let activity_content = activity_lines(state);
-    let mut activity_height = if state.show_input && !overlay_visible && !suggestions_visible {
-        wrapped_lines_height(&activity_content, activity_width).min(
-            if matches!(layout, LayoutMode::Compact) {
-                6
-            } else {
-                10
-            },
-        )
-    } else {
-        0
-    };
+    let mut activity_height =
+        if should_show_activity_section(state, overlay_visible, suggestions_visible) {
+            wrapped_lines_height(&activity_content, activity_width).min(
+                if matches!(layout, LayoutMode::Compact) {
+                    6
+                } else {
+                    10
+                },
+            )
+        } else {
+            0
+        };
     let mut suggestion_height = if suggestions_visible {
         let suggestion_lines = state
             .command_suggestions
@@ -2248,6 +2302,24 @@ mod tests {
 
         assert!(rendered.contains("/help"));
         assert!(rendered.contains("/hooks"));
+    }
+
+    #[test]
+    fn renders_queued_follow_up_prompts_during_activity() {
+        let mut state = RatatuiApp::new("queue").initial_state();
+        state.show_input = true;
+        state.progress_message = Some("/ Waiting for response".to_owned());
+        state.queued_inputs = vec![
+            "follow up with the failing test details".to_owned(),
+            "/tasks".to_owned(),
+        ];
+
+        let rendered = render_to_string(&state, 100, 24).unwrap();
+
+        assert!(rendered.contains("Waiting for response"));
+        assert!(rendered.contains("queue"));
+        assert!(rendered.contains("follow up with the failing test details"));
+        assert!(rendered.contains("/tasks"));
     }
 
     #[test]

@@ -1,21 +1,20 @@
-
-use crate::{workspace_is_empty, friendly_auth_source, short_session_id, auth_hint_for_provider};
-use code_agent_session::claude_config_home_dir;
+use crate::{auth_hint_for_provider, friendly_auth_source, short_session_id, workspace_is_empty};
 use code_agent_providers::config_migration_report;
+use code_agent_session::claude_config_home_dir;
 use crossterm::event;
 
-use crossterm::event::{Event, MouseEventKind, KeyEventKind};
-use ratatui::Terminal;
+use crate::{apply_repl_header, repl_status, shorten_path, status_with_detail};
+use crate::{scroll_down, scroll_up};
+use code_agent_ui::{draw_terminal as draw_tui, PaneKind, RatatuiApp, TranscriptLine};
+use crossterm::event::{Event, KeyEventKind, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use code_agent_ui::{PaneKind, TranscriptLine, RatatuiApp, draw_terminal as draw_tui};
-use crate::{shorten_path, apply_repl_header, status_with_detail, repl_status};
-use crossterm::event::{KeyCode, KeyModifiers, KeyEvent};
-use crate::{scroll_up, scroll_down};
-use serde::{Serialize, Deserialize};
+use ratatui::Terminal;
+use serde::{Deserialize, Serialize};
 
 use std::path::{Path, PathBuf};
 
-use code_agent_ui::{PanePreview, CommandPaletteEntry, UiState};
+use code_agent_ui::{CommandPaletteEntry, PanePreview, UiState};
 
 use code_agent_core::SessionId;
 
@@ -24,8 +23,6 @@ use code_agent_providers::ApiProvider;
 use anyhow::Result;
 
 use std::fs;
-
-
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct StartupPreferences {

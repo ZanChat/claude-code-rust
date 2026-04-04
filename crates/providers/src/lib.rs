@@ -1,11 +1,11 @@
 pub mod auth;
 pub use auth::*;
 pub mod http;
-pub use http::*;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use code_agent_core::{ContentBlock, Message, MessageRole, TokenUsage, ToolCall};
 use hmac::{Hmac, Mac};
+pub use http::*;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
@@ -137,15 +137,6 @@ pub fn resolve_api_provider(explicit: Option<&str>) -> Result<ApiProvider> {
 
     Ok(ApiProvider::FirstParty)
 }
-
-
-
-
-
-
-
-
-
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct AuthSnapshotFile {
@@ -510,19 +501,9 @@ fn parse_echo_tool_directive(prompt: &str) -> Option<(String, String)> {
     Some((name.to_owned(), input_json.to_owned()))
 }
 
-
-
-
-
-
-
-
 pub fn build_provider(provider: ApiProvider, auth: AuthMaterial) -> Box<dyn Provider> {
     Box::new(HttpProvider::new(provider, auth))
 }
-
-
-
 
 fn env_value<const N: usize>(names: [&str; N]) -> Option<String> {
     names
@@ -530,17 +511,11 @@ fn env_value<const N: usize>(names: [&str; N]) -> Option<String> {
         .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
 }
 
-
-
-
 fn read_chatgpt_codex_models_cache() -> Option<ChatGPTCodexModelsCache> {
     let path = codex_home_dir().join("models_cache.json");
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
 }
-
-
-
 
 fn openai_chat_tool_call(call: &ToolCall) -> Value {
     let mut tool_call = json!({
@@ -576,9 +551,6 @@ fn openai_chat_thought_signature(tool_call: &Value) -> Option<String> {
         .map(str::to_owned)
         .filter(|thought_signature| !thought_signature.trim().is_empty())
 }
-
-
-
 
 fn events_from_anthropic_response(value: &Value) -> Result<Vec<ProviderEvent>> {
     let mut events = Vec::new();
@@ -1015,20 +987,6 @@ impl ContextWindowResolver for StaticContextWindowResolver {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 impl Default for OpenAIAuthStatus {
     fn default() -> Self {
         Self {
@@ -1063,12 +1021,6 @@ pub fn read_auth_snapshot() -> Option<BTreeMap<String, AuthMaterial>> {
         .ok()
         .map(|snapshot| snapshot.providers)
 }
-
-
-
-
-
-
 
 pub fn read_provider_auth_snapshot(provider: ApiProvider) -> Option<AuthMaterial> {
     read_auth_snapshot()?.remove(provider.as_str())
@@ -1147,9 +1099,6 @@ pub fn get_token_freshness(token: Option<&str>) -> OpenAITokenFreshness {
         OpenAITokenFreshness::Fresh
     }
 }
-
-
-
 
 fn codex_auth_lock_path(path: &Path) -> PathBuf {
     let mut lock_path = path.as_os_str().to_os_string();
@@ -1485,9 +1434,6 @@ pub fn get_anthropic_credential_hint(provider: ApiProvider) -> String {
     }
 }
 
-
-
-
 pub fn provider_descriptor(provider: ApiProvider) -> ProviderDescriptor {
     match provider {
         ApiProvider::FirstParty => ProviderDescriptor {
@@ -1700,9 +1646,6 @@ pub fn get_openai_reasoning_think_level() -> String {
 pub fn get_openai_completion_think_level() -> String {
     parse_think_level(env::var("COMPLETION_MODEL_THINK").ok(), "xhigh")
 }
-
-
-
 
 // ---------------------------------------------------------------------------
 // Claude-specific thinking helpers (parity with TS thinking.ts)
