@@ -169,6 +169,9 @@ pub struct QuestionUiEntry {
 pub struct UiState {
     pub messages: Vec<Message>,
     pub transcript_lines: Vec<TranscriptLine>,
+    pub header_title: Option<String>,
+    pub header_subtitle: Option<String>,
+    pub header_context: Option<String>,
     pub transcript_scroll: u16,
     pub status_line: String,
     pub status_marquee_tick: usize,
@@ -838,6 +841,61 @@ fn activity_widget(state: &UiState) -> Paragraph<'static> {
     Paragraph::new(activity_lines(state)).wrap(Wrap { trim: false })
 }
 
+fn header_line_count(state: &UiState) -> u16 {
+    [
+        state.header_title.as_deref(),
+        state.header_subtitle.as_deref(),
+        state.header_context.as_deref(),
+    ]
+    .into_iter()
+    .filter(|value| value.is_some_and(|value| !value.trim().is_empty()))
+    .count() as u16
+}
+
+fn header_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
+    let width = width.max(1) as usize;
+    let mut lines = Vec::new();
+
+    if let Some(title) = state
+        .header_title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(Line::from(vec![Span::styled(
+            truncate_middle(title, width),
+            Style::default().add_modifier(Modifier::BOLD),
+        )]));
+    }
+
+    if let Some(subtitle) = state
+        .header_subtitle
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(Line::from(vec![Span::styled(
+            truncate_middle(subtitle, width),
+            Style::default().fg(Color::DarkGray),
+        )]));
+    }
+
+    if let Some(context) = state
+        .header_context
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(Line::from(vec![Span::styled(
+            truncate_middle(context, width),
+            Style::default().fg(Color::DarkGray),
+        )]));
+    }
+
+    lines
+}
+
+fn header_widget(state: &UiState, width: u16) -> Paragraph<'static> {
+    Paragraph::new(header_lines(state, width)).wrap(Wrap { trim: false })
+}
+
 fn status_line(state: &UiState) -> Line<'static> {
     if let Some(prompt) = &state.permission_prompt {
         return Line::from(vec![
@@ -1220,6 +1278,7 @@ fn render_frame(frame: &mut Frame<'_>, state: &UiState) {
     let suggestions_visible =
         state.show_input && !overlay_visible && !state.command_suggestions.is_empty();
     let footer_width = area.width.saturating_sub(4);
+    let header_height = header_line_count(state);
     let mut activity_height = if state.show_input && !overlay_visible && !suggestions_visible {
         activity_lines(state).len().min(2) as u16
     } else {
@@ -1277,6 +1336,7 @@ fn render_frame(frame: &mut Frame<'_>, state: &UiState) {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(header_height),
                 Constraint::Min(transcript_min_height),
                 Constraint::Length(activity_height),
                 Constraint::Length(suggestion_height),
@@ -1288,20 +1348,33 @@ fn render_frame(frame: &mut Frame<'_>, state: &UiState) {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(header_height),
                 Constraint::Min(transcript_min_height),
                 Constraint::Length(footer_height),
             ])
             .split(area)
     };
 
-    let body_area = vertical[0];
+    if header_height > 0 {
+        let header_inner = Rect::new(
+            vertical[0].x.saturating_add(2),
+            vertical[0].y,
+            vertical[0].width.saturating_sub(4),
+            vertical[0].height,
+        );
+        if header_inner.width > 0 && header_inner.height > 0 {
+            frame.render_widget(header_widget(state, header_inner.width), header_inner);
+        }
+    }
+
+    let body_area = vertical[1];
     render_body(frame, state, body_area);
 
     if state.show_input {
-        let activity_area = vertical[1];
-        let suggestion_area = vertical[2];
-        let input_area = vertical[3];
-        let footer_area = vertical[4];
+        let activity_area = vertical[2];
+        let suggestion_area = vertical[3];
+        let input_area = vertical[4];
+        let footer_area = vertical[5];
 
         if activity_height > 0 {
             let inner = Rect::new(
@@ -1346,7 +1419,7 @@ fn render_frame(frame: &mut Frame<'_>, state: &UiState) {
             );
         }
     } else {
-        let footer_area = vertical[1];
+        let footer_area = vertical[2];
         let footer_inner = Rect::new(
             footer_area.x.saturating_add(2),
             footer_area.y,
@@ -1569,6 +1642,20 @@ mod tests {
         let rendered = render_to_string(&state, 100, 24).unwrap();
 
         assert!(rendered.contains("gemini-3.1-pro-preview(openai-compatible)"));
+    }
+
+    #[test]
+    fn renders_runtime_header() {
+        let mut state = RatatuiApp::new("header").initial_state();
+        state.header_title = Some("code-agent-rust v0.1.0".to_owned());
+        state.header_subtitle = Some("gemini-3.1-pro-preview · openai-compatible".to_owned());
+        state.header_context = Some("/Users/pengfeiduan/workspace/code-agent-rust".to_owned());
+
+        let rendered = render_to_string(&state, 80, 24).unwrap();
+
+        assert!(rendered.contains("code-agent-rust v0.1.0"));
+        assert!(rendered.contains("gemini-3.1-pro-preview"));
+        assert!(rendered.contains("workspace/code-agent-rust"));
     }
 
     #[test]

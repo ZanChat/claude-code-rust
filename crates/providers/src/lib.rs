@@ -493,6 +493,7 @@ impl Provider for EchoProvider {
                             id: "echo_tool_call".to_owned(),
                             name,
                             input_json,
+                            thought_signature: None,
                         },
                     },
                     ProviderEvent::ToolCallBoundary {
@@ -1804,6 +1805,41 @@ fn build_openai_chat_completions_payload(request: &ProviderRequest) -> Value {
     payload
 }
 
+fn openai_chat_tool_call(call: &ToolCall) -> Value {
+    let mut tool_call = json!({
+        "id": call.id,
+        "type": "function",
+        "function": {
+            "name": call.name,
+            "arguments": call.input_json,
+        }
+    });
+
+    if let Some(thought_signature) = call
+        .thought_signature
+        .as_deref()
+        .filter(|thought_signature| !thought_signature.trim().is_empty())
+    {
+        tool_call["extra_content"] = json!({
+            "google": {
+                "thought_signature": thought_signature,
+            }
+        });
+    }
+
+    tool_call
+}
+
+fn openai_chat_thought_signature(tool_call: &Value) -> Option<String> {
+    tool_call
+        .get("extra_content")
+        .and_then(|extra_content| extra_content.get("google"))
+        .and_then(|google| google.get("thought_signature"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|thought_signature| !thought_signature.trim().is_empty())
+}
+
 fn openai_chat_messages(messages: &[Message]) -> Vec<Value> {
     let mut encoded = Vec::new();
 
@@ -1850,14 +1886,7 @@ fn openai_chat_messages(messages: &[Message]) -> Vec<Value> {
                     .blocks
                     .iter()
                     .filter_map(|block| match block {
-                        ContentBlock::ToolCall { call } => Some(json!({
-                            "id": call.id,
-                            "type": "function",
-                            "function": {
-                                "name": call.name,
-                                "arguments": call.input_json,
-                            }
-                        })),
+                        ContentBlock::ToolCall { call } => Some(openai_chat_tool_call(call)),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -1989,6 +2018,7 @@ fn events_from_anthropic_response(value: &Value) -> Result<Vec<ProviderEvent>> {
                         id: id.clone(),
                         name,
                         input_json: serde_json::to_string(&input)?,
+                        thought_signature: None,
                     },
                 });
                 events.push(ProviderEvent::ToolCallBoundary { id });
@@ -2180,6 +2210,7 @@ fn events_from_openai_chat_response(value: &Value) -> Result<Vec<ProviderEvent>>
                 id: id.clone(),
                 name,
                 input_json: arguments,
+                thought_signature: openai_chat_thought_signature(tool_call),
             },
         });
         events.push(ProviderEvent::ToolCallBoundary { id });
@@ -2266,6 +2297,7 @@ fn events_from_openai_responses_response_parts(
                         id: id.clone(),
                         name,
                         input_json: arguments,
+                        thought_signature: None,
                     },
                 });
                 events.push(ProviderEvent::ToolCallBoundary { id });
@@ -3433,7 +3465,7 @@ mod tests {
         HttpProvider, ModelCatalog, OpenAIAuthSource, OpenAITokenFreshness, ProviderRequest,
         ProviderToolDefinition, DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
     };
-    use code_agent_core::{ContentBlock, Message, MessageRole};
+    use code_agent_core::{ContentBlock, Message, MessageRole, ToolCall};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::env;
@@ -3903,6 +3935,60 @@ mod tests {
         );
         assert!(
             matches!(&events[3], super::ProviderEvent::Usage { usage } if usage.input_tokens == 19)
+        );
+    }
+
+    #[test]
+    fn parses_openai_tool_call_thought_signature() {
+        let events = super::events_from_openai_chat_response(&json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_123",
+                        "type": "function",
+                        "extra_content": {
+                            "google": {
+                                "thought_signature": "signature-a"
+                            }
+                        },
+                        "function": {
+                            "name": "file_read",
+                            "arguments": "{\"path\":\"src/main.rs\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            &events[0],
+            super::ProviderEvent::ToolCall { call }
+                if call.id == "call_123"
+                    && call.thought_signature.as_deref() == Some("signature-a")
+        ));
+    }
+
+    #[test]
+    fn serializes_openai_chat_tool_call_thought_signature() {
+        let assistant = Message::new(
+            MessageRole::Assistant,
+            vec![ContentBlock::ToolCall {
+                call: ToolCall {
+                    id: "call_123".to_owned(),
+                    name: "file_read".to_owned(),
+                    input_json: "{\"path\":\"src/main.rs\"}".to_owned(),
+                    thought_signature: Some("signature-a".to_owned()),
+                },
+            }],
+        );
+
+        let encoded = super::openai_chat_messages(&[assistant]);
+
+        assert_eq!(
+            encoded[0]["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
+            "signature-a"
         );
     }
 

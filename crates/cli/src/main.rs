@@ -17,11 +17,11 @@ use code_agent_plugins::{
     BridgeLaunchRequest, CommandDefinitions, OutOfProcessPluginRuntime, PluginRuntime,
 };
 use code_agent_providers::{
-    build_provider, clear_auth_snapshot, code_agent_auth_snapshot_path, collect_provider_response,
+    build_provider, clear_auth_snapshot, code_agent_auth_snapshot_path,
     compatibility_model_catalog, config_migration_report, get_anthropic_credential_hint,
     get_openai_credential_hint, resolve_api_provider, write_auth_snapshot, ApiProvider,
-    AuthRequest, AuthResolver, EnvironmentAuthResolver, ModelCatalog, ProviderRequest,
-    ProviderToolDefinition,
+    AuthRequest, AuthResolver, EnvironmentAuthResolver, ModelCatalog, ProviderEvent,
+    ProviderRequest, ProviderToolDefinition,
 };
 use code_agent_session::{
     agent_transcript_path_for, claude_config_home_dir, compact_messages, estimate_message_tokens,
@@ -53,6 +53,7 @@ use std::fs;
 use std::future::Future;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -468,6 +469,30 @@ fn repl_status(provider: ApiProvider, active_model: &str, session_id: SessionId)
     )
 }
 
+fn repl_header_title() -> String {
+    format!("code-agent-rust v{}", env!("CARGO_PKG_VERSION"))
+}
+
+fn repl_header_subtitle(provider: ApiProvider, active_model: &str) -> String {
+    format!("{active_model} · {provider}")
+}
+
+fn repl_header_context(cwd: &Path, session_id: SessionId) -> String {
+    format!("{} · s:{}", cwd.display(), short_session_id(session_id))
+}
+
+fn apply_repl_header(
+    state: &mut code_agent_ui::UiState,
+    provider: ApiProvider,
+    active_model: &str,
+    cwd: &Path,
+    session_id: SessionId,
+) {
+    state.header_title = Some(repl_header_title());
+    state.header_subtitle = Some(repl_header_subtitle(provider, active_model));
+    state.header_context = Some(repl_header_context(cwd, session_id));
+}
+
 fn status_with_detail(base: String, detail: impl AsRef<str>) -> String {
     let detail = detail.as_ref().trim();
     if detail.is_empty() {
@@ -605,7 +630,7 @@ fn build_startup_screens(
         if let Some(path) = migration.auth_snapshot_path {
             preview_lines.push(format!("snapshot: {}", shorten_path(&path, 44)));
         }
-        preview_lines.push("commands: /help /config /login /model".to_owned());
+        preview_lines.push("commands: /help /config /ide /login /model".to_owned());
 
         screens.push(StartupScreen {
             title: "Setup Checklist".to_owned(),
@@ -731,12 +756,14 @@ fn build_startup_ui_state(
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
+    cwd: &Path,
     screens: &[StartupScreen],
     index: usize,
     transcript_scroll: u16,
 ) -> UiState {
     let screen = &screens[index];
     let mut state = app.initial_state();
+    apply_repl_header(&mut state, provider, active_model, cwd, session_id);
     state.status_line = status_with_detail(
         repl_status(provider, active_model, session_id),
         format!("setup {}/{}", index + 1, screens.len()),
@@ -774,6 +801,7 @@ fn run_startup_flow<B: ratatui::backend::Backend>(
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
+    cwd: &Path,
     screens: &[StartupScreen],
 ) -> Result<code_agent_ui::InputBuffer> {
     if screens.is_empty() {
@@ -790,6 +818,7 @@ fn run_startup_flow<B: ratatui::backend::Backend>(
             provider,
             active_model,
             session_id,
+            cwd,
             screens,
             index,
             transcript_scroll,
@@ -1141,6 +1170,21 @@ fn remote_mode_enabled(cli: &Cli) -> bool {
     cli.bridge_connect.is_some() || cli.bridge_server.is_some()
 }
 
+fn ide_bridge_address(cli: &Cli) -> Option<&str> {
+    cli.bridge_connect
+        .as_deref()
+        .filter(|address| address.starts_with("ide://"))
+        .or_else(|| {
+            cli.bridge_server
+                .as_deref()
+                .filter(|address| address.starts_with("ide://"))
+        })
+}
+
+fn ide_bridge_enabled(cli: &Cli) -> bool {
+    ide_bridge_address(cli).is_some()
+}
+
 fn command_allowed_in_repl(registry: &CommandRegistry, remote_mode: bool, name: &str) -> bool {
     if !remote_mode {
         return registry.resolve(name).is_some();
@@ -1442,6 +1486,9 @@ fn build_repl_ui_state(
     registry: &code_agent_core::CommandRegistry,
     raw_messages: &[Message],
     cwd: &Path,
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
     input_buffer: &code_agent_ui::InputBuffer,
     status_line: &str,
     progress_message: Option<String>,
@@ -1454,6 +1501,7 @@ fn build_repl_ui_state(
 ) -> code_agent_ui::UiState {
     let runtime_messages = materialize_runtime_messages(raw_messages);
     let mut state = app.state_from_messages(runtime_messages.clone(), &registry.all());
+    apply_repl_header(&mut state, provider, active_model, cwd, session_id);
     let (task_items, question_items) = load_task_ui_data(cwd);
     state.show_input = true;
     state.input_buffer = input_buffer.clone();
@@ -1503,6 +1551,7 @@ fn draw_repl_state(
     cwd: &Path,
     provider: ApiProvider,
     active_model: &str,
+    session_id: SessionId,
     input_buffer: &code_agent_ui::InputBuffer,
     status_line: &str,
     progress_message: Option<String>,
@@ -1520,6 +1569,9 @@ fn draw_repl_state(
         registry,
         raw_messages,
         cwd,
+        provider,
+        active_model,
+        session_id,
         input_buffer,
         status_line,
         progress_message,
@@ -1550,6 +1602,58 @@ fn optimistic_messages_for_prompt(
     preview_messages
 }
 
+#[derive(Clone, Debug)]
+struct PendingReplView {
+    messages: Vec<Message>,
+    progress_label: String,
+}
+
+impl PendingReplView {
+    fn new(messages: Vec<Message>, progress_label: impl Into<String>) -> Self {
+        Self {
+            messages,
+            progress_label: progress_label.into(),
+        }
+    }
+}
+
+fn update_pending_repl_view(
+    pending_view: Option<&Arc<Mutex<PendingReplView>>>,
+    messages: &[Message],
+    progress_label: impl Into<String>,
+) {
+    let Some(pending_view) = pending_view else {
+        return;
+    };
+    if let Ok(mut state) = pending_view.lock() {
+        state.messages = messages.to_vec();
+        state.progress_label = progress_label.into();
+    }
+}
+
+fn pending_repl_snapshot(pending_view: &Arc<Mutex<PendingReplView>>) -> PendingReplView {
+    pending_view
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_else(|_| PendingReplView::new(Vec::new(), "working"))
+}
+
+fn provider_assistant_message(
+    session_id: SessionId,
+    parent_id: Option<Uuid>,
+    text: String,
+    tool_calls: Vec<code_agent_core::ToolCall>,
+    provider: ApiProvider,
+    model: &str,
+    usage: Option<code_agent_core::TokenUsage>,
+) -> Message {
+    let mut assistant_message = build_assistant_message(session_id, parent_id, text, tool_calls);
+    assistant_message.metadata.provider = Some(provider.to_string());
+    assistant_message.metadata.model = Some(model.to_owned());
+    assistant_message.metadata.usage = usage;
+    assistant_message
+}
+
 fn pending_spinner_frame(tick: usize) -> &'static str {
     const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
     FRAMES[tick % FRAMES.len()]
@@ -1569,13 +1673,13 @@ fn drain_pending_repl_events(
 async fn run_pending_repl_operation<F, T>(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     registry: &code_agent_core::CommandRegistry,
-    preview_messages: &[Message],
+    pending_view: Arc<Mutex<PendingReplView>>,
     cwd: &Path,
     provider: ApiProvider,
     active_model: &str,
+    session_id: SessionId,
     input_buffer: &code_agent_ui::InputBuffer,
     status_line: &str,
-    progress_label: &str,
     active_pane: PaneKind,
     compact_banner: Option<String>,
     transcript_scroll: u16,
@@ -1591,19 +1695,21 @@ where
 
     loop {
         drain_pending_repl_events(terminal)?;
+        let snapshot = pending_repl_snapshot(&pending_view);
         draw_repl_state(
             terminal,
             registry,
-            preview_messages,
+            &snapshot.messages,
             cwd,
             provider,
             active_model,
+            session_id,
             input_buffer,
             status_line,
             Some(format!(
                 "{} {}",
                 pending_spinner_frame(tick),
-                progress_label
+                snapshot.progress_label
             )),
             active_pane,
             compact_banner.clone(),
@@ -1902,6 +2008,7 @@ impl<'a> LocalBridgeHandler<'a> {
             &mut self.raw_messages,
             prompt_text,
             self.live_runtime,
+            None,
         )
         .await?;
 
@@ -1980,6 +2087,7 @@ impl<'a> LocalBridgeHandler<'a> {
                 &mut self.raw_messages,
                 worker_prompt,
                 self.live_runtime,
+                None,
             )
             .await?;
             if let Some(event) = applied_compaction.as_ref().and_then(compaction_event) {
@@ -2031,6 +2139,7 @@ impl<'a> LocalBridgeHandler<'a> {
             &mut self.raw_messages,
             synthesis_prompt,
             self.live_runtime,
+            None,
         )
         .await?;
         if let Some(event) = applied_compaction.as_ref().and_then(compaction_event) {
@@ -2320,6 +2429,7 @@ async fn run_agent_turns(
     session_id: SessionId,
     messages: &mut Vec<Message>,
     auth_configured: bool,
+    pending_view: Option<&Arc<Mutex<PendingReplView>>>,
 ) -> Result<(Option<code_agent_core::TokenUsage>, usize, Option<String>)> {
     const MAX_AGENT_STEPS: usize = 8;
 
@@ -2333,38 +2443,106 @@ async fn run_agent_turns(
     };
 
     for step in 1..=MAX_AGENT_STEPS {
+        update_pending_repl_view(
+            pending_view,
+            messages,
+            format!("waiting for response · step {step}"),
+        );
         let provider_client = resolve_provider_client(provider, auth_configured).await?;
         let parent_id = messages.last().map(|message| message.id);
-        let response = collect_provider_response(
-            provider_client.as_ref(),
-            ProviderRequest {
+        let mut stream = provider_client
+            .start_stream(ProviderRequest {
                 model: model.clone(),
                 messages: messages.clone(),
                 tools: provider_tools.clone(),
                 ..ProviderRequest::default()
-            },
-        )
-        .await?;
+            })
+            .await?;
+        let mut response_text = String::new();
+        let mut response_tool_calls = Vec::new();
+        let mut latest_usage = None;
+        let mut stop_reason = None;
 
-        let latest_usage = response.usage.clone();
-        let stop_reason = response.stop_reason.clone();
-        let mut assistant_message = build_assistant_message(
+        while let Some(event) = stream.next_event().await? {
+            match event {
+                ProviderEvent::MessageDelta { text } => {
+                    response_text.push_str(&text);
+                    let preview_message = provider_assistant_message(
+                        session_id,
+                        parent_id,
+                        response_text.clone(),
+                        response_tool_calls.clone(),
+                        provider,
+                        &model,
+                        latest_usage.clone(),
+                    );
+                    let mut preview_messages = messages.clone();
+                    preview_messages.push(preview_message);
+                    update_pending_repl_view(
+                        pending_view,
+                        &preview_messages,
+                        format!("receiving response · step {step}"),
+                    );
+                }
+                ProviderEvent::ToolCall { call } => {
+                    let tool_name = call.name.clone();
+                    response_tool_calls.push(call);
+                    let preview_message = provider_assistant_message(
+                        session_id,
+                        parent_id,
+                        response_text.clone(),
+                        response_tool_calls.clone(),
+                        provider,
+                        &model,
+                        latest_usage.clone(),
+                    );
+                    let mut preview_messages = messages.clone();
+                    preview_messages.push(preview_message);
+                    update_pending_repl_view(
+                        pending_view,
+                        &preview_messages,
+                        format!("running {tool_name}"),
+                    );
+                }
+                ProviderEvent::ToolCallBoundary { .. } => {}
+                ProviderEvent::Usage { usage } => {
+                    latest_usage = Some(usage);
+                }
+                ProviderEvent::Stop { reason } => {
+                    stop_reason = Some(reason);
+                    break;
+                }
+                ProviderEvent::Error { message } => return Err(anyhow!(message)),
+            }
+        }
+
+        let assistant_message = provider_assistant_message(
             session_id,
             parent_id,
-            response.text,
-            response.tool_calls.clone(),
+            response_text,
+            response_tool_calls.clone(),
+            provider,
+            &model,
+            latest_usage.clone(),
         );
-        assistant_message.metadata.provider = Some(provider.to_string());
-        assistant_message.metadata.model = Some(model.clone());
-        assistant_message.metadata.usage = response.usage.clone();
         store.append_message(session_id, &assistant_message).await?;
         messages.push(assistant_message.clone());
+        update_pending_repl_view(
+            pending_view,
+            messages,
+            if response_tool_calls.is_empty() {
+                format!("completed step {step}")
+            } else {
+                format!("running {}", response_tool_calls[0].name)
+            },
+        );
 
-        if response.tool_calls.is_empty() {
+        if response_tool_calls.is_empty() {
             return Ok((latest_usage, step, stop_reason));
         }
 
-        for call in response.tool_calls {
+        for call in response_tool_calls {
+            update_pending_repl_view(pending_view, messages, format!("running {}", call.name));
             let input = serde_json::from_str(&call.input_json).unwrap_or_else(|_| json!({}));
             let output = tool_registry
                 .invoke(
@@ -2384,6 +2562,15 @@ async fn run_agent_turns(
             );
             store.append_message(session_id, &tool_message).await?;
             messages.push(tool_message);
+            update_pending_repl_view(
+                pending_view,
+                messages,
+                if output.is_error {
+                    format!("{} failed", call.name)
+                } else {
+                    format!("completed {}", call.name)
+                },
+            );
         }
     }
 
@@ -2400,15 +2587,18 @@ async fn execute_local_turn(
     raw_messages: &mut Vec<Message>,
     prompt_text: String,
     live_runtime: bool,
+    pending_view: Option<Arc<Mutex<PendingReplView>>>,
 ) -> Result<(Option<CompactionOutcome>, usize, Option<String>, u64, u64)> {
     let parent_id = raw_messages.last().map(|message| message.id);
     let user_message = build_text_message(session_id, MessageRole::User, prompt_text, parent_id);
     store.append_message(session_id, &user_message).await?;
     raw_messages.push(user_message);
+    update_pending_repl_view(pending_view.as_ref(), raw_messages, "waiting for response");
 
     let estimated_tokens_before =
         estimate_message_tokens(&materialize_runtime_messages(raw_messages));
     let applied_compaction = maybe_auto_compact(store, session_id, raw_messages).await?;
+    update_pending_repl_view(pending_view.as_ref(), raw_messages, "waiting for response");
     let estimated_tokens_after_compaction = applied_compaction
         .as_ref()
         .map(|outcome| outcome.estimated_tokens_after)
@@ -2423,6 +2613,7 @@ async fn execute_local_turn(
         session_id,
         &mut runtime_messages,
         live_runtime,
+        pending_view.as_ref(),
     )
     .await?;
     *raw_messages = store.load_session(session_id).await.unwrap_or_default();
@@ -2647,6 +2838,19 @@ fn render_statusline_command(
 ) -> Result<String> {
     Ok(serde_json::to_string_pretty(&json!({
         "statusline": repl_status(provider, active_model, session_id),
+    }))?)
+}
+
+fn render_ide_command(ide_bridge_active: bool, ide_address: Option<&str>) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&json!({
+        "connected": ide_bridge_active,
+        "bridge_address": ide_address,
+        "status": if ide_bridge_active { "connected" } else { "not_connected" },
+        "message": if ide_bridge_active {
+            "IDE bridge is active for this session."
+        } else {
+            "IDE auto-detection is not implemented yet in the Rust runtime. Connect an IDE bridge explicitly with --bridge-connect ide://HOST[:PORT] or --bridge-server ide://HOST[:PORT]."
+        },
     }))?)
 }
 
@@ -3430,6 +3634,7 @@ async fn handle_repl_slash_command(
     live_runtime: bool,
     vim_state: &mut code_agent_ui::vim::VimState,
     remote_mode: bool,
+    ide_bridge_active: bool,
 ) -> Result<String> {
     if !command_allowed_in_repl(registry, remote_mode, &invocation.name) {
         return Ok(format!(
@@ -3453,6 +3658,7 @@ async fn handle_repl_slash_command(
                 ))
             }
         }
+        "ide" => render_ide_command(ide_bridge_active, None),
         "model" => {
             let Some(model) = invocation.args.first() else {
                 return Ok(format!("current model={active_model}"));
@@ -3609,6 +3815,7 @@ async fn run_interactive_repl(
     auth_source: Option<String>,
     transcript_path: Option<PathBuf>,
     remote_mode: bool,
+    ide_bridge_active: bool,
 ) -> Result<()> {
     let mut active_model = active_model;
     let mut vim_state = code_agent_ui::vim::VimState::default();
@@ -3638,6 +3845,7 @@ async fn run_interactive_repl(
             provider,
             &active_model,
             session_id,
+            &cwd,
             &startup_screens,
         )?;
         if !startup_preferences.welcome_seen {
@@ -3664,6 +3872,7 @@ async fn run_interactive_repl(
                     &cwd,
                     provider,
                     &active_model,
+                    session_id,
                     &input_buffer,
                     &status_line,
                     None,
@@ -3867,16 +4076,20 @@ async fn run_interactive_repl(
                         let active_model_display = active_model.clone();
                         let vim_state_display = vim_state.clone();
                         let preview_messages = raw_messages.to_vec();
+                        let pending_view = Arc::new(Mutex::new(PendingReplView::new(
+                            preview_messages,
+                            format!("running {}", invocation.name),
+                        )));
                         match run_pending_repl_operation(
                             &mut terminal,
                             registry,
-                            &preview_messages,
+                            pending_view,
                             &cwd,
                             provider,
                             &active_model_display,
+                            session_id,
                             &input_buffer,
                             &base_status_line,
-                            &format!("running {}", invocation.name.clone()),
                             active_pane,
                             compact_banner.clone(),
                             transcript_scroll,
@@ -3895,6 +4108,7 @@ async fn run_interactive_repl(
                                 live_runtime,
                                 &mut vim_state,
                                 remote_mode,
+                                ide_bridge_active,
                             ),
                         )
                         .await
@@ -3925,16 +4139,20 @@ async fn run_interactive_repl(
                     let base_status_line = repl_status(provider, &active_model, session_id);
                     let preview_messages =
                         optimistic_messages_for_prompt(raw_messages, session_id, &prompt_text);
+                    let pending_view = Arc::new(Mutex::new(PendingReplView::new(
+                        preview_messages,
+                        "waiting for response",
+                    )));
                     match run_pending_repl_operation(
                         &mut terminal,
                         registry,
-                        &preview_messages,
+                        pending_view.clone(),
                         &cwd,
                         provider,
                         &active_model,
+                        session_id,
                         &input_buffer,
                         &base_status_line,
-                        "waiting for response",
                         active_pane,
                         compact_banner.clone(),
                         transcript_scroll,
@@ -3949,6 +4167,7 @@ async fn run_interactive_repl(
                             raw_messages,
                             prompt_text,
                             live_runtime,
+                            Some(pending_view),
                         ),
                     )
                     .await
@@ -4026,6 +4245,7 @@ async fn handle_slash_command(
         "session" => println!("{}", render_session_command(store, session_id).await?),
         "permissions" => println!("{}", render_permissions_command(cwd).await?),
         "status" => println!("{}", render_status_command(provider, active_model, session_id, live_runtime, cwd)?),
+        "ide" => println!("{}", render_ide_command(ide_bridge_enabled(cli), ide_bridge_address(cli))?),
         "statusline" => println!("{}", render_statusline_command(provider, active_model, session_id)?),
         "theme" => println!("{}", render_theme_command()?),
         "vim" => println!("{}", render_vim_command(false)?),
@@ -4256,6 +4476,13 @@ async fn handle_slash_command(
             serde_json::to_string_pretty(&json!({
                 "status": "deferred",
                 "message": "voice features are intentionally excluded from the current finish target",
+            }))?
+        ),
+        "exit" => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "noop",
+                "message": "Use /exit or /quit inside --repl to leave the interactive session.",
             }))?
         ),
         other => bail!("unknown registered command: {other}"),
@@ -4532,6 +4759,7 @@ async fn main() -> Result<()> {
         let title = format!("{provider}  {active_model}");
         let app = RatatuiApp::new(title);
         let mut state = app.state_from_messages(runtime_messages, &registry.all());
+        apply_repl_header(&mut state, provider, &active_model, &cwd, session_id);
         state.status_line = repl_status(provider, &active_model, session_id);
         if let Some(path) = transcript_path.as_ref() {
             state.compact_banner = Some(format!("resume {}", shorten_path(path, 72)));
@@ -4559,6 +4787,7 @@ async fn main() -> Result<()> {
             auth_source.clone(),
             transcript_path.clone(),
             remote_mode_enabled(&cli),
+            ide_bridge_enabled(&cli),
         )
         .await?;
         return Ok(());
@@ -4619,6 +4848,7 @@ async fn main() -> Result<()> {
             session_id,
             &mut runtime_messages,
             live_runtime,
+            None,
         )
         .await?;
 
@@ -4693,7 +4923,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde::Deserialize;
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -4740,6 +4970,54 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
+    fn repl_handled_command_names() -> BTreeSet<&'static str> {
+        BTreeSet::from([
+            "help",
+            "version",
+            "config",
+            "status",
+            "ide",
+            "statusline",
+            "theme",
+            "vim",
+            "plan",
+            "fast",
+            "passes",
+            "effort",
+            "model",
+            "compact",
+            "clear",
+            "resume",
+            "session",
+            "login",
+            "logout",
+            "permissions",
+            "plugin",
+            "skills",
+            "reload-plugins",
+            "hooks",
+            "output-style",
+            "mcp",
+            "memory",
+            "files",
+            "diff",
+            "usage",
+            "cost",
+            "stats",
+            "remote-env",
+            "export",
+            "tasks",
+            "agents",
+            "remote-control",
+            "voice",
+            "exit",
+        ])
+    }
+
+    fn noninteractive_handled_command_names() -> BTreeSet<&'static str> {
+        repl_handled_command_names()
+    }
+
     #[test]
     fn parses_fixture_backed_slash_commands() {
         let fixture_path = workspace_root().join("fixtures/command-golden/slash-commands.json");
@@ -4753,6 +5031,26 @@ mod tests {
             assert_eq!(parsed.name, case.name);
             assert_eq!(parsed.args, case.args);
         }
+    }
+
+    #[test]
+    fn builtin_commands_are_wired_for_repl_and_noninteractive_handlers() {
+        let registry_commands = compatibility_command_registry()
+            .all_owned()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<BTreeSet<_>>();
+        let repl_commands = repl_handled_command_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let noninteractive_commands = noninteractive_handled_command_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(repl_commands, registry_commands);
+        assert_eq!(noninteractive_commands, registry_commands);
     }
 
     #[test]
@@ -4824,6 +5122,7 @@ mod tests {
             ApiProvider::ChatGPTCodex,
             DEFAULT_OPENAI_REASONING_MODEL,
             SessionId::new_v4(),
+            Path::new("/tmp/project"),
             &screens,
             0,
             2,
@@ -4836,6 +5135,10 @@ mod tests {
             Some("Type to enter the REPL immediately. Enter also continues.")
         );
         assert_eq!(state.active_pane, Some(code_agent_ui::PaneKind::Transcript));
+        assert!(state
+            .header_context
+            .as_deref()
+            .is_some_and(|value| value.contains("/tmp/project")));
     }
 
     #[test]
@@ -4976,6 +5279,9 @@ mod tests {
             &registry,
             &[],
             Path::new("."),
+            ApiProvider::ChatGPTCodex,
+            DEFAULT_OPENAI_REASONING_MODEL,
+            SessionId::new_v4(),
             &input,
             "status",
             None,
@@ -4991,6 +5297,10 @@ mod tests {
         assert_eq!(state.transcript_scroll, 0);
         assert!(state.selected_command_suggestion.is_none());
         assert!(state.command_suggestions.is_empty());
+        assert_eq!(
+            state.header_subtitle.as_deref(),
+            Some("gpt-5.4 · chatgpt-codex")
+        );
     }
 
     #[tokio::test]
@@ -5023,6 +5333,7 @@ mod tests {
             &mut raw_messages,
             false,
             &mut vim_state,
+            false,
             false,
         )
         .await
@@ -5061,12 +5372,75 @@ mod tests {
             false,
             &mut vim_state,
             false,
+            false,
         )
         .await
         .unwrap();
 
         assert!(status.contains("provider=firstParty"));
         assert!(status.contains("runtime=offline"));
+    }
+
+    #[tokio::test]
+    async fn repl_ide_command_reports_bridge_state() {
+        let store =
+            ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-ide")));
+        let tool_registry = compatibility_tool_registry();
+        let root = env::temp_dir();
+        let registry = resolved_command_registry(&root, None).await;
+        let mut active_model = "claude-sonnet-4-6".to_owned();
+        let session_id = SessionId::new_v4();
+        let mut raw_messages = Vec::new();
+        let mut vim_state = code_agent_ui::vim::VimState::default();
+
+        let disconnected = handle_repl_slash_command(
+            &registry,
+            CommandInvocation {
+                name: "ide".to_owned(),
+                raw_input: "/ide".to_owned(),
+                ..CommandInvocation::default()
+            },
+            &store,
+            &tool_registry,
+            &root,
+            None,
+            ApiProvider::FirstParty,
+            &mut active_model,
+            session_id,
+            &mut raw_messages,
+            false,
+            &mut vim_state,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let connected = handle_repl_slash_command(
+            &registry,
+            CommandInvocation {
+                name: "ide".to_owned(),
+                raw_input: "/ide".to_owned(),
+                ..CommandInvocation::default()
+            },
+            &store,
+            &tool_registry,
+            &root,
+            None,
+            ApiProvider::FirstParty,
+            &mut active_model,
+            session_id,
+            &mut raw_messages,
+            false,
+            &mut vim_state,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(disconnected.contains("\"status\": \"not_connected\""));
+        assert!(connected.contains("\"status\": \"connected\""));
     }
 
     #[tokio::test]
@@ -5098,6 +5472,7 @@ mod tests {
             &mut raw_messages,
             true,
             &mut vim_state,
+            false,
             false,
         )
         .await
@@ -5137,6 +5512,7 @@ mod tests {
             &mut raw_messages,
             true,
             &mut vim_state,
+            false,
             false,
         )
         .await
@@ -5185,6 +5561,7 @@ mod tests {
             false,
             &mut vim_state,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -5227,6 +5604,7 @@ mod tests {
             false,
             &mut vim_state,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -5247,6 +5625,7 @@ mod tests {
             &mut raw_messages,
             false,
             &mut vim_state,
+            false,
             false,
         )
         .await
@@ -5301,6 +5680,7 @@ mod tests {
             false,
             &mut vim_state,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -5354,6 +5734,7 @@ mod tests {
             &mut raw_messages,
             false,
             &mut vim_state,
+            false,
             false,
         )
         .await
@@ -5471,6 +5852,7 @@ mod tests {
             false,
             &mut vim_state,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -5507,6 +5889,7 @@ mod tests {
             &mut raw_messages,
             false,
             &mut vim_state,
+            false,
             false,
         )
         .await
@@ -5948,6 +6331,7 @@ mod tests {
                         "content": "ok"
                     })
                     .to_string(),
+                    thought_signature: None,
                 },
             })
             .await

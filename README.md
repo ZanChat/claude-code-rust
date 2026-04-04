@@ -192,6 +192,7 @@ Inside the REPL:
 |---|---|
 | `/vim` | Toggle Vim mode (full state machine) |
 | `/status` | Print runtime provider and environment status |
+| `/ide` | Inspect IDE bridge compatibility and connection state |
 | `/model <name>` | Switch active model |
 | `/files` | View context files |
 | `/diff` | View context diffs |

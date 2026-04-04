@@ -84,6 +84,8 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub input_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -964,6 +966,18 @@ pub fn compatibility_command_registry() -> CommandRegistry {
         builtin_command(
             "status",
             "Show a compact runtime status summary.",
+            CommandCategory::Config,
+            CommandKind::Local,
+            &[],
+            false,
+            true,
+            true,
+            false,
+            false,
+        ),
+        builtin_command(
+            "ide",
+            "Inspect IDE bridge compatibility and connection state.",
             CommandCategory::Config,
             CommandKind::Local,
             &[],
