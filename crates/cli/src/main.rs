@@ -32,9 +32,9 @@ use code_agent_session::{
 use code_agent_tools::{compatibility_tool_registry, ToolCallRequest, ToolContext, ToolRegistry};
 use code_agent_ui::{
     draw_terminal as draw_tui, mouse_action_for_position, render_to_string as render_tui_to_string,
-    CommandPaletteEntry, Notification, PaneKind, PanePreview, PermissionPromptState,
-    QuestionUiEntry, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup, TranscriptLine,
-    UiMouseAction, UiState,
+    ChoiceListItem, ChoiceListState, CommandPaletteEntry, Notification, PaneKind, PanePreview,
+    PermissionPromptState, QuestionUiEntry, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup,
+    TranscriptLine, UiMouseAction, UiState,
 };
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
@@ -187,6 +187,22 @@ struct AuthCommandReport {
 struct ResumeTargetHint {
     session_id: SessionId,
     transcript_path: PathBuf,
+}
+
+const UI_EVENT_TAG: &str = "ui_event";
+const UI_ROLE_ATTRIBUTE: &str = "ui_role";
+const UI_AUTHOR_ATTRIBUTE: &str = "ui_author";
+
+#[derive(Clone, Debug)]
+struct ReplSessionState {
+    session_id: SessionId,
+    transcript_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct ResumePickerState {
+    sessions: Vec<SessionSummary>,
+    selected: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -998,6 +1014,264 @@ fn build_text_message(
     message
 }
 
+fn build_ui_event_message(
+    session_id: SessionId,
+    parent_id: Option<Uuid>,
+    text: String,
+    ui_role: &str,
+    ui_author: Option<String>,
+) -> Message {
+    let mut message = build_text_message(session_id, MessageRole::Attachment, text, parent_id);
+    message.metadata.tags.push(UI_EVENT_TAG.to_owned());
+    message
+        .metadata
+        .attributes
+        .insert(UI_ROLE_ATTRIBUTE.to_owned(), ui_role.to_owned());
+    if let Some(author) = ui_author.filter(|value| !value.trim().is_empty()) {
+        message
+            .metadata
+            .attributes
+            .insert(UI_AUTHOR_ATTRIBUTE.to_owned(), author);
+    }
+    message
+}
+
+fn build_repl_command_input_message(
+    session_id: SessionId,
+    parent_id: Option<Uuid>,
+    raw_input: impl Into<String>,
+) -> Message {
+    build_ui_event_message(session_id, parent_id, raw_input.into(), "command", None)
+}
+
+fn build_repl_command_output_message(
+    session_id: SessionId,
+    parent_id: Option<Uuid>,
+    command_name: &str,
+    output: impl Into<String>,
+) -> Message {
+    build_ui_event_message(
+        session_id,
+        parent_id,
+        output.into(),
+        "command_output",
+        Some(format!("/{command_name}")),
+    )
+}
+
+fn should_record_repl_command(name: &str) -> bool {
+    !matches!(name, "clear" | "resume")
+}
+
+fn should_echo_command_result_in_footer(
+    command_name: &str,
+    command_recorded: bool,
+    is_error: bool,
+) -> bool {
+    if command_recorded {
+        return false;
+    }
+    if is_error {
+        return true;
+    }
+    command_name != "resume"
+}
+
+async fn append_session_message(
+    store: &ActiveSessionStore,
+    raw_messages: &mut Vec<Message>,
+    message: Message,
+) -> Result<()> {
+    let session_id = message
+        .session_id
+        .ok_or_else(|| anyhow!("session message missing session id"))?;
+    store.append_message(session_id, &message).await?;
+    raw_messages.push(message);
+    Ok(())
+}
+
+async fn append_session_messages(
+    store: &ActiveSessionStore,
+    raw_messages: &mut Vec<Message>,
+    messages: Vec<Message>,
+) -> Result<()> {
+    for message in messages {
+        append_session_message(store, raw_messages, message).await?;
+    }
+    Ok(())
+}
+
+fn optimistic_messages_for_command(
+    raw_messages: &[Message],
+    session_id: SessionId,
+    raw_input: &str,
+) -> Vec<Message> {
+    let mut preview_messages = raw_messages.to_vec();
+    preview_messages.push(build_repl_command_input_message(
+        session_id,
+        raw_messages.last().map(|message| message.id),
+        raw_input.to_owned(),
+    ));
+    preview_messages
+}
+
+fn resumable_sessions(
+    sessions: Vec<SessionSummary>,
+    current_session_id: SessionId,
+) -> Vec<SessionSummary> {
+    sessions
+        .into_iter()
+        .filter(|summary| summary.session_id != current_session_id)
+        .collect()
+}
+
+fn resume_picker_item(summary: &SessionSummary) -> ChoiceListItem {
+    let prompt = preview_lines_from_text(summary.first_prompt.clone(), 1, 56).join(" ");
+    ChoiceListItem {
+        label: format!("s:{}  {prompt}", short_session_id(summary.session_id)),
+        detail: Some(format!(
+            "{} messages · {}",
+            summary.message_count,
+            shorten_path(&summary.transcript_path, 64)
+        )),
+        secondary: None,
+    }
+}
+
+fn build_resume_choice_list(picker: &ResumePickerState) -> ChoiceListState {
+    ChoiceListState {
+        title: "Resume conversation".to_owned(),
+        subtitle: Some("Enter to select · Esc to cancel".to_owned()),
+        items: picker.sessions.iter().map(resume_picker_item).collect(),
+        selected: picker.selected,
+        empty_message: Some("No conversations found to resume.".to_owned()),
+    }
+}
+
+async fn resume_repl_session(
+    store: &ActiveSessionStore,
+    repl_session: &mut ReplSessionState,
+    raw_messages: &mut Vec<Message>,
+    target: &str,
+) -> Result<PathBuf> {
+    let (session_id, transcript_path, messages) = store.load_resume_target(target).await?;
+    repl_session.session_id = session_id;
+    repl_session.transcript_path = Some(transcript_path.clone());
+    *raw_messages = messages;
+    Ok(transcript_path)
+}
+
+fn slash_command_footer_status(
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    command_name: &str,
+    command_recorded: bool,
+    is_error: bool,
+    detail: &str,
+) -> String {
+    let base = repl_status(provider, active_model, session_id);
+    if should_echo_command_result_in_footer(command_name, command_recorded, is_error) {
+        status_with_detail(base, detail)
+    } else {
+        base
+    }
+}
+
+fn task_status_summary(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "pending",
+        TaskStatus::Running => "running",
+        TaskStatus::WaitingForInput => "waiting",
+        TaskStatus::Completed => "done",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "stopped",
+    }
+}
+
+fn preview_detail(text: &str, max_lines: usize, max_width: usize) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(preview_lines_from_text(trimmed.to_owned(), max_lines, max_width).join("\n"))
+}
+
+fn summarize_task_ui_event(task: &TaskRecord) -> String {
+    let mut lines = vec![format!(
+        "{} {} [{}]",
+        task_status_summary(&task.status),
+        task.title,
+        task.kind
+    )];
+    if let Some(detail) = task
+        .output
+        .as_deref()
+        .or(task.input.as_deref())
+        .and_then(|text| preview_detail(text, 2, 96))
+    {
+        lines.push(detail);
+    }
+    lines.join("\n")
+}
+
+fn summarize_question_ui_event(question: &QuestionRequest) -> String {
+    let mut lines = vec![question.prompt.clone()];
+    if !question.choices.is_empty() {
+        lines.push(format!("choices: {}", question.choices.join(", ")));
+    }
+    lines.join("\n")
+}
+
+fn tool_ui_event_messages(
+    session_id: SessionId,
+    parent_id: Option<Uuid>,
+    metadata: &Value,
+) -> Vec<Message> {
+    let mut events = Vec::new();
+    let mut next_parent_id = parent_id;
+
+    if let Ok(task) = serde_json::from_value::<TaskRecord>(metadata.clone()) {
+        let message = build_ui_event_message(
+            session_id,
+            next_parent_id,
+            summarize_task_ui_event(&task),
+            "task",
+            Some("Task".to_owned()),
+        );
+        next_parent_id = Some(message.id);
+        events.push(message);
+    }
+
+    if let Some(workflow_task) = metadata
+        .get("workflow")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskRecord>(value).ok())
+    {
+        let message = build_ui_event_message(
+            session_id,
+            next_parent_id,
+            summarize_task_ui_event(&workflow_task),
+            "task",
+            Some("Task".to_owned()),
+        );
+        next_parent_id = Some(message.id);
+        events.push(message);
+    }
+
+    if let Ok(question) = serde_json::from_value::<QuestionRequest>(metadata.clone()) {
+        events.push(build_ui_event_message(
+            session_id,
+            next_parent_id,
+            summarize_question_ui_event(&question),
+            "task",
+            Some("Question".to_owned()),
+        ));
+    }
+
+    events
+}
+
 async fn run_tool(
     tool_name: &str,
     input: Value,
@@ -1589,6 +1863,7 @@ fn build_repl_ui_state(
     active_pane: PaneKind,
     compact_banner: Option<String>,
     transcript_scroll: u16,
+    choice_list: Option<ChoiceListState>,
     command_suggestions: Vec<CommandPaletteEntry>,
     selected_command_suggestion: usize,
     status_marquee_tick: usize,
@@ -1657,6 +1932,7 @@ fn build_repl_ui_state(
     state.status_line = status_line.to_owned();
     state.progress_message = progress_message;
     state.active_pane = Some(active_pane);
+    state.choice_list = choice_list;
     state.compact_banner = compact_banner;
     state.command_suggestions = command_suggestions;
     state.selected_command_suggestion = if state.command_suggestions.is_empty() {
@@ -1707,6 +1983,7 @@ fn draw_repl_state(
     active_pane: PaneKind,
     compact_banner: Option<String>,
     transcript_scroll: u16,
+    choice_list: Option<ChoiceListState>,
     selected_command_suggestion: &mut usize,
     vim_state: &code_agent_ui::vim::VimState,
     status_marquee_tick: usize,
@@ -1728,6 +2005,7 @@ fn draw_repl_state(
         active_pane,
         compact_banner,
         transcript_scroll,
+        choice_list,
         suggestions,
         *selected_command_suggestion,
         status_marquee_tick,
@@ -1751,6 +2029,7 @@ fn repl_mouse_action(
     active_pane: PaneKind,
     compact_banner: Option<String>,
     transcript_scroll: u16,
+    choice_list: Option<ChoiceListState>,
     selected_command_suggestion: usize,
     status_marquee_tick: usize,
     mouse: &MouseEvent,
@@ -1771,6 +2050,7 @@ fn repl_mouse_action(
         active_pane,
         compact_banner,
         transcript_scroll,
+        choice_list,
         command_suggestions(registry, input_buffer),
         selected_command_suggestion,
         status_marquee_tick,
@@ -1984,6 +2264,7 @@ where
                             active_pane,
                             compact_banner.clone(),
                             transcript_scroll,
+                            None,
                             selected_command_suggestion,
                             tick,
                             &mouse,
@@ -2041,6 +2322,7 @@ where
             active_pane,
             compact_banner.clone(),
             transcript_scroll,
+            None,
             &mut selected_command_suggestion,
             vim_state,
             tick,
@@ -2895,21 +3177,31 @@ async fn run_agent_turns(
                     &tool_context,
                 )
                 .await?;
+            let output_content = output.content;
+            let output_is_error = output.is_error;
+            let output_metadata = output.metadata;
             let tool_message = build_tool_result_message(
                 session_id,
                 call.id,
-                output.content,
-                output.is_error,
+                output_content,
+                output_is_error,
                 messages.last().map(|message| message.id),
             );
             store.append_message(session_id, &tool_message).await?;
+            let tool_message_id = tool_message.id;
             messages.push(tool_message);
+            append_session_messages(
+                store,
+                messages,
+                tool_ui_event_messages(session_id, Some(tool_message_id), &output_metadata),
+            )
+            .await?;
             update_pending_repl_step_view(
                 pending_view,
                 step,
                 step_start_index,
                 messages,
-                if output.is_error {
+                if output_is_error {
                     format!("{} failed", call.name)
                 } else {
                     format!("completed {}", call.name)
@@ -3989,7 +4281,7 @@ async fn handle_repl_slash_command(
     plugin_root: Option<&PathBuf>,
     provider: ApiProvider,
     active_model: &mut String,
-    session_id: SessionId,
+    repl_session: &mut ReplSessionState,
     raw_messages: &mut Vec<Message>,
     live_runtime: bool,
     vim_state: &mut code_agent_ui::vim::VimState,
@@ -4013,7 +4305,7 @@ async fn handle_repl_slash_command(
                     "provider={} model={} session={} runtime={}",
                     provider,
                     active_model,
-                    session_id,
+                    repl_session.session_id,
                     if live_runtime { "live" } else { "offline" }
                 ))
             }
@@ -4045,7 +4337,8 @@ async fn handle_repl_slash_command(
                 },
             );
             if let Some(outcome) = outcome {
-                apply_compaction_outcome(store, session_id, raw_messages, &outcome).await?;
+                apply_compaction_outcome(store, repl_session.session_id, raw_messages, &outcome)
+                    .await?;
                 return Ok(format!(
                     "compacted {} messages to ~{} tokens",
                     outcome.summarized_message_count, outcome.estimated_tokens_after
@@ -4054,18 +4347,30 @@ async fn handle_repl_slash_command(
             Ok("nothing to compact".to_owned())
         }
         "clear" => {
-            let transcript_path = store.transcript_path(session_id).await?;
+            let transcript_path = store.transcript_path(repl_session.session_id).await?;
             if transcript_path.exists() {
                 fs::remove_file(&transcript_path)?;
             }
             raw_messages.clear();
-            Ok(format!("cleared session {}", session_id))
+            Ok(format!("cleared session {}", repl_session.session_id))
         }
-        "resume" => Ok("restart with --resume to switch transcripts".to_owned()),
-        "session" => render_session_command(store, session_id).await,
+        "resume" => {
+            if let Some(target) = invocation.args.first() {
+                let transcript_path =
+                    resume_repl_session(store, repl_session, raw_messages, target).await?;
+                Ok(format!(
+                    "resumed {} ({})",
+                    repl_session.session_id,
+                    shorten_path(&transcript_path, 64)
+                ))
+            } else {
+                Ok(serde_json::to_string_pretty(&store.list_sessions().await?)?)
+            }
+        }
+        "session" => render_session_command(store, repl_session.session_id).await,
         "login" => render_auth_command(provider, "login").await,
         "logout" => {
-            let resume_hint = current_resume_hint(store, session_id).await?;
+            let resume_hint = current_resume_hint(store, repl_session.session_id).await?;
             render_auth_command_with_resume(provider, "logout", Some(resume_hint)).await
         }
         "permissions" => render_permissions_command(cwd).await,
@@ -4097,8 +4402,14 @@ async fn handle_repl_slash_command(
         "files" => render_files_command(raw_messages, cwd),
         "diff" => render_diff_command(raw_messages),
         "usage" | "cost" | "stats" => render_usage_command(raw_messages),
-        "status" => render_status_command(provider, active_model, session_id, live_runtime, cwd),
-        "statusline" => render_statusline_command(provider, active_model, session_id),
+        "status" => render_status_command(
+            provider,
+            active_model,
+            repl_session.session_id,
+            live_runtime,
+            cwd,
+        ),
+        "statusline" => render_statusline_command(provider, active_model, repl_session.session_id),
         "theme" => render_theme_command(),
         "vim" => {
             vim_state.enabled = !vim_state.enabled;
@@ -4126,7 +4437,7 @@ async fn handle_repl_slash_command(
             "remote-env",
             "Remote environment reporting currently flows through bridge and session status surfaces.",
         ),
-        "export" => render_export_command(store, session_id),
+        "export" => render_export_command(store, repl_session.session_id),
         "tasks" => render_tasks_command(&invocation, cwd),
         "agents" => {
             render_agents_command(
@@ -4135,7 +4446,7 @@ async fn handle_repl_slash_command(
                 cwd,
                 provider,
                 Some(active_model.clone()),
-                session_id,
+                repl_session.session_id,
             )
             .await
         }
@@ -4149,7 +4460,7 @@ async fn handle_repl_slash_command(
                 cwd,
                 provider,
                 active_model,
-                session_id,
+                repl_session.session_id,
                 raw_messages,
                 live_runtime,
             )
@@ -4176,8 +4487,12 @@ async fn run_interactive_repl(
     transcript_path: Option<PathBuf>,
     remote_mode: bool,
     ide_bridge_active: bool,
-) -> Result<()> {
+) -> Result<SessionId> {
     let mut active_model = active_model;
+    let mut repl_session = ReplSessionState {
+        session_id,
+        transcript_path,
+    };
     let mut vim_state = code_agent_ui::vim::VimState::default();
     let mut out = stdout();
     enable_raw_mode()?;
@@ -4190,10 +4505,10 @@ async fn run_interactive_repl(
     let startup_screens = build_startup_screens(
         provider,
         &active_model,
-        session_id,
+        repl_session.session_id,
         &cwd,
         store.root_dir(),
-        transcript_path.as_deref(),
+        repl_session.transcript_path.as_deref(),
         live_runtime,
         auth_source.as_deref(),
         &startup_preferences,
@@ -4204,7 +4519,7 @@ async fn run_interactive_repl(
             &mut terminal,
             provider,
             &active_model,
-            session_id,
+            repl_session.session_id,
             &cwd,
             &startup_screens,
         )?;
@@ -4220,11 +4535,12 @@ async fn run_interactive_repl(
         let mut prompt_history_index = None;
         let mut prompt_history_draft = None;
         let mut transcript_scroll = 0u16;
-        let mut status_line = repl_status(provider, &active_model, session_id);
+        let mut status_line = repl_status(provider, &active_model, repl_session.session_id);
         let mut status_marquee_tick = 0usize;
         let mut active_pane = PaneKind::Transcript;
         let mut selected_command_suggestion = 0usize;
         let mut compact_banner = None;
+        let mut resume_picker = None;
         let mut dirty = true;
         loop {
             if dirty {
@@ -4236,13 +4552,14 @@ async fn run_interactive_repl(
                     &cwd,
                     provider,
                     &active_model,
-                    session_id,
+                    repl_session.session_id,
                     &input_buffer,
                     &status_line,
                     None,
                     active_pane,
                     compact_banner.clone(),
                     transcript_scroll,
+                    resume_picker.as_ref().map(build_resume_choice_list),
                     &mut selected_command_suggestion,
                     &vim_state,
                     status_marquee_tick,
@@ -4284,13 +4601,14 @@ async fn run_interactive_repl(
                             &cwd,
                             provider,
                             &active_model,
-                            session_id,
+                            repl_session.session_id,
                             &input_buffer,
                             &status_line,
                             None,
                             active_pane,
                             compact_banner.clone(),
                             transcript_scroll,
+                            resume_picker.as_ref().map(build_resume_choice_list),
                             selected_command_suggestion,
                             status_marquee_tick,
                             &mouse,
@@ -4310,6 +4628,100 @@ async fn run_interactive_repl(
                 continue;
             };
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if matches!(key.code, KeyCode::Char('c'))
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                break;
+            }
+            if resume_picker.is_some() {
+                enum ResumePickerAction {
+                    Close,
+                    Resume(SessionSummary),
+                }
+
+                let mut picker_action = None;
+                if let Some(picker) = resume_picker.as_mut() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            picker_action = Some(ResumePickerAction::Close);
+                            dirty = true;
+                        }
+                        KeyCode::Up => {
+                            picker.selected = picker.selected.saturating_sub(1);
+                            dirty = true;
+                        }
+                        KeyCode::Down => {
+                            if picker.selected + 1 < picker.sessions.len() {
+                                picker.selected += 1;
+                            }
+                            dirty = true;
+                        }
+                        KeyCode::PageUp => {
+                            picker.selected = picker.selected.saturating_sub(5);
+                            dirty = true;
+                        }
+                        KeyCode::PageDown => {
+                            if !picker.sessions.is_empty() {
+                                picker.selected =
+                                    (picker.selected + 5).min(picker.sessions.len() - 1);
+                            }
+                            dirty = true;
+                        }
+                        KeyCode::Home => {
+                            picker.selected = 0;
+                            dirty = true;
+                        }
+                        KeyCode::End => {
+                            if !picker.sessions.is_empty() {
+                                picker.selected = picker.sessions.len() - 1;
+                            }
+                            dirty = true;
+                        }
+                        KeyCode::Enter => {
+                            picker_action = picker
+                                .sessions
+                                .get(picker.selected)
+                                .cloned()
+                                .map(ResumePickerAction::Resume);
+                            dirty = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                match picker_action {
+                    Some(ResumePickerAction::Close) => {
+                        resume_picker = None;
+                        status_line = repl_status(provider, &active_model, repl_session.session_id);
+                        status_marquee_tick = 0;
+                    }
+                    Some(ResumePickerAction::Resume(summary)) => {
+                        resume_picker = None;
+                        let previous_session_id = repl_session.session_id;
+                        let transcript_path = resume_repl_session(
+                            store,
+                            &mut repl_session,
+                            raw_messages,
+                            &summary.session_id.to_string(),
+                        )
+                        .await?;
+                        if repl_session.session_id != previous_session_id {
+                            prompt_history = prompt_history_from_messages(raw_messages);
+                            reset_prompt_history_navigation(
+                                &mut prompt_history_index,
+                                &mut prompt_history_draft,
+                            );
+                            transcript_scroll = 0;
+                        }
+                        compact_banner =
+                            Some(format!("resume {}", shorten_path(&transcript_path, 72)));
+                        status_line = repl_status(provider, &active_model, repl_session.session_id);
+                        status_marquee_tick = 0;
+                    }
+                    None => {}
+                }
                 continue;
             }
             if let Some(pane) = pane_from_shortcut(&key) {
@@ -4404,7 +4816,6 @@ async fn run_interactive_repl(
                     input_buffer.cursor = (input_buffer.cursor + 1).min(input_buffer.chars.len());
                     dirty = true;
                 }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 KeyCode::Char(ch)
                     if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
                 {
@@ -4510,13 +4921,61 @@ async fn run_interactive_repl(
                     selected_command_suggestion = 0;
                     compact_banner = None;
                     if let Some(invocation) = registry.parse_slash_command(&prompt_text) {
-                        let base_status_line = repl_status(provider, &active_model, session_id);
+                        if invocation.name == "resume" && invocation.args.is_empty() {
+                            let sessions = resumable_sessions(
+                                store.list_sessions().await?,
+                                repl_session.session_id,
+                            );
+                            if sessions.is_empty() {
+                                status_line = status_with_detail(
+                                    repl_status(provider, &active_model, repl_session.session_id),
+                                    "No conversations found to resume",
+                                );
+                            } else {
+                                resume_picker = Some(ResumePickerState {
+                                    sessions,
+                                    selected: 0,
+                                });
+                                status_line =
+                                    repl_status(provider, &active_model, repl_session.session_id);
+                            }
+                            status_marquee_tick = 0;
+                            dirty = true;
+                            continue;
+                        }
+                        let command_name = invocation.name.clone();
+                        let command_input = invocation.raw_input.clone();
+                        let command_recorded = should_record_repl_command(&command_name);
+                        if command_recorded {
+                            append_session_message(
+                                store,
+                                raw_messages,
+                                build_repl_command_input_message(
+                                    repl_session.session_id,
+                                    raw_messages.last().map(|message| message.id),
+                                    command_input.clone(),
+                                ),
+                            )
+                            .await?;
+                        }
+
+                        let previous_session_id = repl_session.session_id;
+                        let base_status_line =
+                            repl_status(provider, &active_model, repl_session.session_id);
                         let active_model_display = active_model.clone();
                         let vim_state_display = vim_state.clone();
-                        let preview_messages = materialize_runtime_messages(raw_messages);
+                        let preview_messages = if command_recorded {
+                            materialize_runtime_messages(raw_messages)
+                        } else {
+                            materialize_runtime_messages(&optimistic_messages_for_command(
+                                raw_messages,
+                                repl_session.session_id,
+                                &command_input,
+                            ))
+                        };
                         let pending_view = Arc::new(Mutex::new(PendingReplView::new(
                             preview_messages,
-                            format!("running {}", invocation.name),
+                            format!("running {command_name}"),
                         )));
                         match run_pending_repl_operation(
                             &mut terminal,
@@ -4525,7 +4984,7 @@ async fn run_interactive_repl(
                             &cwd,
                             provider,
                             &active_model_display,
-                            session_id,
+                            repl_session.session_id,
                             &input_buffer,
                             &base_status_line,
                             active_pane,
@@ -4541,7 +5000,7 @@ async fn run_interactive_repl(
                                 plugin_root,
                                 provider,
                                 &mut active_model,
-                                session_id,
+                                &mut repl_session,
                                 raw_messages,
                                 live_runtime,
                                 &mut vim_state,
@@ -4553,8 +5012,38 @@ async fn run_interactive_repl(
                         {
                             Ok(next_status) if next_status == "exit" => break,
                             Ok(next_status) => {
-                                status_line = status_with_detail(
-                                    repl_status(provider, &active_model, session_id),
+                                if command_recorded {
+                                    append_session_message(
+                                        store,
+                                        raw_messages,
+                                        build_repl_command_output_message(
+                                            repl_session.session_id,
+                                            raw_messages.last().map(|message| message.id),
+                                            &command_name,
+                                            next_status.clone(),
+                                        ),
+                                    )
+                                    .await?;
+                                }
+                                if repl_session.session_id != previous_session_id {
+                                    prompt_history = prompt_history_from_messages(raw_messages);
+                                    reset_prompt_history_navigation(
+                                        &mut prompt_history_index,
+                                        &mut prompt_history_draft,
+                                    );
+                                    transcript_scroll = 0;
+                                    compact_banner = repl_session
+                                        .transcript_path
+                                        .as_ref()
+                                        .map(|path| format!("resume {}", shorten_path(path, 72)));
+                                }
+                                status_line = slash_command_footer_status(
+                                    provider,
+                                    &active_model,
+                                    repl_session.session_id,
+                                    &command_name,
+                                    command_recorded,
+                                    false,
                                     &next_status,
                                 );
                                 status_marquee_tick = 0;
@@ -4563,10 +5052,29 @@ async fn run_interactive_repl(
                                 }
                             }
                             Err(error) => {
-                                status_line = status_with_detail(
-                                    repl_status(provider, &active_model, session_id),
-                                    format!("error: {error}"),
+                                let error_detail = format!("error: {error}");
+                                status_line = slash_command_footer_status(
+                                    provider,
+                                    &active_model,
+                                    repl_session.session_id,
+                                    &command_name,
+                                    command_recorded,
+                                    true,
+                                    &error_detail,
                                 );
+                                if command_recorded {
+                                    append_session_message(
+                                        store,
+                                        raw_messages,
+                                        build_repl_command_output_message(
+                                            repl_session.session_id,
+                                            raw_messages.last().map(|message| message.id),
+                                            &command_name,
+                                            format!("error: {error}"),
+                                        ),
+                                    )
+                                    .await?;
+                                }
                                 status_marquee_tick = 0;
                             }
                         }
@@ -4574,10 +5082,14 @@ async fn run_interactive_repl(
                         continue;
                     }
 
-                    let base_status_line = repl_status(provider, &active_model, session_id);
-                    let preview_messages = materialize_runtime_messages(
-                        &optimistic_messages_for_prompt(raw_messages, session_id, &prompt_text),
-                    );
+                    let base_status_line =
+                        repl_status(provider, &active_model, repl_session.session_id);
+                    let preview_messages =
+                        materialize_runtime_messages(&optimistic_messages_for_prompt(
+                            raw_messages,
+                            repl_session.session_id,
+                            &prompt_text,
+                        ));
                     let pending_view = Arc::new(Mutex::new(PendingReplView::new(
                         preview_messages,
                         "waiting for response",
@@ -4589,7 +5101,7 @@ async fn run_interactive_repl(
                         &cwd,
                         provider,
                         &active_model,
-                        session_id,
+                        repl_session.session_id,
                         &input_buffer,
                         &base_status_line,
                         active_pane,
@@ -4602,7 +5114,7 @@ async fn run_interactive_repl(
                             cwd.clone(),
                             provider,
                             active_model.clone(),
-                            session_id,
+                            repl_session.session_id,
                             raw_messages,
                             prompt_text,
                             live_runtime,
@@ -4624,14 +5136,14 @@ async fn run_interactive_repl(
                                 format!("{turn_count} steps · {:?}", stop_reason)
                             };
                             status_line = status_with_detail(
-                                repl_status(provider, &active_model, session_id),
+                                repl_status(provider, &active_model, repl_session.session_id),
                                 detail,
                             );
                             status_marquee_tick = 0;
                         }
                         Err(error) => {
                             status_line = status_with_detail(
-                                repl_status(provider, &active_model, session_id),
+                                repl_status(provider, &active_model, repl_session.session_id),
                                 format!("error: {error}"),
                             );
                             status_marquee_tick = 0;
@@ -4658,7 +5170,7 @@ async fn run_interactive_repl(
             }
         }
 
-        Ok::<(), anyhow::Error>(())
+        Ok::<SessionId, anyhow::Error>(repl_session.session_id)
     }
     .await;
 
@@ -5222,7 +5734,7 @@ async fn main() -> Result<()> {
         if existing_messages.is_empty() && transcript_path.is_some() {
             existing_messages = store.load_session(session_id).await.unwrap_or_default();
         }
-        run_interactive_repl(
+        let final_session_id = run_interactive_repl(
             &store,
             &registry,
             &tool_registry,
@@ -5239,7 +5751,7 @@ async fn main() -> Result<()> {
             ide_bridge_enabled(&cli),
         )
         .await?;
-        if let Ok(resume_hint) = current_resume_hint(&store, session_id).await {
+        if let Ok(resume_hint) = current_resume_hint(&store, final_session_id).await {
             print_resume_hint(&resume_hint);
         }
         return Ok(());
@@ -5353,14 +5865,16 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_repl_ui_state, build_startup_screens, build_startup_ui_state, build_text_message,
-        build_tool_result_message, choose_active_session, command_suggestions,
+        build_repl_command_input_message, build_repl_command_output_message, build_repl_ui_state,
+        build_resume_choice_list, build_startup_screens, build_startup_ui_state,
+        build_text_message, build_tool_result_message, choose_active_session, command_suggestions,
         handle_repl_slash_command, message_text, navigate_prompt_history_down,
         navigate_prompt_history_up, pane_from_shortcut, prompt_history_from_messages,
         render_auth_command_with_resume, render_remote_control_command, resolve_continue_target,
-        resolved_command_registry, resume_hint_text, should_exit_repl, ActiveSessionStore, Cli,
+        resolved_command_registry, resumable_sessions, resume_hint_text,
+        should_echo_command_result_in_footer, should_exit_repl, ActiveSessionStore, Cli,
         LocalBridgeHandler, Message, MessageRole, PendingReplStep, PendingReplView,
-        ResumeTargetHint, StartupPreferences,
+        ReplSessionState, ResumePickerState, ResumeTargetHint, StartupPreferences,
     };
     use code_agent_bridge::{
         base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
@@ -5373,9 +5887,16 @@ mod tests {
     use code_agent_providers::{
         ApiProvider, DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
     };
-    use code_agent_session::{materialize_runtime_messages, LocalSessionStore};
+    use code_agent_session::{materialize_runtime_messages, LocalSessionStore, SessionSummary};
     use code_agent_tools::compatibility_tool_registry;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn repl_session_state(session_id: SessionId) -> ReplSessionState {
+        ReplSessionState {
+            session_id,
+            transcript_path: None,
+        }
+    }
     use serde::Deserialize;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -5846,6 +6367,7 @@ mod tests {
             code_agent_ui::PaneKind::Transcript,
             None,
             0,
+            None,
             Vec::new(),
             0,
             0,
@@ -5908,6 +6430,7 @@ mod tests {
             code_agent_ui::PaneKind::Transcript,
             None,
             0,
+            None,
             Vec::new(),
             0,
             0,
@@ -5935,6 +6458,7 @@ mod tests {
         };
         let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
+        let mut repl_session = repl_session_state(session_id);
 
         let status = handle_repl_slash_command(
             &registry,
@@ -5945,7 +6469,7 @@ mod tests {
             None,
             ApiProvider::OpenAI,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             false,
             &mut vim_state,
@@ -5969,6 +6493,7 @@ mod tests {
         let session_id = SessionId::new_v4();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
+        let mut repl_session = repl_session_state(session_id);
 
         let status = handle_repl_slash_command(
             &registry,
@@ -5983,7 +6508,7 @@ mod tests {
             None,
             ApiProvider::FirstParty,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             false,
             &mut vim_state,
@@ -6008,6 +6533,7 @@ mod tests {
         let session_id = SessionId::new_v4();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
+        let mut repl_session = repl_session_state(session_id);
 
         let disconnected = handle_repl_slash_command(
             &registry,
@@ -6022,7 +6548,7 @@ mod tests {
             None,
             ApiProvider::FirstParty,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             false,
             &mut vim_state,
@@ -6045,7 +6571,7 @@ mod tests {
             None,
             ApiProvider::FirstParty,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             false,
             &mut vim_state,
@@ -6070,6 +6596,7 @@ mod tests {
         let session_id = SessionId::new_v4();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
+        let mut repl_session = repl_session_state(session_id);
 
         let status = handle_repl_slash_command(
             &registry,
@@ -6084,7 +6611,7 @@ mod tests {
             None,
             ApiProvider::OpenAI,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             true,
             &mut vim_state,
@@ -6110,6 +6637,7 @@ mod tests {
         let session_id = SessionId::new_v4();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
+        let mut repl_session = repl_session_state(session_id);
 
         let status = handle_repl_slash_command(
             &registry,
@@ -6124,7 +6652,7 @@ mod tests {
             None,
             ApiProvider::OpenAICompatible,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             true,
             &mut vim_state,
@@ -6158,6 +6686,7 @@ mod tests {
         store.append_message(session_id, &persisted).await.unwrap();
         let mut active_model = "claude-sonnet-4-6".to_owned();
         let mut vim_state = code_agent_ui::vim::VimState::default();
+        let mut repl_session = repl_session_state(session_id);
 
         let status = handle_repl_slash_command(
             &registry,
@@ -6172,7 +6701,7 @@ mod tests {
             None,
             ApiProvider::FirstParty,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             false,
             &mut vim_state,
@@ -6187,6 +6716,159 @@ mod tests {
         assert!(!transcript_path.exists());
     }
 
+    #[test]
+    fn repl_command_ui_event_messages_use_attachment_metadata() {
+        let session_id = SessionId::new_v4();
+        let input = build_repl_command_input_message(session_id, None, "/config");
+        let output = build_repl_command_output_message(session_id, Some(input.id), "config", "ok");
+
+        assert_eq!(input.role, MessageRole::Attachment);
+        assert_eq!(
+            input.metadata.attributes.get("ui_role").map(String::as_str),
+            Some("command")
+        );
+        assert_eq!(output.role, MessageRole::Attachment);
+        assert_eq!(
+            output
+                .metadata
+                .attributes
+                .get("ui_role")
+                .map(String::as_str),
+            Some("command_output")
+        );
+        assert_eq!(
+            output
+                .metadata
+                .attributes
+                .get("ui_author")
+                .map(String::as_str),
+            Some("/config")
+        );
+    }
+
+    #[test]
+    fn resumable_sessions_exclude_current_session() {
+        let current_session = SessionId::new_v4();
+        let other_session = SessionId::new_v4();
+        let sessions = vec![
+            SessionSummary {
+                session_id: current_session,
+                transcript_path: PathBuf::from(format!("{current_session}.jsonl")),
+                modified_at_unix_ms: 20,
+                message_count: 3,
+                first_prompt: "current".to_owned(),
+            },
+            SessionSummary {
+                session_id: other_session,
+                transcript_path: PathBuf::from(format!("{other_session}.jsonl")),
+                modified_at_unix_ms: 10,
+                message_count: 8,
+                first_prompt: "pick me".to_owned(),
+            },
+        ];
+
+        let filtered = resumable_sessions(sessions, current_session);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].session_id, other_session);
+    }
+
+    #[test]
+    fn resume_picker_builds_choice_list_entries() {
+        let session_id = SessionId::new_v4();
+        let picker = ResumePickerState {
+            sessions: vec![SessionSummary {
+                session_id,
+                transcript_path: PathBuf::from(format!("{session_id}.jsonl")),
+                modified_at_unix_ms: 10,
+                message_count: 6,
+                first_prompt: "Continue with the latest auth edge cases.".to_owned(),
+            }],
+            selected: 0,
+        };
+
+        let choice_list = build_resume_choice_list(&picker);
+
+        assert_eq!(choice_list.title, "Resume conversation");
+        assert_eq!(choice_list.items.len(), 1);
+        assert!(choice_list.items[0]
+            .label
+            .contains("Continue with the latest auth edge cases."));
+        assert!(choice_list.items[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("6 messages"));
+    }
+
+    #[test]
+    fn transcript_backed_commands_do_not_echo_results_in_footer() {
+        assert!(!should_echo_command_result_in_footer("tasks", true, false));
+        assert!(!should_echo_command_result_in_footer(
+            "resume", false, false
+        ));
+        assert!(should_echo_command_result_in_footer("clear", false, false));
+        assert!(should_echo_command_result_in_footer("resume", false, true));
+    }
+
+    #[tokio::test]
+    async fn repl_resume_command_switches_live_session() {
+        let root = temp_session_root("repl-resume");
+        let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+        let tool_registry = compatibility_tool_registry();
+        let registry = resolved_command_registry(&root, None).await;
+        let current_session = SessionId::new_v4();
+        let resumed_session = SessionId::new_v4();
+        let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+        let mut raw_messages = vec![build_text_message(
+            current_session,
+            MessageRole::User,
+            "current prompt".to_owned(),
+            None,
+        )];
+        let mut vim_state = code_agent_ui::vim::VimState::default();
+        let mut repl_session = repl_session_state(current_session);
+
+        let resumed_message = build_text_message(
+            resumed_session,
+            MessageRole::User,
+            "resumed output".to_owned(),
+            None,
+        );
+        store
+            .append_message(resumed_session, &resumed_message)
+            .await
+            .unwrap();
+
+        let status = handle_repl_slash_command(
+            &registry,
+            CommandInvocation {
+                name: "resume".to_owned(),
+                args: vec![resumed_session.to_string()],
+                raw_input: format!("/resume {resumed_session}"),
+            },
+            &store,
+            &tool_registry,
+            &root,
+            None,
+            ApiProvider::OpenAICompatible,
+            &mut active_model,
+            &mut repl_session,
+            &mut raw_messages,
+            false,
+            &mut vim_state,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(status.contains("resumed"));
+        assert_eq!(repl_session.session_id, resumed_session);
+        assert_eq!(raw_messages.len(), 1);
+        assert_eq!(message_text(&raw_messages[0]), "resumed output");
+    }
+
     #[tokio::test]
     async fn repl_tasks_command_creates_and_lists_tasks() {
         let root = temp_session_root("repl-tasks");
@@ -6197,6 +6879,7 @@ mod tests {
         let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
+        let mut repl_session = repl_session_state(session_id);
 
         let created = handle_repl_slash_command(
             &registry,
@@ -6215,7 +6898,7 @@ mod tests {
             None,
             ApiProvider::OpenAI,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             false,
             &mut vim_state,
@@ -6237,7 +6920,7 @@ mod tests {
             None,
             ApiProvider::OpenAI,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             false,
             &mut vim_state,
@@ -6262,6 +6945,7 @@ mod tests {
         let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
+        let mut repl_session = repl_session_state(session_id);
         write_test_file(
             &root.join(".claude-plugin/plugin.json"),
             r#"{
@@ -6291,7 +6975,7 @@ mod tests {
             None,
             ApiProvider::OpenAI,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             false,
             &mut vim_state,
@@ -6316,6 +7000,7 @@ mod tests {
         let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
+        let mut repl_session = repl_session_state(session_id);
         write_test_file(
             &root.join(".claude-plugin/plugin.json"),
             r#"{
@@ -6346,7 +7031,7 @@ mod tests {
             None,
             ApiProvider::OpenAI,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             false,
             &mut vim_state,
@@ -6427,6 +7112,7 @@ mod tests {
         let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
+        let mut repl_session = repl_session_state(session_id);
         write_test_file(
             &root.join(".claude-plugin/plugin.json"),
             &format!(
@@ -6463,7 +7149,7 @@ mod tests {
             None,
             ApiProvider::OpenAI,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             false,
             &mut vim_state,
@@ -6487,6 +7173,7 @@ mod tests {
         let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
         let mut raw_messages = Vec::new();
         let mut vim_state = code_agent_ui::vim::VimState::default();
+        let mut repl_session = repl_session_state(session_id);
 
         let status = handle_repl_slash_command(
             &registry,
@@ -6501,7 +7188,7 @@ mod tests {
             None,
             ApiProvider::OpenAI,
             &mut active_model,
-            session_id,
+            &mut repl_session,
             &mut raw_messages,
             false,
             &mut vim_state,

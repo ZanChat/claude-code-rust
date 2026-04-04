@@ -335,6 +335,10 @@ fn is_compact_summary_message(message: &Message) -> bool {
 }
 
 fn summarize_line(message: &Message) -> Option<String> {
+    if message.role == MessageRole::Attachment {
+        return None;
+    }
+
     let prefix = match message.role {
         MessageRole::System => "system",
         MessageRole::User => "user",
@@ -359,13 +363,14 @@ fn summarize_line(message: &Message) -> Option<String> {
 pub fn estimate_message_tokens(messages: &[Message]) -> u64 {
     messages
         .iter()
+        .filter(|message| message.role != MessageRole::Attachment)
         .map(|message| {
             let role_tokens = match message.role {
                 MessageRole::System => 8,
                 MessageRole::User => 6,
                 MessageRole::Assistant => 6,
                 MessageRole::Tool => 12,
-                MessageRole::Attachment => 10,
+                MessageRole::Attachment => 0,
             };
             let content_tokens = message_text(message).chars().count().div_ceil(4) as u64;
             role_tokens + content_tokens + (message.blocks.len() as u64 * 6)

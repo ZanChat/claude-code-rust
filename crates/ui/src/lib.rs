@@ -12,6 +12,9 @@ use std::collections::VecDeque;
 
 pub mod vim;
 
+const UI_ROLE_ATTRIBUTE: &str = "ui_role";
+const UI_AUTHOR_ATTRIBUTE: &str = "ui_author";
+
 const MIN_WIDTH: u16 = 48;
 const MIN_HEIGHT: u16 = 10;
 const MIN_REPL_HEIGHT: u16 = 15;
@@ -165,6 +168,22 @@ pub struct PanePreview {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChoiceListItem {
+    pub label: String,
+    pub detail: Option<String>,
+    pub secondary: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChoiceListState {
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub items: Vec<ChoiceListItem>,
+    pub selected: usize,
+    pub empty_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TaskUiEntry {
     pub title: String,
     pub kind: String,
@@ -198,6 +217,7 @@ pub struct UiState {
     pub command_suggestions: Vec<CommandPaletteEntry>,
     pub selected_command_suggestion: Option<usize>,
     pub active_pane: Option<PaneKind>,
+    pub choice_list: Option<ChoiceListState>,
     pub notifications: VecDeque<Notification>,
     pub permission_prompt: Option<PermissionPromptState>,
     pub progress_message: Option<String>,
@@ -217,7 +237,7 @@ impl UiState {
         let transcript_lines = messages
             .iter()
             .map(|message| TranscriptLine {
-                role: format!("{:?}", message.role).to_lowercase(),
+                role: transcript_role(message),
                 text: message
                     .blocks
                     .iter()
@@ -255,6 +275,15 @@ impl UiState {
     pub fn active_pane_or_default(&self) -> PaneKind {
         self.active_pane.unwrap_or(PaneKind::Transcript)
     }
+}
+
+fn transcript_role(message: &Message) -> String {
+    message
+        .metadata
+        .attributes
+        .get(UI_ROLE_ATTRIBUTE)
+        .cloned()
+        .unwrap_or_else(|| format!("{:?}", message.role).to_lowercase())
 }
 
 fn content_block_text(block: &ContentBlock) -> Option<String> {
@@ -368,6 +397,12 @@ enum LayoutMode {
     Standard,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlayKind {
+    ChoiceList,
+    Pane(PaneKind),
+}
+
 fn pane_preview(state: &UiState, pane: PaneKind) -> PanePreview {
     match pane {
         PaneKind::Transcript => state.transcript_preview.clone(),
@@ -449,14 +484,18 @@ fn layout_mode(area: Rect, state: &UiState) -> LayoutMode {
     }
 }
 
-fn overlay_kind(state: &UiState) -> Option<PaneKind> {
+fn overlay_kind(state: &UiState) -> Option<OverlayKind> {
+    if state.choice_list.is_some() {
+        return Some(OverlayKind::ChoiceList);
+    }
+
     if state.permission_prompt.is_some() {
-        return Some(PaneKind::Permissions);
+        return Some(OverlayKind::Pane(PaneKind::Permissions));
     }
 
     match state.active_pane_or_default() {
         PaneKind::Transcript => None,
-        pane => Some(pane),
+        pane => Some(OverlayKind::Pane(pane)),
     }
 }
 
@@ -572,11 +611,20 @@ fn role_style(role: &str) -> Style {
         "user" => Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
+        "command" => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
         "assistant" => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        "command_output" => Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
         "tool" => Style::default()
             .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        "task" => Style::default()
+            .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD),
         "setup" => Style::default()
             .fg(Color::Magenta)
@@ -590,14 +638,21 @@ fn role_style(role: &str) -> Style {
 fn role_label(role: &str) -> &'static str {
     match role {
         "user" => "You",
+        "command" => "You",
         "assistant" => "Assistant",
+        "command_output" => "Command",
         "tool" => "Tool",
+        "task" => "Task",
         "setup" => "Setup",
         _ => "Info",
     }
 }
 
 fn transcript_author_label(message: &Message) -> Option<String> {
+    if let Some(author) = message.metadata.attributes.get(UI_AUTHOR_ATTRIBUTE) {
+        return Some(author.clone());
+    }
+
     match message.role {
         MessageRole::Assistant => Some(assistant_author_label(&message.metadata)),
         _ => None,
@@ -1406,27 +1461,128 @@ fn overlay_title(kind: PaneKind, preview_title: &str) -> String {
     }
 }
 
-fn overlay_content_lines(state: &UiState, kind: PaneKind) -> Vec<Line<'static>> {
-    let preview = pane_preview(state, kind);
+fn choice_list_lines(choice_list: &ChoiceListState) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        overlay_title(kind, &preview.title),
+        choice_list.title.clone(),
         Style::default().add_modifier(Modifier::BOLD),
     ))];
+
+    lines.push(Line::from(Span::styled(
+        choice_list
+            .subtitle
+            .clone()
+            .unwrap_or_else(|| "Enter to select · Esc to cancel".to_owned()),
+        Style::default().fg(Color::DarkGray),
+    )));
     lines.push(Line::from(""));
 
-    match kind {
-        PaneKind::Tasks => lines.extend(task_lines(state, 8, true)),
-        PaneKind::Permissions => lines.extend(permission_lines(state)),
-        _ => {
-            if preview.lines.is_empty() {
-                lines.push(Line::from("No details available."));
-            } else {
-                lines.extend(preview.lines.into_iter().map(Line::from));
-            }
+    if choice_list.items.is_empty() {
+        lines.push(Line::from(
+            choice_list
+                .empty_message
+                .clone()
+                .unwrap_or_else(|| "No choices available.".to_owned()),
+        ));
+        return lines;
+    }
+
+    let max_visible = 8usize;
+    let selected = choice_list
+        .selected
+        .min(choice_list.items.len().saturating_sub(1));
+    let start = selected
+        .saturating_sub(max_visible / 2)
+        .min(choice_list.items.len().saturating_sub(max_visible));
+    let end = (start + max_visible).min(choice_list.items.len());
+
+    for (offset, item) in choice_list.items[start..end].iter().enumerate() {
+        let index = start + offset;
+        let is_selected = index == selected;
+        let prefix = if is_selected { "> " } else { "  " };
+        let item_style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        let detail_style = if is_selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{}", item.label),
+            item_style,
+        )));
+        if let Some(detail) = item
+            .detail
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(Line::from(Span::styled(
+                format!("    {detail}"),
+                detail_style,
+            )));
+        }
+        if let Some(secondary) = item
+            .secondary
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            lines.push(Line::from(Span::styled(
+                format!("    {secondary}"),
+                detail_style,
+            )));
+        }
+        if index + 1 < end {
+            lines.push(Line::from(""));
         }
     }
 
+    if choice_list.items.len() > max_visible {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{} of {}", selected + 1, choice_list.items.len()),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     lines
+}
+
+fn overlay_content_lines(state: &UiState, kind: OverlayKind) -> Vec<Line<'static>> {
+    match kind {
+        OverlayKind::ChoiceList => state
+            .choice_list
+            .as_ref()
+            .map(choice_list_lines)
+            .unwrap_or_default(),
+        OverlayKind::Pane(kind) => {
+            let preview = pane_preview(state, kind);
+            let mut lines = vec![Line::from(Span::styled(
+                overlay_title(kind, &preview.title),
+                Style::default().add_modifier(Modifier::BOLD),
+            ))];
+            lines.push(Line::from(""));
+
+            match kind {
+                PaneKind::Tasks => lines.extend(task_lines(state, 8, true)),
+                PaneKind::Permissions => lines.extend(permission_lines(state)),
+                _ => {
+                    if preview.lines.is_empty() {
+                        lines.push(Line::from("No details available."));
+                    } else {
+                        lines.extend(preview.lines.into_iter().map(Line::from));
+                    }
+                }
+            }
+
+            lines
+        }
+    }
 }
 
 fn overlay_rect(area: Rect, desired_lines: usize) -> Option<Rect> {
@@ -1961,10 +2117,12 @@ pub fn render_to_string(state: &UiState, width: u16, height: u16) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        mouse_action_for_position, render_to_string, Notification, PaneKind, PermissionPromptState,
-        RatatuiApp, StatusLevel, TranscriptGroup, TranscriptLine, UiMouseAction,
+        mouse_action_for_position, render_to_string, ChoiceListItem, ChoiceListState, Notification,
+        PaneKind, PermissionPromptState, RatatuiApp, StatusLevel, TranscriptGroup, TranscriptLine,
+        UiMouseAction,
     };
     use code_agent_core::{compatibility_command_registry, ContentBlock, Message, MessageRole};
+    use std::collections::BTreeMap;
 
     #[test]
     fn renders_transcript_empty_state_and_commands() {
@@ -2093,6 +2251,37 @@ mod tests {
     }
 
     #[test]
+    fn renders_choice_list_overlay() {
+        let mut state = RatatuiApp::new("picker").initial_state();
+        state.show_input = true;
+        state.choice_list = Some(ChoiceListState {
+            title: "Resume conversation".to_owned(),
+            subtitle: Some("Enter to select · Esc to cancel".to_owned()),
+            items: vec![
+                ChoiceListItem {
+                    label: "s:77777777  Continue with auth edge cases".to_owned(),
+                    detail: Some("6 messages · fixtures/transcripts/7777.jsonl".to_owned()),
+                    secondary: None,
+                },
+                ChoiceListItem {
+                    label: "s:88888888  Rework tool transcript rendering".to_owned(),
+                    detail: Some("12 messages · fixtures/transcripts/8888.jsonl".to_owned()),
+                    secondary: None,
+                },
+            ],
+            selected: 0,
+            empty_message: Some("No conversations found to resume.".to_owned()),
+        });
+
+        let rendered = render_to_string(&state, 100, 26).unwrap();
+
+        assert!(rendered.contains("Resume conversation"));
+        assert!(rendered.contains("Enter to select"));
+        assert!(rendered.contains("s:77777777  Continue with auth edge cases"));
+        assert!(rendered.contains("fixtures/transcripts/7777.jsonl"));
+    }
+
+    #[test]
     fn transcript_widget_supports_scroll_offset() {
         let mut state = RatatuiApp::new("scroll").initial_state();
         state.transcript_lines = (1..=8)
@@ -2132,6 +2321,52 @@ mod tests {
         let rendered = render_to_string(&state, 100, 24).unwrap();
 
         assert!(rendered.contains("gemini-3.1-pro-preview(openai-compatible)"));
+    }
+
+    #[test]
+    fn attachment_ui_events_render_with_custom_roles_and_authors() {
+        let mut command = Message::new(
+            MessageRole::Attachment,
+            vec![ContentBlock::Text {
+                text: "/tasks list".to_owned(),
+            }],
+        );
+        command
+            .metadata
+            .attributes
+            .insert("ui_role".to_owned(), "command".to_owned());
+
+        let mut output = Message::new(
+            MessageRole::Attachment,
+            vec![ContentBlock::Text {
+                text: "{\"count\":1}".to_owned(),
+            }],
+        );
+        output.metadata.attributes = BTreeMap::from([
+            ("ui_role".to_owned(), "command_output".to_owned()),
+            ("ui_author".to_owned(), "/tasks".to_owned()),
+        ]);
+
+        let mut task = Message::new(
+            MessageRole::Attachment,
+            vec![ContentBlock::Text {
+                text: "running review workspace [workflow]".to_owned(),
+            }],
+        );
+        task.metadata.attributes = BTreeMap::from([
+            ("ui_role".to_owned(), "task".to_owned()),
+            ("ui_author".to_owned(), "Task".to_owned()),
+        ]);
+
+        let state = RatatuiApp::new("events").state_from_messages(
+            vec![command, output, task],
+            &compatibility_command_registry().all(),
+        );
+        let rendered = render_to_string(&state, 100, 24).unwrap();
+
+        assert!(rendered.contains("You  /tasks list"));
+        assert!(rendered.contains("/tasks  {\"count\":1}"));
+        assert!(rendered.contains("Task  running review workspace [workflow]"));
     }
 
     #[test]
