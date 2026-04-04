@@ -747,6 +747,86 @@ fn scroll_down(scroll: &mut u16, amount: u16) {
     *scroll = scroll.saturating_sub(amount);
 }
 
+fn push_prompt_history_entry(history: &mut Vec<String>, prompt_text: &str) {
+    let prompt_text = prompt_text.trim();
+    if prompt_text.is_empty() {
+        return;
+    }
+    if history
+        .last()
+        .is_some_and(|previous| previous == prompt_text)
+    {
+        return;
+    }
+    history.push(prompt_text.to_owned());
+}
+
+fn prompt_history_from_messages(raw_messages: &[Message]) -> Vec<String> {
+    let mut history = Vec::new();
+    for message in raw_messages {
+        if message.role == MessageRole::User {
+            push_prompt_history_entry(&mut history, &message_text(message));
+        }
+    }
+    history
+}
+
+fn reset_prompt_history_navigation(
+    history_index: &mut Option<usize>,
+    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+) {
+    *history_index = None;
+    *history_draft = None;
+}
+
+fn navigate_prompt_history_up(
+    history: &[String],
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    history_index: &mut Option<usize>,
+    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+) -> bool {
+    if history.is_empty() {
+        return false;
+    }
+
+    let next_index = match *history_index {
+        Some(0) => 0,
+        Some(index) => index.saturating_sub(1),
+        None => {
+            *history_draft = Some(input_buffer.clone());
+            history.len() - 1
+        }
+    };
+    *history_index = Some(next_index);
+    input_buffer.replace(history[next_index].clone());
+    true
+}
+
+fn navigate_prompt_history_down(
+    history: &[String],
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    history_index: &mut Option<usize>,
+    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+) -> bool {
+    let Some(current_index) = *history_index else {
+        return false;
+    };
+
+    if current_index + 1 < history.len() {
+        let next_index = current_index + 1;
+        *history_index = Some(next_index);
+        input_buffer.replace(history[next_index].clone());
+    } else {
+        *history_index = None;
+        if let Some(draft) = history_draft.take() {
+            *input_buffer = draft;
+        } else {
+            input_buffer.clear();
+        }
+    }
+    true
+}
+
 fn should_exit_repl(prompt_text: &str) -> bool {
     matches!(prompt_text.trim(), "quit" | "exit" | "/quit" | "/exit")
 }
@@ -4120,6 +4200,9 @@ async fn run_interactive_repl(
 
     let loop_result = async {
         let mut input_buffer = initial_input_buffer;
+        let mut prompt_history = prompt_history_from_messages(raw_messages);
+        let mut prompt_history_index = None;
+        let mut prompt_history_draft = None;
         let mut transcript_scroll = 0u16;
         let mut status_line = repl_status(provider, &active_model, session_id);
         let mut status_marquee_tick = 0usize;
@@ -4246,14 +4329,19 @@ async fn run_interactive_repl(
                         &input_buffer,
                         &mut selected_command_suggestion,
                     );
-                    if !suggestions.is_empty() {
+                    if suggestions.len() > 1 {
                         selected_command_suggestion = if selected_command_suggestion == 0 {
                             suggestions.len() - 1
                         } else {
                             selected_command_suggestion - 1
                         };
                     } else {
-                        scroll_up(&mut transcript_scroll, 1);
+                        navigate_prompt_history_up(
+                            &prompt_history,
+                            &mut input_buffer,
+                            &mut prompt_history_index,
+                            &mut prompt_history_draft,
+                        );
                     }
                     dirty = true;
                 }
@@ -4263,11 +4351,16 @@ async fn run_interactive_repl(
                         &input_buffer,
                         &mut selected_command_suggestion,
                     );
-                    if !suggestions.is_empty() {
+                    if suggestions.len() > 1 {
                         selected_command_suggestion =
                             (selected_command_suggestion + 1) % suggestions.len();
                     } else {
-                        scroll_down(&mut transcript_scroll, 1);
+                        navigate_prompt_history_down(
+                            &prompt_history,
+                            &mut input_buffer,
+                            &mut prompt_history_index,
+                            &mut prompt_history_draft,
+                        );
                     }
                     dirty = true;
                 }
@@ -4296,8 +4389,14 @@ async fn run_interactive_repl(
                     dirty = true;
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Char(ch) if key.modifiers.is_empty() => {
+                KeyCode::Char(ch)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
                     if vim_state.is_insert() {
+                        reset_prompt_history_navigation(
+                            &mut prompt_history_index,
+                            &mut prompt_history_draft,
+                        );
                         input_buffer.push(ch);
                         selected_command_suggestion = 0;
                         dirty = true;
@@ -4329,6 +4428,10 @@ async fn run_interactive_repl(
                                     dirty = true;
                                 }
                                 code_agent_ui::vim::VimTransition::DeleteChars(mut amount) => {
+                                    reset_prompt_history_navigation(
+                                        &mut prompt_history_index,
+                                        &mut prompt_history_draft,
+                                    );
                                     while amount > 0
                                         && input_buffer.cursor < input_buffer.chars.len()
                                     {
@@ -4340,6 +4443,10 @@ async fn run_interactive_repl(
                                     dirty = true;
                                 }
                                 code_agent_ui::vim::VimTransition::ReplaceChar(r) => {
+                                    reset_prompt_history_navigation(
+                                        &mut prompt_history_index,
+                                        &mut prompt_history_draft,
+                                    );
                                     if input_buffer.cursor < input_buffer.chars.len() {
                                         input_buffer.chars[input_buffer.cursor] = r;
                                     }
@@ -4366,6 +4473,10 @@ async fn run_interactive_repl(
                             && !prompt_text.contains(char::is_whitespace)
                             && prompt_text != selected_name
                         {
+                            reset_prompt_history_navigation(
+                                &mut prompt_history_index,
+                                &mut prompt_history_draft,
+                            );
                             apply_selected_command(&mut input_buffer, selected);
                             dirty = true;
                             continue;
@@ -4374,6 +4485,11 @@ async fn run_interactive_repl(
                     if should_exit_repl(&prompt_text) {
                         break;
                     }
+                    push_prompt_history_entry(&mut prompt_history, &prompt_text);
+                    reset_prompt_history_navigation(
+                        &mut prompt_history_index,
+                        &mut prompt_history_draft,
+                    );
                     input_buffer.clear();
                     selected_command_suggestion = 0;
                     compact_banner = None;
@@ -4509,6 +4625,10 @@ async fn run_interactive_repl(
                 }
                 KeyCode::Backspace => {
                     if vim_state.is_insert() {
+                        reset_prompt_history_navigation(
+                            &mut prompt_history_index,
+                            &mut prompt_history_draft,
+                        );
                         input_buffer.pop();
                         selected_command_suggestion = 0;
                     } else {
@@ -5216,7 +5336,8 @@ mod tests {
     use super::{
         build_repl_ui_state, build_startup_screens, build_startup_ui_state, build_text_message,
         build_tool_result_message, choose_active_session, command_suggestions,
-        handle_repl_slash_command, message_text, pane_from_shortcut,
+        handle_repl_slash_command, message_text, navigate_prompt_history_down,
+        navigate_prompt_history_up, pane_from_shortcut, prompt_history_from_messages,
         render_auth_command_with_resume, render_remote_control_command, resolve_continue_target,
         resolved_command_registry, should_exit_repl, ActiveSessionStore, Cli, LocalBridgeHandler,
         Message, MessageRole, PendingReplStep, PendingReplView, StartupPreferences,
@@ -5503,6 +5624,73 @@ mod tests {
         assert!(should_exit_repl("/quit"));
         assert!(should_exit_repl("/exit"));
         assert!(!should_exit_repl("please exit"));
+    }
+
+    #[test]
+    fn prompt_history_seeds_from_user_messages_only() {
+        let session_id = SessionId::new_v4();
+        let messages = vec![
+            build_text_message(session_id, MessageRole::User, "first".to_owned(), None),
+            build_text_message(
+                session_id,
+                MessageRole::Assistant,
+                "ignore".to_owned(),
+                None,
+            ),
+            build_text_message(session_id, MessageRole::User, "second".to_owned(), None),
+            build_text_message(session_id, MessageRole::User, "second".to_owned(), None),
+            build_text_message(session_id, MessageRole::User, "first".to_owned(), None),
+        ];
+
+        let history = prompt_history_from_messages(&messages);
+
+        assert_eq!(history, vec!["first", "second", "first"]);
+    }
+
+    #[test]
+    fn prompt_history_navigation_restores_draft_after_latest_entry() {
+        let history = vec!["alpha".to_owned(), "beta".to_owned()];
+        let mut input = code_agent_ui::InputBuffer::new();
+        input.replace("draft");
+        let mut history_index = None;
+        let mut history_draft = None;
+
+        assert!(navigate_prompt_history_up(
+            &history,
+            &mut input,
+            &mut history_index,
+            &mut history_draft
+        ));
+        assert_eq!(input.as_str(), "beta");
+        assert_eq!(history_index, Some(1));
+
+        assert!(navigate_prompt_history_up(
+            &history,
+            &mut input,
+            &mut history_index,
+            &mut history_draft
+        ));
+        assert_eq!(input.as_str(), "alpha");
+        assert_eq!(history_index, Some(0));
+
+        assert!(navigate_prompt_history_down(
+            &history,
+            &mut input,
+            &mut history_index,
+            &mut history_draft
+        ));
+        assert_eq!(input.as_str(), "beta");
+        assert_eq!(history_index, Some(1));
+
+        assert!(navigate_prompt_history_down(
+            &history,
+            &mut input,
+            &mut history_index,
+            &mut history_draft
+        ));
+        assert_eq!(input.as_str(), "draft");
+        assert_eq!(history_index, None);
+        assert!(history_draft.is_none());
     }
 
     #[tokio::test]
