@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use code_agent_core::{ContentBlock, Message, MessageRole, TokenUsage, ToolCall};
 use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -175,6 +177,25 @@ pub struct AuthMaterial {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct AuthSnapshotFile {
     providers: BTreeMap<String, AuthMaterial>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ChatGPTCodexModelsCache {
+    #[serde(default)]
+    etag: Option<String>,
+    #[serde(default)]
+    models: Vec<ChatGPTCodexModelCacheEntry>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ChatGPTCodexModelCacheEntry {
+    slug: String,
+    #[serde(default)]
+    supported_in_api: bool,
+    #[serde(default)]
+    supports_reasoning_summaries: bool,
+    #[serde(default)]
+    support_verbosity: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -623,8 +644,41 @@ impl HttpProvider {
         request: ProviderRequest,
     ) -> Result<Box<dyn ProviderStream>> {
         let url = join_if_missing(&self.base_url, "codex/responses");
-        self.send_openai_responses_request(url, request, false, false)
-            .await
+        let mut request = request;
+        let mut supports_reasoning_summaries = false;
+        let mut supports_verbosity = false;
+
+        if let Some(cache) = read_chatgpt_codex_models_cache() {
+            if let Some(etag) = cache.etag {
+                request
+                    .extra_headers
+                    .entry("x-models-etag".to_owned())
+                    .or_insert(etag);
+            }
+
+            if let Some(model) = cache
+                .models
+                .iter()
+                .find(|entry| entry.slug == request.model)
+            {
+                supports_reasoning_summaries = model.supports_reasoning_summaries;
+                supports_verbosity = model.support_verbosity;
+                if !model.supported_in_api {
+                    return Err(anyhow!(
+                        "ChatGPT Codex model '{}' is not available through the Codex API",
+                        request.model
+                    ));
+                }
+            }
+        }
+
+        self.send_openai_responses_request(
+            url,
+            request,
+            supports_reasoning_summaries,
+            supports_verbosity,
+        )
+        .await
     }
 
     async fn send_openai_responses_request(
@@ -669,7 +723,8 @@ impl HttpProvider {
                     continue;
                 }
                 return Err(anyhow!(
-                    "openai request failed with status {}: {}",
+                    "{} request failed with status {}: {}",
+                    openai_request_failure_label(self.provider),
                     status,
                     compact_error_body(&body)
                 ));
@@ -977,6 +1032,10 @@ impl HttpProvider {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static(concat!("code-agent-rust/", env!("CARGO_PKG_VERSION"))),
+        );
 
         let bearer = self
             .auth
@@ -1361,13 +1420,119 @@ async fn get_command_stdout(candidates: &[(&str, &[&str])]) -> Option<String> {
 }
 
 fn compact_error_body(body: &str) -> String {
+    if let Some(message) = extract_error_message(body) {
+        return truncate_error_text(&message, 600);
+    }
+
     let trimmed = body.trim();
-    let mut compact = trimmed.replace('\n', " ");
-    if compact.len() > 240 {
-        compact.truncate(240);
+    let compact = trimmed.replace('\n', " ");
+    truncate_error_text(&compact, 600)
+}
+
+fn truncate_error_text(text: &str, max_len: usize) -> String {
+    let mut compact = text.trim().to_owned();
+    if compact.len() > max_len {
+        compact.truncate(max_len);
         compact.push_str("...");
     }
     compact
+}
+
+fn extract_error_message(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let mut fragments = Vec::new();
+
+    for pointer in [
+        "/detail",
+        "/message",
+        "/error/message",
+        "/response/error/message",
+        "/error/errors",
+        "/error",
+        "/response/error",
+    ] {
+        if let Some(target) = value.pointer(pointer) {
+            collect_error_fragments(target, &mut fragments);
+        }
+    }
+
+    if fragments.is_empty() {
+        collect_error_fragments(&value, &mut fragments);
+    }
+
+    (!fragments.is_empty()).then(|| fragments.join(" "))
+}
+
+fn collect_error_fragments(value: &Value, fragments: &mut Vec<String>) {
+    match value {
+        Value::String(message) => push_error_fragment(fragments, message),
+        Value::Array(items) => {
+            for item in items {
+                collect_error_fragments(item, fragments);
+            }
+        }
+        Value::Object(object) => {
+            let location = object.get("loc").and_then(format_error_location);
+            if let Some(message) = object
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| object.get("msg").and_then(Value::as_str))
+                .or_else(|| object.get("reason").and_then(Value::as_str))
+                .or_else(|| object.get("error_description").and_then(Value::as_str))
+            {
+                if let Some(location) = location {
+                    push_error_fragment(fragments, format!("{location}: {message}"));
+                } else {
+                    push_error_fragment(fragments, message);
+                }
+            }
+
+            for key in ["detail", "error", "errors"] {
+                if let Some(child) = object.get(key) {
+                    collect_error_fragments(child, fragments);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn format_error_location(value: &Value) -> Option<String> {
+    let location = value
+        .as_array()?
+        .iter()
+        .filter_map(|part| match part {
+            Value::String(text) => Some(text.trim().to_owned()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    (!location.is_empty()).then(|| location.join("."))
+}
+
+fn push_error_fragment(fragments: &mut Vec<String>, fragment: impl AsRef<str>) {
+    let fragment = fragment.as_ref().trim();
+    if fragment.is_empty() {
+        return;
+    }
+    if !fragments.iter().any(|existing| existing == fragment) {
+        fragments.push(fragment.to_owned());
+    }
+}
+
+fn openai_request_failure_label(provider: ApiProvider) -> &'static str {
+    match provider {
+        ApiProvider::ChatGPTCodex => "ChatGPT Codex",
+        ApiProvider::OpenAICompatible => "OpenAI-compatible",
+        _ => "OpenAI",
+    }
+}
+
+fn read_chatgpt_codex_models_cache() -> Option<ChatGPTCodexModelsCache> {
+    let path = codex_home_dir().join("models_cache.json");
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 fn openai_responses_max_retries() -> usize {
@@ -3572,6 +3737,23 @@ mod tests {
         );
         assert!(
             matches!(&events[5], super::ProviderEvent::Stop { reason } if reason == "tool_use")
+        );
+    }
+
+    #[test]
+    fn extracts_error_message_from_detail_array() {
+        let body = r#"{
+            "detail": [
+                {
+                    "loc": ["body", "input", 0, "call_id"],
+                    "msg": "Field required"
+                }
+            ]
+        }"#;
+
+        assert_eq!(
+            super::compact_error_body(body),
+            "body.input.0.call_id: Field required"
         );
     }
 
