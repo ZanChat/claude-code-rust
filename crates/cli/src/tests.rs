@@ -1,17 +1,18 @@
 use super::{
-    accept_prompt_history_search, build_repl_command_input_message,
+    accept_prompt_history_search, build_ide_choice_list, build_repl_command_input_message,
     build_repl_command_output_message, build_repl_ui_state, build_resume_choice_list,
     build_startup_screens, build_startup_ui_state, build_text_message, build_tool_result_message,
     cancel_prompt_history_search, choose_active_session, command_suggestions, current_time_ms,
-    delete_prompt_selection, handle_prompt_file_picker_key, handle_prompt_mouse_action,
-    handle_repl_slash_command, insert_prompt_text, is_paste_shortcut, is_selection_copy_shortcut,
-    message_action_copy_text, message_primary_input, message_text, move_prompt_selection,
+    delete_prompt_selection, enter_message_actions, handle_prompt_file_picker_key,
+    handle_prompt_mouse_action, handle_repl_slash_command, insert_prompt_text, is_paste_shortcut,
+    is_selection_copy_shortcut, message_action_copy_text, message_action_items_from_runtime,
+    message_actions_ui_state, message_primary_input, message_text, move_prompt_selection,
     navigate_prompt_history_down, navigate_prompt_history_up, open_prompt_history_search,
     pane_from_shortcut, pane_from_shortcut_for_terminal, pending_interrupt_messages,
     prompt_file_picker_choice_list, prompt_history_from_messages, prompt_history_search_matches,
     prompt_selection_text, render_auth_command_with_resume, render_ide_command_with_home,
-    render_remote_control_command, repl_shortcut_action_for_key, resolve_continue_target,
-    resolved_command_registry, resumable_sessions, resume_hint_text,
+    render_remote_control_command, repl_ide_picker_state_with_home, repl_shortcut_action_for_key,
+    resolve_continue_target, resolved_command_registry, resumable_sessions, resume_hint_text,
     should_echo_command_result_in_footer, should_exit_repl, step_prompt_history_search_match,
     sync_prompt_history_search_preview, task_entries_for_ui, toggle_all_history_transcript_groups,
     toggle_pending_repl_transcript_details, ActiveSessionStore, Cli, LocalBridgeHandler, Message,
@@ -1316,6 +1317,76 @@ fn prompt_file_picker_inserts_selected_match_into_prompt() {
 }
 
 #[test]
+fn ide_picker_lists_matching_workspace_bridges() {
+    let home = temp_session_root("ide-picker-home");
+    let workspace = home.join("workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    write_test_file(
+        &home.join(".claude/ide/48123.lock"),
+        &json!({
+            "workspaceFolders": [workspace.display().to_string()],
+            "ideName": "VS Code",
+            "transport": "ws"
+        })
+        .to_string(),
+    );
+
+    let picker = repl_ide_picker_state_with_home(&workspace, None, Some(&home));
+    let choice_list = build_ide_choice_list(&picker, None);
+
+    assert_eq!(choice_list.title, "IDE bridge");
+    assert_eq!(choice_list.selected, 0);
+    assert_eq!(choice_list.items[0].label, "VS Code");
+    assert_eq!(
+        choice_list.items[0].detail.as_deref(),
+        Some("ide://127.0.0.1:48123")
+    );
+}
+
+#[test]
+fn message_actions_show_expand_and_collapse_for_history_groups() {
+    let session_id = SessionId::new_v4();
+    let tool_call = build_tool_call_message(
+        session_id,
+        "call-1",
+        "read_file",
+        r#"{"path":"src/lib.rs"}"#,
+        None,
+    );
+    let tool_result = build_tool_result_message(
+        session_id,
+        "call-1".to_owned(),
+        "pub fn helper() {}".to_owned(),
+        false,
+        None,
+    );
+    let runtime_messages = materialize_runtime_messages(&vec![tool_call, tool_result]);
+    let mut interaction_state = ReplInteractionState::default();
+    let items = message_action_items_from_runtime(&runtime_messages, None, &interaction_state);
+
+    assert!(enter_message_actions(&mut interaction_state, &items));
+    assert_eq!(
+        message_actions_ui_state(&interaction_state, &items)
+            .and_then(|state| state.enter_label)
+            .as_deref(),
+        Some("expand")
+    );
+
+    let group_id = items[0]
+        .history_group_id
+        .clone()
+        .expect("history group item should expose a group id");
+    interaction_state.expanded_history_groups.insert(group_id);
+
+    assert_eq!(
+        message_actions_ui_state(&interaction_state, &items)
+            .and_then(|state| state.enter_label)
+            .as_deref(),
+        Some("collapse")
+    );
+}
+
+#[test]
 fn build_repl_ui_state_hides_prompt_in_transcript_mode() {
     let app = code_agent_ui::RatatuiApp::new("repl-transcript");
     let registry = compatibility_command_registry();
@@ -1426,7 +1497,7 @@ fn build_repl_ui_state_keeps_prompt_visible_for_message_actions() {
             .message_actions
             .as_ref()
             .and_then(|actions| actions.enter_label.as_deref()),
-        None
+        Some("expand")
     );
 }
 

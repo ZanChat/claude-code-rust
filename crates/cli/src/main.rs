@@ -1550,6 +1550,12 @@ struct ReplFilePickerState {
     hidden_query: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReplIdePickerState {
+    candidates: Vec<DetectedIdeCandidate>,
+    selected: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReplFilePickerToken {
     start: usize,
@@ -1567,6 +1573,7 @@ struct ReplFilePickerMatchSet {
 struct ReplMessageActionItem {
     item_index: usize,
     message: Message,
+    history_group_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1801,6 +1808,79 @@ fn active_prompt_file_picker_token(
             .trim_start_matches("./")
             .replace('\\', "/"),
     })
+}
+
+fn repl_ide_picker_state_with_home(
+    cwd: &Path,
+    connected_ide: Option<&DetectedIdeCandidate>,
+    home_override: Option<&Path>,
+) -> ReplIdePickerState {
+    let candidates = detect_workspace_ides(cwd, home_override);
+    let selected = connected_ide
+        .and_then(|connected| {
+            candidates
+                .iter()
+                .position(|candidate| candidate.suggested_bridge == connected.suggested_bridge)
+        })
+        .unwrap_or(0);
+
+    ReplIdePickerState {
+        candidates,
+        selected,
+    }
+}
+
+fn repl_ide_picker_state(
+    cwd: &Path,
+    connected_ide: Option<&DetectedIdeCandidate>,
+) -> ReplIdePickerState {
+    repl_ide_picker_state_with_home(cwd, connected_ide, None)
+}
+
+fn build_ide_choice_list(
+    picker: &ReplIdePickerState,
+    connected_ide: Option<&DetectedIdeCandidate>,
+) -> ChoiceListState {
+    let subtitle = connected_ide
+        .map(|candidate| {
+            format!(
+                "Enter to connect · Esc to cancel · current: {}",
+                candidate.name
+            )
+        })
+        .unwrap_or_else(|| "Enter to connect · Esc to cancel".to_owned());
+
+    ChoiceListState {
+        title: "IDE bridge".to_owned(),
+        subtitle: Some(subtitle),
+        items: picker
+            .candidates
+            .iter()
+            .map(|candidate| {
+                let connected = connected_ide.is_some_and(|current| {
+                    current.suggested_bridge == candidate.suggested_bridge
+                });
+                let detail = if connected {
+                    format!("{} · connected", candidate.suggested_bridge)
+                } else {
+                    candidate.suggested_bridge.clone()
+                };
+
+                ChoiceListItem {
+                    label: candidate.name.clone(),
+                    detail: Some(detail),
+                    secondary: candidate.workspace_folders.first().map(|folder| {
+                        preview_lines_from_text(folder.clone(), 1, 72).join(" ")
+                    }),
+                }
+            })
+            .collect(),
+        selected: picker.selected.min(picker.candidates.len().saturating_sub(1)),
+        empty_message: Some(
+            "No IDE bridge detected for this workspace. Start a supported IDE with the Claude extension first."
+                .to_owned(),
+        ),
+    }
 }
 
 fn rebuild_prompt_file_picker_index(cwd: &Path, file_picker: &mut ReplFilePickerState) {
@@ -2353,6 +2433,7 @@ fn push_message_action_items(
             items.push(ReplMessageActionItem {
                 item_index: *item_index,
                 message: message.clone(),
+                history_group_id: None,
             });
         }
         *item_index += 1;
@@ -3386,6 +3467,7 @@ fn push_history_transcript_line_item(
         presentation.action_items.push(ReplMessageActionItem {
             item_index: presentation.item_count,
             message: message.clone(),
+            history_group_id: None,
         });
     }
     presentation.item_count += 1;
@@ -3399,10 +3481,12 @@ fn push_history_transcript_group_item(
     let representative_message = accumulator.representative_message();
     let group = accumulator.into_group(expanded_history_groups);
     presentation.group_ids.push(group.id.clone());
+    let group_id = group.id.clone();
     presentation.items.push(TranscriptItem::Group(group));
     presentation.action_items.push(ReplMessageActionItem {
         item_index: presentation.item_count,
         message: representative_message,
+        history_group_id: Some(group_id),
     });
     presentation.item_count += 1;
 }
@@ -3469,7 +3553,17 @@ fn message_actions_ui_state(
 
     Some(TranscriptMessageActionsState {
         active_item: selected_item,
-        enter_label: (item.message.role == MessageRole::User).then(|| "edit".to_owned()),
+        enter_label: item
+            .history_group_id
+            .as_ref()
+            .map(|group_id| {
+                if interaction_state.expanded_history_groups.contains(group_id) {
+                    "collapse".to_owned()
+                } else {
+                    "expand".to_owned()
+                }
+            })
+            .or_else(|| (item.message.role == MessageRole::User).then(|| "edit".to_owned())),
         primary_input_label: message_primary_input(&item.message)
             .map(|input| input.label.to_owned()),
     })
@@ -4432,6 +4526,51 @@ where
                                 interaction_state.message_actions = None;
                             }
                             KeyCode::Enter => {
+                                let selected_history_group = selected_message_action_item(
+                                    interaction_state,
+                                    &message_action_items,
+                                )
+                                .and_then(|item| item.history_group_id.clone());
+                                if let Some(group_id) = selected_history_group {
+                                    toggle_history_transcript_group(interaction_state, &group_id);
+                                    let app =
+                                        RatatuiApp::new(format!("{provider}  {active_model}"));
+                                    let state = build_repl_ui_state(
+                                        &app,
+                                        registry,
+                                        &pending_snapshot.messages,
+                                        Some(&pending_snapshot),
+                                        cwd,
+                                        provider,
+                                        active_model,
+                                        session_id,
+                                        input_buffer,
+                                        status_line,
+                                        Some(format!(
+                                            "{} {}",
+                                            pending_spinner_frame(tick),
+                                            pending_snapshot.progress_label
+                                        )),
+                                        *active_pane,
+                                        compact_banner.clone(),
+                                        *transcript_scroll,
+                                        None,
+                                        command_suggestions(registry, input_buffer),
+                                        *selected_command_suggestion,
+                                        tick,
+                                        interaction_state,
+                                    );
+                                    let size = terminal.size()?;
+                                    sync_message_action_preview(
+                                        &state,
+                                        size.width,
+                                        size.height,
+                                        interaction_state,
+                                        transcript_scroll,
+                                    );
+                                    continue;
+                                }
+
                                 let prompt_text = selected_message_action_item(
                                     interaction_state,
                                     &message_action_items,

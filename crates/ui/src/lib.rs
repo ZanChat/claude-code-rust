@@ -2789,20 +2789,16 @@ fn choice_list_lines(choice_list: &ChoiceListState) -> Vec<Line<'static>> {
             Style::default().fg(Color::DarkGray)
         };
 
-        lines.push(Line::from(Span::styled(
-            format!("{prefix}{}", item.label),
-            item_style,
-        )));
+        let mut spans = vec![Span::styled(format!("{prefix}{}", item.label), item_style)];
         if let Some(detail) = item
             .detail
             .as_deref()
             .filter(|value| !value.trim().is_empty())
         {
-            lines.push(Line::from(Span::styled(
-                format!("    {detail}"),
-                detail_style,
-            )));
+            spans.push(Span::styled(" - ".to_owned(), detail_style));
+            spans.push(Span::styled(detail.to_owned(), detail_style));
         }
+        lines.push(Line::from(spans));
         if let Some(secondary) = item
             .secondary
             .as_deref()
@@ -2812,9 +2808,6 @@ fn choice_list_lines(choice_list: &ChoiceListState) -> Vec<Line<'static>> {
                 format!("    {secondary}"),
                 detail_style,
             )));
-        }
-        if index + 1 < end {
-            lines.push(Line::from(""));
         }
     }
 
@@ -4003,6 +3996,26 @@ mod tests {
 
         assert!(saw_start);
         assert!(saw_middle);
+    }
+
+    #[test]
+    fn choice_list_renders_label_and_detail_inline() {
+        let mut state = RatatuiApp::new("choice-list-inline").initial_state();
+        state.choice_list = Some(ChoiceListState {
+            title: "File picker".to_owned(),
+            subtitle: None,
+            items: vec![ChoiceListItem {
+                label: "src/main.rs".to_owned(),
+                detail: Some("Insert @src/main.rs".to_owned()),
+                secondary: None,
+            }],
+            selected: 0,
+            empty_message: None,
+        });
+
+        let rendered = render_to_string(&state, 120, 20).unwrap();
+
+        assert!(rendered.contains("src/main.rs - Insert @src/main.rs"));
     }
 
     #[test]

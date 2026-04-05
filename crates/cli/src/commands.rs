@@ -498,13 +498,13 @@ struct IdeLockfileInfo {
     use_websocket: bool,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
-struct DetectedIdeCandidate {
-    name: String,
-    port: u16,
-    url: String,
-    suggested_bridge: String,
-    workspace_folders: Vec<String>,
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct DetectedIdeCandidate {
+    pub(crate) name: String,
+    pub(crate) port: u16,
+    pub(crate) url: String,
+    pub(crate) suggested_bridge: String,
+    pub(crate) workspace_folders: Vec<String>,
 }
 
 fn ide_lockfiles_dir(home_override: Option<&Path>) -> Option<PathBuf> {
@@ -581,7 +581,10 @@ fn workspace_matches_ide(cwd: &Path, workspace_folder: &str) -> bool {
     cwd == resolved_workspace || cwd.starts_with(&resolved_workspace)
 }
 
-fn detect_workspace_ides(cwd: &Path, home_override: Option<&Path>) -> Vec<DetectedIdeCandidate> {
+pub(crate) fn detect_workspace_ides(
+    cwd: &Path,
+    home_override: Option<&Path>,
+) -> Vec<DetectedIdeCandidate> {
     let resolved_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     sorted_ide_lockfiles(home_override)
         .into_iter()
@@ -1649,6 +1652,8 @@ async fn process_repl_submission(
     compact_banner: &mut Option<String>,
     interaction_state: &mut ReplInteractionState,
     resume_picker: &mut Option<ResumePickerState>,
+    ide_picker: &mut Option<ReplIdePickerState>,
+    connected_ide_bridge: &Option<DetectedIdeCandidate>,
     selected_command_suggestion: &mut usize,
     vim_state: &mut code_agent_ui::vim::VimState,
     remote_mode: bool,
@@ -1683,6 +1688,13 @@ async fn process_repl_submission(
                 });
                 *status_line = repl_status(provider, active_model, repl_session.session_id);
             }
+            *status_marquee_tick = 0;
+            return Ok(ReplSubmissionOutcome::Continue);
+        }
+
+        if invocation.name == "ide" && invocation.args.is_empty() {
+            *ide_picker = Some(repl_ide_picker_state(cwd, connected_ide_bridge.as_ref()));
+            *status_line = repl_status(provider, active_model, repl_session.session_id);
             *status_marquee_tick = 0;
             return Ok(ReplSubmissionOutcome::Continue);
         }
@@ -2010,6 +2022,8 @@ pub(crate) async fn run_interactive_repl(
         let mut selected_command_suggestion = 0usize;
         let mut compact_banner = None;
         let mut resume_picker = None;
+        let mut ide_picker = None;
+        let mut connected_ide_bridge = None;
         let mut queued_submissions = VecDeque::new();
         let mut interaction_state = ReplInteractionState::default();
         let mut dirty = true;
@@ -2033,7 +2047,14 @@ pub(crate) async fn run_interactive_repl(
                     active_repl_choice_list(
                         &cwd,
                         &input_buffer,
-                        resume_picker.as_ref().map(build_resume_choice_list),
+                        resume_picker
+                            .as_ref()
+                            .map(build_resume_choice_list)
+                            .or_else(|| {
+                                ide_picker.as_ref().map(|picker| {
+                                    build_ide_choice_list(picker, connected_ide_bridge.as_ref())
+                                })
+                            }),
                         &mut interaction_state,
                     ),
                     &mut selected_command_suggestion,
@@ -2044,7 +2065,7 @@ pub(crate) async fn run_interactive_repl(
                 dirty = false;
             }
 
-            if resume_picker.is_none() {
+            if resume_picker.is_none() && ide_picker.is_none() {
                 if let Some(prompt_text) = queued_submissions.pop_front() {
                     match process_repl_submission(
                         &mut terminal,
@@ -2070,6 +2091,8 @@ pub(crate) async fn run_interactive_repl(
                         &mut compact_banner,
                         &mut interaction_state,
                         &mut resume_picker,
+                        &mut ide_picker,
+                        &connected_ide_bridge,
                         &mut selected_command_suggestion,
                         &mut vim_state,
                         remote_mode,
@@ -2103,6 +2126,9 @@ pub(crate) async fn run_interactive_repl(
                 continue;
             }
             if let Event::Mouse(mouse) = event {
+                if ide_picker.is_some() {
+                    continue;
+                }
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         clear_prompt_mouse_anchor(&mut interaction_state);
@@ -2137,7 +2163,17 @@ pub(crate) async fn run_interactive_repl(
                             active_repl_choice_list(
                                 &cwd,
                                 &input_buffer,
-                                resume_picker.as_ref().map(build_resume_choice_list),
+                                resume_picker
+                                    .as_ref()
+                                    .map(build_resume_choice_list)
+                                    .or_else(|| {
+                                        ide_picker.as_ref().map(|picker| {
+                                            build_ide_choice_list(
+                                                picker,
+                                                connected_ide_bridge.as_ref(),
+                                            )
+                                        })
+                                    }),
                                 &mut interaction_state,
                             ),
                             selected_command_suggestion,
@@ -2190,6 +2226,9 @@ pub(crate) async fn run_interactive_repl(
             }
             if let Event::Paste(text) = event {
                 clear_prompt_mouse_anchor(&mut interaction_state);
+                if ide_picker.is_some() {
+                    continue;
+                }
                 if let Some(search_state) = interaction_state.prompt_history_search.as_mut() {
                     let _ = insert_buffer_text(&mut search_state.input_buffer, &text);
                     sync_prompt_history_search_preview(
@@ -2334,6 +2373,97 @@ pub(crate) async fn run_interactive_repl(
                         compact_banner =
                             Some(format!("resume {}", shorten_path(&transcript_path, 72)));
                         status_line = repl_status(provider, &active_model, repl_session.session_id);
+                        status_marquee_tick = 0;
+                    }
+                    None => {}
+                }
+                continue;
+            }
+
+            if ide_picker.is_some() {
+                enum IdePickerAction {
+                    Cancel,
+                    Connect(Option<DetectedIdeCandidate>),
+                }
+
+                let mut picker_action = None;
+                if let Some(picker) = ide_picker.as_mut() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            picker_action = Some(IdePickerAction::Cancel);
+                            dirty = true;
+                        }
+                        KeyCode::Up => {
+                            picker.selected = picker.selected.saturating_sub(1);
+                            dirty = true;
+                        }
+                        KeyCode::Down => {
+                            if picker.selected + 1 < picker.candidates.len() {
+                                picker.selected += 1;
+                            }
+                            dirty = true;
+                        }
+                        KeyCode::PageUp => {
+                            picker.selected = picker.selected.saturating_sub(5);
+                            dirty = true;
+                        }
+                        KeyCode::PageDown => {
+                            if !picker.candidates.is_empty() {
+                                picker.selected =
+                                    (picker.selected + 5).min(picker.candidates.len() - 1);
+                            }
+                            dirty = true;
+                        }
+                        KeyCode::Home => {
+                            picker.selected = 0;
+                            dirty = true;
+                        }
+                        KeyCode::End => {
+                            if !picker.candidates.is_empty() {
+                                picker.selected = picker.candidates.len() - 1;
+                            }
+                            dirty = true;
+                        }
+                        KeyCode::Enter | KeyCode::Tab => {
+                            picker_action = Some(IdePickerAction::Connect(
+                                picker.candidates.get(picker.selected).cloned(),
+                            ));
+                            dirty = true;
+                        }
+                        _ if is_plain_ctrl_char(&key, 'c') => {
+                            picker_action = Some(IdePickerAction::Cancel);
+                            dirty = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                match picker_action {
+                    Some(IdePickerAction::Cancel) => {
+                        ide_picker = None;
+                        status_line = repl_status(provider, &active_model, repl_session.session_id);
+                        status_marquee_tick = 0;
+                    }
+                    Some(IdePickerAction::Connect(Some(candidate))) => {
+                        let message = format!(
+                            "Connected to {} via {}",
+                            candidate.name, candidate.suggested_bridge
+                        );
+                        compact_banner = Some(message.clone());
+                        connected_ide_bridge = Some(candidate);
+                        ide_picker = None;
+                        status_line = status_with_detail(
+                            repl_status(provider, &active_model, repl_session.session_id),
+                            message,
+                        );
+                        status_marquee_tick = 0;
+                    }
+                    Some(IdePickerAction::Connect(None)) => {
+                        ide_picker = None;
+                        status_line = status_with_detail(
+                            repl_status(provider, &active_model, repl_session.session_id),
+                            "No IDE bridge detected for this workspace",
+                        );
                         status_marquee_tick = 0;
                     }
                     None => {}
@@ -2635,6 +2765,47 @@ pub(crate) async fn run_interactive_repl(
                         dirty = true;
                     }
                     KeyCode::Enter => {
+                        let selected_history_group = selected_message_action_item(
+                            &mut interaction_state,
+                            &message_action_items,
+                        )
+                        .and_then(|item| item.history_group_id.clone());
+                        if let Some(group_id) = selected_history_group {
+                            toggle_history_transcript_group(&mut interaction_state, &group_id);
+                            let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                            let state = build_repl_ui_state(
+                                &app,
+                                registry,
+                                raw_messages,
+                                None,
+                                &cwd,
+                                provider,
+                                &active_model,
+                                repl_session.session_id,
+                                &input_buffer,
+                                &status_line,
+                                None,
+                                active_pane,
+                                compact_banner.clone(),
+                                transcript_scroll,
+                                None,
+                                command_suggestions(registry, &input_buffer),
+                                selected_command_suggestion,
+                                status_marquee_tick,
+                                &interaction_state,
+                            );
+                            let size = terminal.size()?;
+                            sync_message_action_preview(
+                                &state,
+                                size.width,
+                                size.height,
+                                &interaction_state,
+                                &mut transcript_scroll,
+                            );
+                            dirty = true;
+                            continue;
+                        }
+
                         let prompt_text = selected_message_action_item(
                             &mut interaction_state,
                             &message_action_items,
@@ -3517,6 +3688,8 @@ pub(crate) async fn run_interactive_repl(
                         &mut compact_banner,
                         &mut interaction_state,
                         &mut resume_picker,
+                        &mut ide_picker,
+                        &connected_ide_bridge,
                         &mut selected_command_suggestion,
                         &mut vim_state,
                         remote_mode,
