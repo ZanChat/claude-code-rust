@@ -120,7 +120,7 @@ fn using_your_tools_section(enabled_tools: &BTreeSet<String>) -> Option<String> 
         );
     }
     if enabled_tools.contains("file_edit") {
-        items.push("To edit files use file_edit instead of sed, awk, perl, or shell one-liners.");
+        items.push("To edit files use file_edit instead of sed, awk, perl, or shell one-liners. If writing new temp files, use a designated temporary directory, for example .tmp dir.");
     }
     if enabled_tools.contains("file_write") {
         items.push(

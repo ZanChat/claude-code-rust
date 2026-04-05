@@ -98,7 +98,10 @@ async fn run_agent_turns(
         ..ToolContext::default()
     };
 
-    for step in 1..=MAX_AGENT_STEPS {
+    let mut step = 1;
+    let mut recent_tools = Vec::new();
+
+    loop {
         let step_start_index = messages.len();
         update_pending_repl_step_view(
             pending_view,
@@ -284,10 +287,29 @@ async fn run_agent_turns(
                     TaskStatus::Completed
                 },
             );
-        }
-    }
 
-    Err(anyhow!("agent loop exceeded tool iteration limit"))
+            recent_tools.push(format!(
+                "- {}: {}",
+                call.name,
+                if output_is_error { "failed" } else { "completed" }
+            ));
+        }
+
+        if step > 0 && step % MAX_AGENT_STEPS == 0 {
+            let summary = recent_tools.join("\n");
+            recent_tools.clear();
+            let text = format!("Checkpoint: You have executed {MAX_AGENT_STEPS} consecutive steps. Here is a summary of the recent tool runs:\n{summary}\n\nPlease decide whether to continue. If the task is done or stuck, you can stop by replying with your final response. If you need to continue, please explain what you will do next.");
+            
+            let mut checkpoint_message = Message::new(MessageRole::User, vec![ContentBlock::Text { text }]);
+            checkpoint_message.session_id = Some(session_id);
+            checkpoint_message.parent_id = messages.last().map(|m| m.id);
+            
+            store.append_message(session_id, &checkpoint_message).await?;
+            messages.push(checkpoint_message);
+        }
+
+        step += 1;
+    }
 }
 
 async fn execute_local_turn(
