@@ -27,7 +27,8 @@ use code_agent_core::{
 };
 use code_agent_mcp::parse_mcp_server_configs;
 use code_agent_plugins::{
-    BridgeLaunchRequest, CommandDefinitions, OutOfProcessPluginRuntime, PluginRuntime,
+    BridgeLaunchRequest, CommandDefinitions, OutOfProcessPluginRuntime, PluginManifest,
+    PluginRuntime, PLUGIN_MANIFEST_PATH, SKILL_FILE_NAME,
 };
 use code_agent_providers::{
     build_provider, clear_auth_snapshot, code_agent_auth_snapshot_path,
@@ -37,7 +38,7 @@ use code_agent_providers::{
     ProviderRequest, ProviderToolDefinition,
 };
 use code_agent_session::{
-    agent_transcript_path_for, compact_messages, estimate_message_tokens,
+    agent_transcript_path_for, claude_config_home_dir, compact_messages, estimate_message_tokens,
     extract_last_json_string_field, get_project_dir, import_transcript_to_session_root,
     materialize_runtime_messages, CompactionConfig, CompactionOutcome, JsonlTranscriptCodec,
     SessionSummary, TranscriptCodec,
@@ -93,6 +94,8 @@ const FILE_PICKER_MAX_RESULTS: usize = 12;
 
 include!("main/session_messages.rs");
 include!("main/ui_helpers.rs");
+include!("main/system_prompt.rs");
+include!("main/prompt_commands.rs");
 include!("main/repl_picker.rs");
 include!("main/transcript_actions.rs");
 include!("main/repl_ui.rs");

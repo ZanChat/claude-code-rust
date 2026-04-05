@@ -77,6 +77,7 @@ async fn run_agent_turns(
     store: &ActiveSessionStore,
     tool_registry: &ToolRegistry,
     cwd: PathBuf,
+    plugin_root: Option<&PathBuf>,
     provider: ApiProvider,
     model: String,
     session_id: SessionId,
@@ -87,6 +88,7 @@ async fn run_agent_turns(
     const MAX_AGENT_STEPS: usize = 100;
 
     let provider_tools = tool_definitions(tool_registry);
+    let system_prompt = build_runtime_system_prompt(&cwd, tool_registry, provider, plugin_root);
     let tool_context = ToolContext {
         session_id: Some(session_id),
         cwd: cwd.clone(),
@@ -108,10 +110,11 @@ async fn run_agent_turns(
         );
         let provider_client = resolve_provider_client(provider, auth_configured).await?;
         let parent_id = messages.last().map(|message| message.id);
+        let request_messages = provider_request_messages(&system_prompt, messages);
         let mut stream = provider_client
             .start_stream(ProviderRequest {
                 model: model.clone(),
-                messages: messages.clone(),
+                messages: request_messages,
                 tools: provider_tools.clone(),
                 ..ProviderRequest::default()
             })
@@ -290,6 +293,7 @@ async fn execute_local_turn(
     store: &ActiveSessionStore,
     tool_registry: &ToolRegistry,
     cwd: PathBuf,
+    plugin_root: Option<&PathBuf>,
     provider: ApiProvider,
     active_model: String,
     session_id: SessionId,
@@ -317,6 +321,7 @@ async fn execute_local_turn(
         store,
         tool_registry,
         cwd,
+        plugin_root,
         provider,
         active_model,
         session_id,
@@ -642,8 +647,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(prompt_text) = prompt.clone() {
+    if let Some(mut prompt_text) = prompt.clone() {
         if let Some(invocation) = registry.parse_slash_command(&prompt_text) {
+            if let Some(expanded_prompt) = resolve_prompt_command_prompt(
+                &registry,
+                &invocation,
+                &cwd,
+                cli.plugin_root.as_ref(),
+                session_id,
+            )? {
+                prompt_text = expanded_prompt;
+            } else {
             handle_slash_command(
                 &registry,
                 invocation,
@@ -661,6 +675,7 @@ async fn main() -> Result<()> {
             )
             .await?;
             return Ok(());
+            }
         }
 
         let transcript_path = match transcript_path {
@@ -692,6 +707,7 @@ async fn main() -> Result<()> {
             &store,
             &tool_registry,
             cwd.clone(),
+            cli.plugin_root.as_ref(),
             provider,
             active_model.clone(),
             session_id,

@@ -698,7 +698,9 @@ fn transcript_body_layout(state: &UiState, body_area: Rect) -> Option<Transcript
         return None;
     }
 
-    let (_, initial_scroll) = transcript_viewport(state, body_area.width, body_area.height);
+    let all_lines = transcript_visual_lines(state, body_area.width);
+    let initial_scroll =
+        clamped_transcript_scroll(all_lines.len(), body_area.height, state.transcript_scroll);
     let sticky_visible = initial_scroll > 0 && body_area.height > 1;
     let transcript_height = if sticky_visible {
         body_area.height.saturating_sub(1)
@@ -706,7 +708,7 @@ fn transcript_body_layout(state: &UiState, body_area: Rect) -> Option<Transcript
         body_area.height
     };
     let (visible_lines, effective_scroll) =
-        transcript_viewport(state, body_area.width, transcript_height);
+        transcript_viewport_from_lines(&all_lines, transcript_height, state.transcript_scroll);
     let (header_area, transcript_area) = if sticky_visible {
         (
             Some(Rect::new(body_area.x, body_area.y, body_area.width, 1)),

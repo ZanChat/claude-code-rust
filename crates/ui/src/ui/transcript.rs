@@ -1324,17 +1324,16 @@ fn clamped_transcript_scroll(
     requested_scroll.min(max_scroll)
 }
 
-fn transcript_viewport(
-    state: &UiState,
-    width: u16,
+fn transcript_viewport_from_lines(
+    all_lines: &[TranscriptRenderLine],
     height: u16,
+    requested_scroll: u16,
 ) -> (Vec<TranscriptRenderLine>, u16) {
-    let all_lines = transcript_visual_lines(state, width);
     if height == 0 {
         return (Vec::new(), 0);
     }
 
-    let scroll = clamped_transcript_scroll(all_lines.len(), height, state.transcript_scroll);
+    let scroll = clamped_transcript_scroll(all_lines.len(), height, requested_scroll);
     let start = all_lines
         .len()
         .saturating_sub(height as usize + scroll as usize);
@@ -1347,27 +1346,48 @@ fn last_user_prompt_excerpt(state: &UiState, width: u16, transcript_scroll: u16)
         return None;
     }
 
-    for item in resolved_transcript_items(state).into_iter().rev() {
-        match item {
-            TranscriptItem::Line(line) if line.role == "user" => {
-                return Some(truncate_middle(
-                    &line.text,
-                    width.saturating_sub(4) as usize,
-                ));
-            }
-            TranscriptItem::Group(group) => {
-                if let Some(line) = group.lines.iter().rev().find(|line| line.role == "user") {
-                    return Some(truncate_middle(
-                        &line.text,
-                        width.saturating_sub(4) as usize,
-                    ));
-                }
-            }
-            _ => {}
-        }
+    last_user_prompt_text(state)
+        .map(|text| truncate_middle(text, width.saturating_sub(4) as usize))
+}
+
+fn last_user_prompt_text(state: &UiState) -> Option<&str> {
+    if !state.transcript_items.is_empty() {
+        return state
+            .transcript_items
+            .iter()
+            .rev()
+            .find_map(last_user_prompt_text_for_item);
     }
 
-    None
+    state
+        .transcript_groups
+        .iter()
+        .rev()
+        .find_map(last_user_prompt_text_for_group)
+        .or_else(|| {
+            state
+                .transcript_lines
+                .iter()
+                .rev()
+                .find(|line| line.role == "user")
+                .map(|line| line.text.as_str())
+        })
+}
+
+fn last_user_prompt_text_for_item(item: &TranscriptItem) -> Option<&str> {
+    match item {
+        TranscriptItem::Line(line) if line.role == "user" => Some(line.text.as_str()),
+        TranscriptItem::Line(_) => None,
+        TranscriptItem::Group(group) => last_user_prompt_text_for_group(group),
+    }
+}
+
+fn last_user_prompt_text_for_group(group: &TranscriptGroup) -> Option<&str> {
+    group.lines
+        .iter()
+        .rev()
+        .find(|line| line.role == "user")
+        .map(|line| line.text.as_str())
 }
 
 fn sticky_prompt_widget(
@@ -1408,4 +1428,3 @@ fn scroll_pill_widget(transcript_scroll: u16) -> Option<Paragraph<'static>> {
         .alignment(Alignment::Center),
     )
 }
-

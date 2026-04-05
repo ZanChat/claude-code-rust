@@ -4,8 +4,9 @@ enum ClipboardPath {
     Osc52,
 }
 
-fn should_enable_mouse_capture(term_program: Option<&str>) -> bool {
-    !matches!(term_program, Some("vscode"))
+pub(crate) fn should_enable_mouse_capture(term_program: Option<&str>) -> bool {
+    let _ = term_program;
+    true
 }
 
 pub(crate) async fn render_auth_command(provider: ApiProvider, action: &str) -> Result<String> {

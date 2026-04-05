@@ -384,6 +384,13 @@ fn selection_copy_shortcut_matches_explicit_copy_bindings() {
 }
 
 #[test]
+fn mouse_capture_stays_enabled_in_vscode_terminals() {
+    assert!(should_enable_mouse_capture(Some("vscode")));
+    assert!(should_enable_mouse_capture(Some("Apple_Terminal")));
+    assert!(should_enable_mouse_capture(None));
+}
+
+#[test]
 fn paste_shortcut_matches_expected_bindings() {
     let super_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER);
     assert!(is_paste_shortcut(&super_v));

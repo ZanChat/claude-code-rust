@@ -1,3 +1,39 @@
+fn drain_mouse_scroll_burst(
+    initial_kind: &MouseEventKind,
+    pending_event: &mut Option<Event>,
+) -> Result<u16> {
+    let scroll_up = matches!(initial_kind, MouseEventKind::ScrollUp);
+    let scroll_down = matches!(initial_kind, MouseEventKind::ScrollDown);
+    if !scroll_up && !scroll_down {
+        return Ok(1);
+    }
+
+    let mut burst = 1u16;
+    while event::poll(Duration::from_millis(0))? {
+        let next = event::read()?;
+        match next {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                ..
+            }) if scroll_up => {
+                burst = burst.saturating_add(1);
+            }
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                ..
+            }) if scroll_down => {
+                burst = burst.saturating_add(1);
+            }
+            other => {
+                *pending_event = Some(other);
+                break;
+            }
+        }
+    }
+
+    Ok(burst)
+}
+
 pub(crate) async fn run_interactive_repl(
     store: &ActiveSessionStore,
     registry: &code_agent_core::CommandRegistry,
@@ -81,6 +117,7 @@ pub(crate) async fn run_interactive_repl(
         let mut connected_ide_bridge = None;
         let mut queued_submissions = VecDeque::new();
         let mut interaction_state = ReplInteractionState::default();
+        let mut pending_event = None;
         let mut dirty = true;
         loop {
             if dirty {
@@ -165,7 +202,9 @@ pub(crate) async fn run_interactive_repl(
                 }
             }
 
-            let event = if status_line_needs_marquee(&status_line) {
+            let event = if let Some(event) = pending_event.take() {
+                event
+            } else if status_line_needs_marquee(&status_line) {
                 if !event::poll(Duration::from_millis(160))? {
                     status_marquee_tick = status_marquee_tick.wrapping_add(1);
                     dirty = true;
@@ -188,13 +227,15 @@ pub(crate) async fn run_interactive_repl(
                     MouseEventKind::ScrollUp => {
                         clear_prompt_mouse_anchor(&mut interaction_state);
                         interaction_state.transcript_selection = None;
-                        scroll_up(&mut transcript_scroll, 3);
+                        let burst = drain_mouse_scroll_burst(&mouse.kind, &mut pending_event)?;
+                        scroll_up(&mut transcript_scroll, burst.saturating_mul(3));
                         dirty = true;
                     }
                     MouseEventKind::ScrollDown => {
                         clear_prompt_mouse_anchor(&mut interaction_state);
                         interaction_state.transcript_selection = None;
-                        scroll_down(&mut transcript_scroll, 3);
+                        let burst = drain_mouse_scroll_burst(&mouse.kind, &mut pending_event)?;
+                        scroll_down(&mut transcript_scroll, burst.saturating_mul(3));
                         dirty = true;
                     }
                     MouseEventKind::Down(MouseButton::Left)
@@ -1785,4 +1826,3 @@ pub(crate) async fn run_interactive_repl(
     }
     loop_result
 }
-

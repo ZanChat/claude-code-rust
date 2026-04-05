@@ -20,6 +20,36 @@ pub(crate) async fn handle_repl_slash_command(
             invocation.name
         ));
     }
+    if let Some(expanded_prompt) = resolve_prompt_command_prompt(
+        registry,
+        &invocation,
+        cwd,
+        plugin_root,
+        repl_session.session_id,
+    )? {
+        let (applied_compaction, turn_count, stop_reason, _, _) = execute_local_turn(
+            store,
+            tool_registry,
+            cwd.to_path_buf(),
+            plugin_root,
+            provider,
+            active_model.clone(),
+            repl_session.session_id,
+            raw_messages,
+            expanded_prompt,
+            live_runtime,
+            None,
+        )
+        .await?;
+        let detail = if let Some(kind) = applied_compaction.as_ref().and_then(compaction_kind_name)
+        {
+            format!("{turn_count} steps · {:?} · compact {kind}", stop_reason)
+        } else {
+            format!("{turn_count} steps · {:?}", stop_reason)
+        };
+        return Ok(detail);
+    }
+
     match invocation.name.as_str() {
         "help" => Ok(render_command_help(registry, remote_mode)),
         "version" => Ok(env!("CARGO_PKG_VERSION").to_owned()),
@@ -463,6 +493,7 @@ async fn process_repl_submission(
             store,
             tool_registry,
             cwd.clone(),
+            plugin_root,
             provider,
             active_model.clone(),
             repl_session.session_id,
