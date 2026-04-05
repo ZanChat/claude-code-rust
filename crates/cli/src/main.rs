@@ -925,13 +925,17 @@ fn pane_from_digit(ch: char) -> Option<PaneKind> {
     Some(PaneKind::ALL[index - 1])
 }
 
-fn pane_from_shortcut(key: &crossterm::event::KeyEvent) -> Option<PaneKind> {
-    let shortcut_modifier = if cfg!(target_os = "macos") {
-        KeyModifiers::SUPER
+fn pane_shortcut_modifiers() -> KeyModifiers {
+    // VS Code's integrated terminal on macOS often intercepts Cmd+digit before the app sees it.
+    if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER | KeyModifiers::CONTROL
     } else {
         KeyModifiers::CONTROL
-    };
-    if !key.modifiers.contains(shortcut_modifier) {
+    }
+}
+
+fn pane_from_shortcut(key: &crossterm::event::KeyEvent) -> Option<PaneKind> {
+    if !key.modifiers.intersects(pane_shortcut_modifiers()) {
         return None;
     }
 
@@ -1470,6 +1474,16 @@ fn toggle_pending_repl_group(pending_view: &Arc<Mutex<PendingReplView>>, group_i
     }
 }
 
+fn toggle_all_pending_repl_groups(pending_view: &Arc<Mutex<PendingReplView>>) {
+    if let Ok(mut state) = pending_view.lock() {
+        let should_expand = state.steps.iter().any(|entry| !entry.expanded);
+        for entry in &mut state.steps {
+            entry.expanded = should_expand;
+            entry.touched = true;
+        }
+    }
+}
+
 fn pending_repl_snapshot(pending_view: &Arc<Mutex<PendingReplView>>) -> PendingReplView {
     pending_view
         .lock()
@@ -1600,6 +1614,12 @@ where
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         return Ok(PendingReplOperationResult::Interrupted);
+                    }
+                    if matches!(key.code, KeyCode::Char('o'))
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        toggle_all_pending_repl_groups(&pending_view);
+                        continue;
                     }
                     if let Some(pane) = pane_from_shortcut(&key) {
                         *active_pane = pane;

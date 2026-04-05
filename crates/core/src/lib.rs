@@ -868,6 +868,18 @@ pub fn compatibility_command_registry() -> CommandRegistry {
             true,
         ),
         builtin_command(
+            "copy",
+            "Copy the latest assistant response, or /copy N for an older one.",
+            CommandCategory::Session,
+            CommandKind::Local,
+            &[],
+            false,
+            true,
+            true,
+            true,
+            true,
+        ),
+        builtin_command(
             "compact",
             "Compact the current conversation.",
             CommandCategory::Session,

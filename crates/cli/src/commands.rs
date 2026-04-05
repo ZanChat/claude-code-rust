@@ -1,6 +1,11 @@
 use super::*;
 
+use anyhow::Context;
 use std::collections::VecDeque;
+use std::fs;
+use std::io::Write as _;
+use std::process::{Command as StdCommand, Stdio};
+use uuid::Uuid;
 
 pub(crate) async fn render_auth_command(provider: ApiProvider, action: &str) -> Result<String> {
     render_auth_command_with_resume(provider, action, None).await
@@ -157,6 +162,116 @@ pub(crate) fn render_command_help(registry: &CommandRegistry, remote_only: bool)
             .map(|spec| format!("/{:<16} {}", spec.name, spec.description)),
     );
     lines.join("\n")
+}
+
+fn collect_recent_assistant_texts(messages: &[Message], max_items: usize) -> Vec<String> {
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .map(message_text)
+        .filter(|text| !text.trim().is_empty())
+        .take(max_items)
+        .collect()
+}
+
+fn try_copy_to_clipboard(text: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = run_clipboard_command("pbcopy", &[], text);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = run_clipboard_command("cmd", &["/C", "clip"], text);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some()
+            && run_clipboard_command("wl-copy", &[], text).is_ok()
+        {
+            return;
+        }
+        if std::env::var_os("DISPLAY").is_some()
+            && run_clipboard_command("xclip", &["-selection", "clipboard"], text).is_ok()
+        {
+            return;
+        }
+        let _ = run_clipboard_command("xsel", &["--clipboard", "--input"], text);
+    }
+}
+
+fn run_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<()> {
+    let mut child = StdCommand::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to launch clipboard helper: {program}"))?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(text.as_bytes())
+            .with_context(|| format!("failed to write clipboard payload for {program}"))?;
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for clipboard helper: {program}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("clipboard helper exited with status {status}")
+    }
+}
+
+fn write_copy_fallback_file(text: &str) -> Result<PathBuf> {
+    let copy_dir = std::env::temp_dir().join("code-agent-rust");
+    fs::create_dir_all(&copy_dir)?;
+    let file_path = copy_dir.join(format!("response-{}.md", Uuid::new_v4()));
+    fs::write(&file_path, text)?;
+    Ok(file_path)
+}
+
+pub(crate) fn render_copy_command(
+    invocation: &CommandInvocation,
+    raw_messages: &[Message],
+) -> Result<String> {
+    let requested_index = match invocation.args.first() {
+        None => 1,
+        Some(value) => match value.parse::<usize>() {
+            Ok(0) => return Ok("usage: /copy [N], where N starts at 1".to_owned()),
+            Ok(index) => index,
+            Err(_) => return Ok("usage: /copy [N], where N starts at 1".to_owned()),
+        },
+    };
+
+    let recent_texts = collect_recent_assistant_texts(raw_messages, 20);
+    let Some(text) = recent_texts.get(requested_index - 1) else {
+        return Ok(if requested_index == 1 {
+            "No assistant response available to copy yet.".to_owned()
+        } else {
+            format!("No assistant response found at index {requested_index}.")
+        });
+    };
+
+    try_copy_to_clipboard(text);
+    let file_path = write_copy_fallback_file(text)?;
+    let line_count = text.lines().count().max(1);
+    let response_label = if requested_index == 1 {
+        "last assistant response".to_owned()
+    } else {
+        format!("assistant response #{requested_index}")
+    };
+
+    Ok(format!(
+        "Sent {response_label} to the system clipboard when supported ({}, {} lines)\nAlso wrote it to {}",
+        text.chars().count(),
+        line_count,
+        file_path.display()
+    ))
 }
 
 pub(crate) async fn render_permissions_command(cwd: &Path) -> Result<String> {
@@ -1080,6 +1195,7 @@ pub(crate) async fn handle_repl_slash_command(
             }
             Ok("nothing to compact".to_owned())
         }
+        "copy" => render_copy_command(&invocation, raw_messages),
         "clear" => {
             let transcript_path = store.transcript_path(repl_session.session_id).await?;
             if transcript_path.exists() {

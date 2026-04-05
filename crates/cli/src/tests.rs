@@ -6,9 +6,9 @@ use super::{
     navigate_prompt_history_up, pane_from_shortcut, pending_interrupt_messages,
     prompt_history_from_messages, render_auth_command_with_resume, render_remote_control_command,
     resolve_continue_target, resolved_command_registry, resumable_sessions, resume_hint_text,
-    should_echo_command_result_in_footer, should_exit_repl, ActiveSessionStore, Cli,
-    LocalBridgeHandler, Message, MessageRole, PendingReplStep, PendingReplView, ReplSessionState,
-    ResumePickerState, ResumeTargetHint, StartupPreferences,
+    should_echo_command_result_in_footer, should_exit_repl, toggle_all_pending_repl_groups,
+    ActiveSessionStore, Cli, LocalBridgeHandler, Message, MessageRole, PendingReplStep,
+    PendingReplView, ReplSessionState, ResumePickerState, ResumeTargetHint, StartupPreferences,
 };
 use code_agent_bridge::{
     base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -82,6 +83,7 @@ fn repl_handled_command_names() -> BTreeSet<&'static str> {
     BTreeSet::from([
         "help",
         "version",
+        "copy",
         "config",
         "status",
         "ide",
@@ -274,20 +276,25 @@ fn command_suggestions_stop_after_command_arguments_start() {
 }
 
 #[test]
-fn pane_shortcut_requires_platform_modifier() {
+fn pane_shortcut_accepts_supported_platform_modifiers() {
     let plain = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
     assert!(pane_from_shortcut(&plain).is_none());
 
-    let shortcut_modifier = if cfg!(target_os = "macos") {
-        KeyModifiers::SUPER
-    } else {
-        KeyModifiers::CONTROL
-    };
-    let shortcut = KeyEvent::new(KeyCode::Char('1'), shortcut_modifier);
+    let control_shortcut = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL);
     assert_eq!(
-        pane_from_shortcut(&shortcut),
+        pane_from_shortcut(&control_shortcut),
         Some(code_agent_ui::PaneKind::Transcript)
     );
+
+    let super_shortcut = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SUPER);
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            pane_from_shortcut(&super_shortcut),
+            Some(code_agent_ui::PaneKind::Transcript)
+        );
+    } else {
+        assert!(pane_from_shortcut(&super_shortcut).is_none());
+    }
 }
 
 #[test]
@@ -607,6 +614,44 @@ fn pending_interrupt_messages_preserve_partial_preview_before_marker() {
     );
 }
 
+#[test]
+fn toggle_all_pending_repl_groups_switches_between_expanded_and_collapsed() {
+    let pending_view = Arc::new(Mutex::new(PendingReplView {
+        messages: Vec::new(),
+        progress_label: "Working".to_owned(),
+        steps: vec![
+            PendingReplStep {
+                step: 1,
+                start_index: 0,
+                status_label: "working".to_owned(),
+                status_detail: None,
+                expanded: false,
+                touched: false,
+            },
+            PendingReplStep {
+                step: 2,
+                start_index: 0,
+                status_label: "working".to_owned(),
+                status_detail: None,
+                expanded: true,
+                touched: false,
+            },
+        ],
+        queued_inputs: Vec::new(),
+    }));
+
+    toggle_all_pending_repl_groups(&pending_view);
+    {
+        let state = pending_view.lock().unwrap();
+        assert!(state.steps.iter().all(|entry| entry.expanded));
+        assert!(state.steps.iter().all(|entry| entry.touched));
+    }
+
+    toggle_all_pending_repl_groups(&pending_view);
+    let state = pending_view.lock().unwrap();
+    assert!(state.steps.iter().all(|entry| !entry.expanded));
+}
+
 #[tokio::test]
 async fn config_migrate_reports_compatibility_inputs() {
     let store =
@@ -874,6 +919,125 @@ async fn repl_clear_command_resets_transcript_state() {
     assert!(status.contains("cleared session"));
     assert!(raw_messages.is_empty());
     assert!(!transcript_path.exists());
+}
+
+#[tokio::test]
+async fn repl_copy_command_writes_latest_assistant_response() {
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-copy")));
+    let tool_registry = compatibility_tool_registry();
+    let root = env::temp_dir();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut raw_messages = vec![
+        build_text_message(session_id, MessageRole::User, "question".to_owned(), None),
+        build_text_message(
+            session_id,
+            MessageRole::Assistant,
+            "first answer".to_owned(),
+            None,
+        ),
+        build_text_message(
+            session_id,
+            MessageRole::Assistant,
+            "second answer".to_owned(),
+            None,
+        ),
+    ];
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "copy".to_owned(),
+            raw_input: "/copy".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::FirstParty,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(status.contains("last assistant response"));
+    let file_path = status
+        .lines()
+        .last()
+        .and_then(|line| line.strip_prefix("Also wrote it to "))
+        .map(PathBuf::from)
+        .expect("copy command should report a fallback file path");
+    assert_eq!(fs::read_to_string(file_path).unwrap(), "second answer");
+}
+
+#[tokio::test]
+async fn repl_copy_command_supports_explicit_message_index() {
+    let store =
+        ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-copy-index")));
+    let tool_registry = compatibility_tool_registry();
+    let root = env::temp_dir();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut raw_messages = vec![
+        build_text_message(session_id, MessageRole::User, "question".to_owned(), None),
+        build_text_message(
+            session_id,
+            MessageRole::Assistant,
+            "first answer".to_owned(),
+            None,
+        ),
+        build_text_message(
+            session_id,
+            MessageRole::Assistant,
+            "second answer".to_owned(),
+            None,
+        ),
+    ];
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "copy".to_owned(),
+            args: vec!["2".to_owned()],
+            raw_input: "/copy 2".to_owned(),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::FirstParty,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(status.contains("assistant response #2"));
+    let file_path = status
+        .lines()
+        .last()
+        .and_then(|line| line.strip_prefix("Also wrote it to "))
+        .map(PathBuf::from)
+        .expect("copy command should report a fallback file path");
+    assert_eq!(fs::read_to_string(file_path).unwrap(), "first answer");
 }
 
 #[test]

@@ -502,9 +502,21 @@ fn overlay_kind(state: &UiState) -> Option<OverlayKind> {
 
 fn pane_shortcut_label() -> &'static str {
     if cfg!(target_os = "macos") {
-        "Cmd+1-6"
+        "Cmd/Ctrl+1-6"
     } else {
         "Ctrl+1-6"
+    }
+}
+
+fn transcript_toggle_label(state: &UiState, active_pane: PaneKind) -> Option<&'static str> {
+    if !matches!(active_pane, PaneKind::Transcript) || state.transcript_groups.is_empty() {
+        return None;
+    }
+
+    if state.transcript_groups.iter().all(|group| group.expanded) {
+        Some("Ctrl+O collapse")
+    } else {
+        Some("Ctrl+O show all")
     }
 }
 
@@ -1331,7 +1343,12 @@ fn prompt_row_height(state: &UiState, width: u16) -> u16 {
         .clamp(3, 6)
 }
 
-fn navigation_hint(active_pane: PaneKind, layout: LayoutMode, suggestions_visible: bool) -> String {
+fn navigation_hint(
+    state: &UiState,
+    active_pane: PaneKind,
+    layout: LayoutMode,
+    suggestions_visible: bool,
+) -> String {
     let suggestion_hint = if suggestions_visible {
         "Up/Down choose"
     } else {
@@ -1342,15 +1359,18 @@ fn navigation_hint(active_pane: PaneKind, layout: LayoutMode, suggestions_visibl
     } else {
         format!("{} open", active_pane.title())
     };
+    let transcript_hint = transcript_toggle_label(state, active_pane)
+        .map(|hint| format!("  {hint}"))
+        .unwrap_or_default();
 
     if matches!(layout, LayoutMode::Compact) {
         format!(
-            "{focus_label}  {} panes  {suggestion_hint}",
+            "{focus_label}  {} panes  {suggestion_hint}{transcript_hint}",
             pane_shortcut_label()
         )
     } else {
         format!(
-            "{focus_label}  Tab cycle  {} panes  {suggestion_hint}  Ctrl-C exit",
+            "{focus_label}  Tab cycle  {} panes  {suggestion_hint}{transcript_hint}  Ctrl-C exit",
             pane_shortcut_label()
         )
     }
@@ -1440,7 +1460,7 @@ fn footer_widget(
     let secondary_text = line_text(&status_line(state));
     let primary = compose_footer_line(
         &footer_primary_text(state, suggestions_visible),
-        &navigation_hint(active_pane, layout, suggestions_visible),
+        &navigation_hint(state, active_pane, layout, suggestions_visible),
         width,
     );
     let secondary = Line::from(Span::styled(
@@ -2174,9 +2194,10 @@ pub fn render_to_string(state: &UiState, width: u16, height: u16) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        footer_primary_text, mouse_action_for_position, render_to_string, ChoiceListItem,
-        ChoiceListState, Notification, PaneKind, PermissionPromptState, RatatuiApp, StatusLevel,
-        TranscriptGroup, TranscriptLine, UiMouseAction,
+        footer_primary_text, mouse_action_for_position, pane_shortcut_label, render_to_string,
+        transcript_toggle_label, ChoiceListItem, ChoiceListState, Notification, PaneKind,
+        PermissionPromptState, RatatuiApp, StatusLevel, TranscriptGroup, TranscriptLine,
+        UiMouseAction,
     };
     use code_agent_core::{compatibility_command_registry, ContentBlock, Message, MessageRole};
     use std::collections::BTreeMap;
@@ -2273,6 +2294,45 @@ mod tests {
 
         assert!(rendered.contains("Terminal too small"));
         assert!(rendered.contains("comfortable REPL") || rendered.contains("Resize"));
+    }
+
+    #[test]
+    fn pane_shortcut_label_matches_supported_shortcuts() {
+        let expected = if cfg!(target_os = "macos") {
+            "Cmd/Ctrl+1-6"
+        } else {
+            "Ctrl+1-6"
+        };
+
+        assert_eq!(pane_shortcut_label(), expected);
+    }
+
+    #[test]
+    fn transcript_toggle_label_tracks_group_visibility() {
+        let mut state = RatatuiApp::new("toggle").initial_state();
+        state.transcript_groups = vec![TranscriptGroup {
+            id: "pending-step-1".to_owned(),
+            title: "Step 1".to_owned(),
+            subtitle: None,
+            expanded: false,
+            lines: vec![TranscriptLine {
+                role: "assistant".to_owned(),
+                text: "details".to_owned(),
+                author_label: None,
+            }],
+        }];
+
+        assert_eq!(
+            transcript_toggle_label(&state, PaneKind::Transcript),
+            Some("Ctrl+O show all")
+        );
+
+        state.transcript_groups[0].expanded = true;
+        assert_eq!(
+            transcript_toggle_label(&state, PaneKind::Transcript),
+            Some("Ctrl+O collapse")
+        );
+        assert_eq!(transcript_toggle_label(&state, PaneKind::Tasks), None);
     }
 
     #[test]
