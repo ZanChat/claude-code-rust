@@ -186,11 +186,16 @@ pub struct ChoiceListState {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TaskUiEntry {
+    pub id: String,
+    pub parent_id: Option<String>,
     pub title: String,
     pub kind: String,
     pub status: TaskStatus,
     pub input: Option<String>,
     pub output: Option<String>,
+    pub tree_prefix: String,
+    pub detail_prefix: String,
+    pub is_recent_completion: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -267,6 +272,7 @@ pub struct UiState {
     pub notifications: VecDeque<Notification>,
     pub permission_prompt: Option<PermissionPromptState>,
     pub progress_message: Option<String>,
+    pub progress_verb: Option<String>,
     pub task_items: Vec<TaskUiEntry>,
     pub question_items: Vec<QuestionUiEntry>,
     pub vim_state: vim::VimState,
@@ -1538,39 +1544,103 @@ fn scroll_pill_widget(transcript_scroll: u16) -> Option<Paragraph<'static>> {
     )
 }
 
-fn task_status_style(status: &TaskStatus) -> (&'static str, Style) {
-    match status {
-        TaskStatus::Pending => ("PEND", Style::default().fg(Color::DarkGray)),
+fn task_kind_label(kind: &str) -> Option<&str> {
+    match kind {
+        "" | "task" | "workflow" | "workflow_step" => None,
+        "assistant_worker" => Some("worker"),
+        "assistant_synthesis" => Some("synthesis"),
+        other => Some(other),
+    }
+}
+
+fn task_status_visual(task: &TaskUiEntry) -> (&'static str, Style, Style) {
+    match task.status {
+        TaskStatus::Pending => ("○", Style::default().fg(Color::DarkGray), Style::default()),
         TaskStatus::Running => (
-            "RUN ",
+            "●",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
+            Style::default().add_modifier(Modifier::BOLD),
         ),
         TaskStatus::WaitingForInput => (
-            "WAIT",
+            "◆",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        TaskStatus::Completed => (
-            "DONE",
+        TaskStatus::Completed if task.is_recent_completion => (
+            "✓",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Green),
+        ),
+        TaskStatus::Completed => (
+            "✓",
+            Style::default().fg(Color::Green),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
         ),
         TaskStatus::Failed => (
-            "FAIL",
+            "✕",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red),
         ),
-        TaskStatus::Cancelled => ("STOP", Style::default().fg(Color::Magenta)),
+        TaskStatus::Cancelled => (
+            "◌",
+            Style::default().fg(Color::Magenta),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
     }
 }
 
+fn task_header_line(task: &TaskUiEntry, render_as_root: bool) -> Line<'static> {
+    let (icon, icon_style, title_style) = task_status_visual(task);
+    let mut spans = Vec::new();
+
+    if !render_as_root && !task.tree_prefix.is_empty() {
+        spans.push(Span::styled(
+            task.tree_prefix.clone(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    spans.push(Span::styled(format!("{icon} "), icon_style));
+    spans.push(Span::styled(task.title.clone(), title_style));
+
+    if let Some(kind) = task_kind_label(&task.kind) {
+        spans.push(Span::styled(
+            format!("  [{kind}]"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    Line::from(spans)
+}
+
 fn indented_detail_lines(text: &str, indent: &str, style: Style) -> Vec<Line<'static>> {
-    text.split('\n')
-        .map(|line| Line::from(Span::styled(format!("{indent}{line}"), style)))
-        .collect()
+    let mut lines = Vec::new();
+    let mut detail_lines = text
+        .split('\n')
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty());
+
+    for line in detail_lines.by_ref().take(2) {
+        lines.push(Line::from(Span::styled(format!("{indent}{line}"), style)));
+    }
+
+    if detail_lines.next().is_some() {
+        lines.push(Line::from(Span::styled(format!("{indent}…"), style)));
+    }
+
+    lines
 }
 
 fn task_prefers_input(status: &TaskStatus) -> bool {
@@ -1581,11 +1651,65 @@ fn task_prefers_input(status: &TaskStatus) -> bool {
 }
 
 fn task_detail_text(task: &TaskUiEntry) -> Option<&str> {
-    if task_prefers_input(&task.status) {
+    let detail = if task_prefers_input(&task.status) {
         task.input.as_deref().or(task.output.as_deref())
     } else {
         task.output.as_deref().or(task.input.as_deref())
+    }?
+    .trim();
+
+    if detail.is_empty() || detail.eq_ignore_ascii_case(task.title.trim()) {
+        None
+    } else {
+        Some(detail)
     }
+}
+
+fn hidden_task_summary(tasks: &[TaskUiEntry]) -> Option<Line<'static>> {
+    if tasks.is_empty() {
+        return None;
+    }
+
+    let running = tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Running | TaskStatus::WaitingForInput
+            )
+        })
+        .count();
+    let pending = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Pending)
+        .count();
+    let completed = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Completed)
+        .count();
+    let failed = tasks
+        .iter()
+        .filter(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled))
+        .count();
+
+    let mut parts = Vec::new();
+    if running > 0 {
+        parts.push(format!("{running} active"));
+    }
+    if pending > 0 {
+        parts.push(format!("{pending} pending"));
+    }
+    if completed > 0 {
+        parts.push(format!("{completed} done"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} stopped"));
+    }
+
+    Some(Line::from(Span::styled(
+        format!("… +{}", parts.join(", ")),
+        Style::default().fg(Color::DarkGray),
+    )))
 }
 
 fn task_lines(state: &UiState, max_items: usize, detailed: bool) -> Vec<Line<'static>> {
@@ -1608,25 +1732,21 @@ fn task_lines(state: &UiState, max_items: usize, detailed: bool) -> Vec<Line<'st
     }
 
     for task in state.task_items.iter().take(max_items) {
-        let (badge, style) = task_status_style(&task.status);
-        lines.push(Line::from(vec![
-            Span::styled(format!("{badge} "), style),
-            Span::raw(task.title.clone()),
-            Span::styled(
-                format!("  [{}]", task.kind),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+        lines.push(task_header_line(task, false));
 
         if detailed {
             if let Some(detail) = task_detail_text(task) {
                 lines.extend(indented_detail_lines(
                     detail,
-                    "  ",
+                    &task.detail_prefix,
                     Style::default().fg(Color::DarkGray),
                 ));
             }
         }
+    }
+
+    if let Some(summary) = hidden_task_summary(state.task_items.get(max_items..).unwrap_or(&[])) {
+        lines.push(summary);
     }
 
     if detailed {
@@ -1650,6 +1770,78 @@ fn task_lines(state: &UiState, max_items: usize, detailed: bool) -> Vec<Line<'st
     }
 
     lines
+}
+
+fn progress_spinner_frame(tick: usize) -> &'static str {
+    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    FRAMES[tick % FRAMES.len()]
+}
+
+fn sanitize_progress_detail(detail: &str) -> &str {
+    let trimmed = detail.trim();
+    for prefix in ["- ", "\\ ", "| ", "/ "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.trim();
+        }
+    }
+    trimmed
+}
+
+fn spinner_headline(message: &str) -> String {
+    if message.ends_with('…') || message.ends_with("...") {
+        message.to_owned()
+    } else {
+        format!("{message}…")
+    }
+}
+
+fn progress_line(state: &UiState) -> Option<Line<'static>> {
+    if state.progress_message.is_none() && state.progress_verb.is_none() {
+        return None;
+    }
+
+    let detail = state
+        .progress_message
+        .as_deref()
+        .map(sanitize_progress_detail)
+        .filter(|detail| !detail.is_empty());
+    let verb = state
+        .progress_verb
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(detail)
+        .unwrap_or("Working");
+    let detail = state
+        .progress_verb
+        .as_deref()
+        .and(detail)
+        .filter(|detail| !detail.eq_ignore_ascii_case(verb));
+
+    let mut spans = vec![
+        Span::styled(
+            format!("{} ", progress_spinner_frame(state.status_marquee_tick)),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            spinner_headline(verb),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    if let Some(detail) = detail {
+        spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            detail.to_owned(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    Some(Line::from(spans))
 }
 
 fn permission_lines(state: &UiState) -> Vec<Line<'static>> {
@@ -1690,17 +1882,21 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
         ]));
     }
 
-    if let Some(progress) = &state.progress_message {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "live  ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(progress.clone()),
-        ]));
+    if let Some(progress) = progress_line(state) {
+        lines.push(progress);
     }
+
+    let active_task_ids = state
+        .task_items
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Running | TaskStatus::WaitingForInput
+            )
+        })
+        .map(|task| task.id.as_str())
+        .collect::<Vec<_>>();
 
     for task in state
         .task_items
@@ -1713,19 +1909,21 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
         })
         .take(5)
     {
-        let (badge, style) = task_status_style(&task.status);
-        lines.push(Line::from(vec![
-            Span::styled(format!("{badge} "), style),
-            Span::raw(task.title.clone()),
-            Span::styled(
-                format!("  [{}]", task.kind),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+        let render_as_root = task
+            .parent_id
+            .as_deref()
+            .map(|parent_id| !active_task_ids.contains(&parent_id))
+            .unwrap_or(true);
+
+        lines.push(task_header_line(task, render_as_root));
         if let Some(detail) = task_detail_text(task) {
             lines.extend(indented_detail_lines(
                 detail,
-                "  ",
+                if render_as_root {
+                    "  "
+                } else {
+                    &task.detail_prefix
+                },
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -2952,15 +3150,18 @@ pub fn render_to_string(state: &UiState, width: u16, height: u16) -> Result<Stri
 mod tests {
     use super::{
         footer_primary_text, input_prompt_line, mouse_action_for_position,
-        pane_shortcut_label_for_terminal, render_to_string, transcript_search_match_items,
-        transcript_search_scroll_for_view, transcript_selectable_lines_for_view,
-        transcript_selection_text_for_view, transcript_toggle_label, transcript_visual_lines,
-        ChoiceListItem, ChoiceListState, Notification, PaneKind, PermissionPromptState,
-        PromptSelectionState, RatatuiApp, StatusLevel, TranscriptGroup, TranscriptLine,
-        TranscriptMessageActionsState, TranscriptSearchState, TranscriptSelectionPoint,
-        TranscriptSelectionState, UiMouseAction,
+        pane_shortcut_label_for_terminal, progress_line, render_to_string, task_lines,
+        transcript_search_match_items, transcript_search_scroll_for_view,
+        transcript_selectable_lines_for_view, transcript_selection_text_for_view,
+        transcript_toggle_label, transcript_visual_lines, ChoiceListItem, ChoiceListState,
+        Notification, PaneKind, PermissionPromptState, PromptSelectionState, RatatuiApp,
+        StatusLevel, TaskUiEntry, TranscriptGroup, TranscriptLine, TranscriptMessageActionsState,
+        TranscriptSearchState, TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
     };
-    use code_agent_core::{compatibility_command_registry, ContentBlock, Message, MessageRole};
+    use code_agent_core::{
+        compatibility_command_registry, ContentBlock, Message, MessageRole, TaskStatus,
+    };
+    use ratatui::style::Color;
     use std::collections::BTreeMap;
 
     #[test]
@@ -3176,6 +3377,99 @@ mod tests {
         assert!(rendered.contains("queue"));
         assert!(rendered.contains("follow up with the failing test details"));
         assert!(rendered.contains("/tasks"));
+    }
+
+    #[test]
+    fn task_lines_render_tree_prefixes_and_hidden_summary() {
+        let mut state = RatatuiApp::new("task-tree").initial_state();
+        state.task_items = vec![
+            TaskUiEntry {
+                id: "root".to_owned(),
+                parent_id: None,
+                title: "Review workspace".to_owned(),
+                kind: "workflow".to_owned(),
+                status: TaskStatus::Running,
+                input: None,
+                output: None,
+                tree_prefix: String::new(),
+                detail_prefix: "  ".to_owned(),
+                is_recent_completion: false,
+            },
+            TaskUiEntry {
+                id: "child-1".to_owned(),
+                parent_id: Some("root".to_owned()),
+                title: "Inspect failing tests".to_owned(),
+                kind: "workflow_step".to_owned(),
+                status: TaskStatus::Running,
+                input: Some("Open the failing fixture".to_owned()),
+                output: None,
+                tree_prefix: "├─ ".to_owned(),
+                detail_prefix: "│    ".to_owned(),
+                is_recent_completion: false,
+            },
+            TaskUiEntry {
+                id: "child-2".to_owned(),
+                parent_id: Some("root".to_owned()),
+                title: "Summarize blockers".to_owned(),
+                kind: "workflow_step".to_owned(),
+                status: TaskStatus::Completed,
+                input: None,
+                output: Some("Missing integration fixture".to_owned()),
+                tree_prefix: "└─ ".to_owned(),
+                detail_prefix: "     ".to_owned(),
+                is_recent_completion: true,
+            },
+            TaskUiEntry {
+                id: "later".to_owned(),
+                parent_id: None,
+                title: "Follow up with maintainer".to_owned(),
+                kind: "task".to_owned(),
+                status: TaskStatus::Pending,
+                input: None,
+                output: None,
+                tree_prefix: String::new(),
+                detail_prefix: "  ".to_owned(),
+                is_recent_completion: false,
+            },
+        ];
+
+        let lines = task_lines(&state, 3, true);
+        let texts = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(texts.iter().any(|line| line == "● Review workspace"));
+        assert!(texts
+            .iter()
+            .any(|line| line == "├─ ● Inspect failing tests"));
+        assert!(texts
+            .iter()
+            .any(|line| line == "│    Open the failing fixture"));
+        assert!(texts.iter().any(|line| line == "└─ ✓ Summarize blockers"));
+        assert!(texts.iter().any(|line| line == "… +1 pending"));
+    }
+
+    #[test]
+    fn progress_line_uses_spinner_verb_and_styles() {
+        let mut state = RatatuiApp::new("spinner").initial_state();
+        state.progress_verb = Some("Crafting".to_owned());
+        state.progress_message = Some("/ Waiting for response".to_owned());
+        state.status_marquee_tick = 1;
+
+        let line = progress_line(&state).expect("progress line should exist");
+
+        assert_eq!(line.spans[0].content.as_ref(), "◓ ");
+        assert_eq!(line.spans[1].content.as_ref(), "Crafting…");
+        assert_eq!(line.spans[2].content.as_ref(), " · ");
+        assert_eq!(line.spans[3].content.as_ref(), "Waiting for response");
+        assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(line.spans[1].style.fg, Some(Color::Cyan));
     }
 
     #[test]

@@ -2,6 +2,8 @@ mod helpers;
 use helpers::*;
 mod commands;
 use commands::*;
+mod spinner_verbs;
+use spinner_verbs::sample_spinner_verb;
 mod startup;
 use startup::*;
 mod session;
@@ -66,7 +68,7 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 use reports::*;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::future::Future;
@@ -83,6 +85,7 @@ const UI_EVENT_TAG: &str = "ui_event";
 const UI_ROLE_ATTRIBUTE: &str = "ui_role";
 const UI_AUTHOR_ATTRIBUTE: &str = "ui_author";
 const REQUEST_INTERRUPTED_MESSAGE: &str = "[Request interrupted by user]";
+const RECENT_COMPLETED_TTL_MS: i64 = 30_000;
 
 fn should_exit_repl(prompt_text: &str) -> bool {
     matches!(prompt_text.trim(), "quit" | "exit" | "/quit" | "/exit")
@@ -439,25 +442,211 @@ fn compose_pending_progress_label(status_label: &str, status_detail: Option<&str
     }
 }
 
-fn task_ui_sort_rank(status: &TaskStatus) -> usize {
-    match status {
-        TaskStatus::Running => 0,
-        TaskStatus::WaitingForInput => 1,
-        TaskStatus::Pending => 2,
-        TaskStatus::Completed => 3,
-        TaskStatus::Failed => 4,
-        TaskStatus::Cancelled => 5,
+fn title_case_progress_label(label: &str) -> String {
+    let trimmed = label.trim();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => "Working".to_owned(),
     }
 }
 
-fn sorted_tasks_for_ui(mut tasks: Vec<TaskRecord>) -> Vec<TaskRecord> {
+fn pending_spinner_verb(progress_label: &str) -> String {
+    let trimmed = progress_label.trim();
+    if trimmed.eq_ignore_ascii_case("waiting for response") {
+        sample_spinner_verb().to_owned()
+    } else {
+        title_case_progress_label(trimmed)
+    }
+}
+
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn task_is_recent_completion(task: &TaskRecord, now_ms: i64) -> bool {
+    task.status == TaskStatus::Completed
+        && now_ms.saturating_sub(task.updated_at_unix_ms) <= RECENT_COMPLETED_TTL_MS
+}
+
+fn task_ui_sort_rank(task: &TaskRecord, now_ms: i64) -> usize {
+    if task_is_recent_completion(task, now_ms) {
+        return 0;
+    }
+
+    match task.status {
+        TaskStatus::Running => 1,
+        TaskStatus::WaitingForInput => 2,
+        TaskStatus::Pending => 3,
+        TaskStatus::Completed => 4,
+        TaskStatus::Failed => 5,
+        TaskStatus::Cancelled => 6,
+    }
+}
+
+fn sort_task_records_for_ui(tasks: &mut [TaskRecord], now_ms: i64) {
     tasks.sort_by(|left, right| {
-        task_ui_sort_rank(&left.status)
-            .cmp(&task_ui_sort_rank(&right.status))
+        task_ui_sort_rank(left, now_ms)
+            .cmp(&task_ui_sort_rank(right, now_ms))
             .then_with(|| right.updated_at_unix_ms.cmp(&left.updated_at_unix_ms))
+            .then_with(|| left.created_at_unix_ms.cmp(&right.created_at_unix_ms))
             .then_with(|| left.title.cmp(&right.title))
     });
-    tasks
+}
+
+fn task_tree_prefixes(
+    depth: usize,
+    ancestor_has_next: &[bool],
+    has_next: bool,
+) -> (String, String) {
+    if depth == 0 {
+        return (String::new(), "  ".to_owned());
+    }
+
+    let mut base = String::new();
+    for ancestor_has_more in ancestor_has_next {
+        base.push_str(if *ancestor_has_more { "│  " } else { "   " });
+    }
+
+    let branch = if has_next { "├─ " } else { "└─ " };
+    let detail = if has_next { "│    " } else { "     " };
+    (format!("{base}{branch}"), format!("{base}{detail}"))
+}
+
+fn flatten_task_ui_entries(
+    siblings: Vec<TaskRecord>,
+    children_by_parent: &mut BTreeMap<Uuid, Vec<TaskRecord>>,
+    depth: usize,
+    ancestor_has_next: &[bool],
+    now_ms: i64,
+    entries: &mut Vec<TaskUiEntry>,
+) {
+    let sibling_count = siblings.len();
+
+    for (index, task) in siblings.into_iter().enumerate() {
+        let has_next = index + 1 < sibling_count;
+        let (tree_prefix, detail_prefix) = task_tree_prefixes(depth, ancestor_has_next, has_next);
+        let task_id = task.id;
+        let is_recent_completion = task_is_recent_completion(&task, now_ms);
+
+        entries.push(TaskUiEntry {
+            id: task_id.to_string(),
+            parent_id: task.parent_task_id.map(|id| id.to_string()),
+            title: task.title,
+            kind: task.kind,
+            status: task.status,
+            input: task.input,
+            output: task.output,
+            tree_prefix,
+            detail_prefix,
+            is_recent_completion,
+        });
+
+        if let Some(mut children) = children_by_parent.remove(&task_id) {
+            sort_task_records_for_ui(&mut children, now_ms);
+
+            let next_ancestor_has_next = if depth == 0 {
+                ancestor_has_next.to_vec()
+            } else {
+                let mut values = ancestor_has_next.to_vec();
+                values.push(has_next);
+                values
+            };
+
+            flatten_task_ui_entries(
+                children,
+                children_by_parent,
+                depth + 1,
+                &next_ancestor_has_next,
+                now_ms,
+                entries,
+            );
+        }
+    }
+}
+
+fn task_entries_for_ui(tasks: Vec<TaskRecord>) -> Vec<TaskUiEntry> {
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+
+    let now_ms = current_time_ms();
+    let known_ids = tasks.iter().map(|task| task.id).collect::<BTreeSet<_>>();
+    let mut roots = Vec::new();
+    let mut children_by_parent = BTreeMap::<Uuid, Vec<TaskRecord>>::new();
+
+    for task in tasks {
+        if let Some(parent_id) = task
+            .parent_task_id
+            .filter(|parent_id| known_ids.contains(parent_id))
+        {
+            children_by_parent.entry(parent_id).or_default().push(task);
+        } else {
+            roots.push(task);
+        }
+    }
+
+    sort_task_records_for_ui(&mut roots, now_ms);
+    for children in children_by_parent.values_mut() {
+        sort_task_records_for_ui(children, now_ms);
+    }
+
+    let mut entries = Vec::new();
+    flatten_task_ui_entries(roots, &mut children_by_parent, 0, &[], now_ms, &mut entries);
+
+    if !children_by_parent.is_empty() {
+        let mut remaining = children_by_parent
+            .into_values()
+            .flatten()
+            .collect::<Vec<_>>();
+        sort_task_records_for_ui(&mut remaining, now_ms);
+        flatten_task_ui_entries(
+            remaining,
+            &mut BTreeMap::new(),
+            0,
+            &[],
+            now_ms,
+            &mut entries,
+        );
+    }
+
+    entries
+}
+
+fn preview_task_kind(kind: &str) -> Option<&str> {
+    match kind {
+        "" | "task" | "workflow" | "workflow_step" => None,
+        "assistant_worker" => Some("worker"),
+        "assistant_synthesis" => Some("synthesis"),
+        other => Some(other),
+    }
+}
+
+fn preview_task_icon(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "○",
+        TaskStatus::Running => "●",
+        TaskStatus::WaitingForInput => "◆",
+        TaskStatus::Completed => "✓",
+        TaskStatus::Failed => "✕",
+        TaskStatus::Cancelled => "◌",
+    }
+}
+
+fn task_preview_line(task: &TaskUiEntry) -> String {
+    let kind_suffix = preview_task_kind(&task.kind)
+        .map(|kind| format!("  [{kind}]"))
+        .unwrap_or_default();
+    format!(
+        "{}{} {}{}",
+        task.tree_prefix,
+        preview_task_icon(&task.status),
+        task.title,
+        kind_suffix
+    )
 }
 
 fn summarize_task_ui_event(task: &TaskRecord) -> String {
@@ -991,10 +1180,10 @@ fn recent_task_preview(cwd: &Path) -> PanePreview {
             lines: vec!["No task activity yet.".to_owned()],
         },
         Ok(tasks) => {
-            let lines = sorted_tasks_for_ui(tasks)
+            let lines = task_entries_for_ui(tasks)
                 .into_iter()
                 .take(6)
-                .map(|task| format!("{:?} {} [{}]", task.status, task.title, task.kind))
+                .map(|task| task_preview_line(&task))
                 .collect::<Vec<_>>();
             PanePreview {
                 title: "Tasks".to_owned(),
@@ -1027,17 +1216,7 @@ fn recent_question_preview(cwd: &Path) -> Option<PanePreview> {
 
 fn load_task_ui_data(cwd: &Path) -> (Vec<TaskUiEntry>, Vec<QuestionUiEntry>) {
     let store = task_store_for(cwd);
-    let tasks = sorted_tasks_for_ui(store.list_tasks().unwrap_or_default())
-        .into_iter()
-        .take(8)
-        .map(|task| TaskUiEntry {
-            title: task.title,
-            kind: task.kind,
-            status: task.status,
-            input: task.input,
-            output: task.output,
-        })
-        .collect::<Vec<_>>();
+    let tasks = task_entries_for_ui(store.list_tasks().unwrap_or_default());
 
     let questions = store
         .list_questions()
@@ -2208,6 +2387,7 @@ fn build_repl_ui_state(
     state.transcript_scroll = transcript_scroll;
     state.status_line = status_line.to_owned();
     state.progress_message = progress_message;
+    state.progress_verb = pending_view.map(|pending| pending.spinner_verb.clone());
     state.active_pane = Some(
         if interaction_state.transcript_mode
             || interaction_state.message_actions.is_some()
@@ -2397,6 +2577,7 @@ impl PendingReplStep {
 #[derive(Clone, Debug)]
 struct PendingReplView {
     messages: Vec<Message>,
+    spinner_verb: String,
     progress_label: String,
     steps: Vec<PendingReplStep>,
     queued_inputs: Vec<String>,
@@ -2404,9 +2585,11 @@ struct PendingReplView {
 
 impl PendingReplView {
     fn new(messages: Vec<Message>, progress_label: impl Into<String>) -> Self {
+        let progress_label = progress_label.into();
         Self {
             messages,
-            progress_label: progress_label.into(),
+            spinner_verb: pending_spinner_verb(&progress_label),
+            progress_label,
             steps: Vec::new(),
             queued_inputs: Vec::new(),
         }

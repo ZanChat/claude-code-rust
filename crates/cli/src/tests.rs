@@ -1,25 +1,28 @@
 use super::{
     build_repl_command_input_message, build_repl_command_output_message, build_repl_ui_state,
     build_resume_choice_list, build_startup_screens, build_startup_ui_state, build_text_message,
-    build_tool_result_message, choose_active_session, command_suggestions, delete_prompt_selection,
-    handle_prompt_mouse_action, handle_repl_slash_command, insert_prompt_text, is_paste_shortcut,
-    is_selection_copy_shortcut, message_action_copy_text, message_primary_input, message_text,
-    move_prompt_selection, navigate_prompt_history_down, navigate_prompt_history_up,
-    pane_from_shortcut, pane_from_shortcut_for_terminal, pending_interrupt_messages,
-    prompt_history_from_messages, prompt_selection_text, render_auth_command_with_resume,
-    render_remote_control_command, repl_shortcut_action_for_key, resolve_continue_target,
-    resolved_command_registry, resumable_sessions, resume_hint_text,
-    should_echo_command_result_in_footer, should_exit_repl, toggle_all_pending_repl_groups,
-    ActiveSessionStore, Cli, LocalBridgeHandler, Message, MessageRole, PendingReplStep,
-    PendingReplView, PromptSelectionMove, ReplInteractionState, ReplSessionState,
-    ReplShortcutAction, ResumePickerState, ResumeTargetHint, StartupPreferences,
+    build_tool_result_message, choose_active_session, command_suggestions, current_time_ms,
+    delete_prompt_selection, handle_prompt_mouse_action, handle_repl_slash_command,
+    insert_prompt_text, is_paste_shortcut, is_selection_copy_shortcut, message_action_copy_text,
+    message_primary_input, message_text, move_prompt_selection, navigate_prompt_history_down,
+    navigate_prompt_history_up, pane_from_shortcut, pane_from_shortcut_for_terminal,
+    pending_interrupt_messages, prompt_history_from_messages, prompt_selection_text,
+    render_auth_command_with_resume, render_remote_control_command, repl_shortcut_action_for_key,
+    resolve_continue_target, resolved_command_registry, resumable_sessions, resume_hint_text,
+    should_echo_command_result_in_footer, should_exit_repl, task_entries_for_ui,
+    toggle_all_pending_repl_groups, ActiveSessionStore, Cli, LocalBridgeHandler, Message,
+    MessageRole, PendingReplStep, PendingReplView, PromptSelectionMove, ReplInteractionState,
+    ReplSessionState, ReplShortcutAction, ResumePickerState, ResumeTargetHint, StartupPreferences,
 };
 use code_agent_bridge::{
     base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
     BridgeSessionHandler, RemoteEnvelope, RemotePermissionResponse, ResumeSessionRequest,
     VoiceFrame,
 };
-use code_agent_core::{compatibility_command_registry, CommandInvocation, ContentBlock, SessionId};
+use code_agent_core::{
+    compatibility_command_registry, CommandInvocation, ContentBlock, SessionId, TaskRecord,
+    TaskStatus,
+};
 use code_agent_providers::{
     ApiProvider, DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
 };
@@ -254,6 +257,50 @@ fn startup_ui_state_shows_prompt_and_scroll_state() {
         .header_context
         .as_deref()
         .is_some_and(|value| value.contains("/tmp/project")));
+}
+
+#[test]
+fn task_entries_for_ui_preserve_parent_child_structure() {
+    let now = current_time_ms();
+
+    let mut root = TaskRecord::new("workflow", "Review workspace");
+    root.status = TaskStatus::Running;
+    root.updated_at_unix_ms = now - 2_000;
+
+    let mut child_running = TaskRecord::new("workflow_step", "Inspect failing tests");
+    child_running.parent_task_id = Some(root.id);
+    child_running.status = TaskStatus::Running;
+    child_running.input = Some("Open the failing fixture".to_owned());
+    child_running.updated_at_unix_ms = now - 1_500;
+
+    let mut child_recent = TaskRecord::new("workflow_step", "Summarize blockers");
+    child_recent.parent_task_id = Some(root.id);
+    child_recent.status = TaskStatus::Completed;
+    child_recent.output = Some("Missing integration fixture".to_owned());
+    child_recent.updated_at_unix_ms = now - 500;
+
+    let mut follow_up = TaskRecord::new("task", "Follow up with maintainer");
+    follow_up.status = TaskStatus::Pending;
+    follow_up.updated_at_unix_ms = now - 10_000;
+
+    let root_id = root.id.to_string();
+    let entries = task_entries_for_ui(vec![follow_up, child_recent, root, child_running]);
+
+    assert_eq!(entries[0].title, "Review workspace");
+    assert_eq!(entries[0].tree_prefix, "");
+    assert_eq!(
+        entries.last().map(|entry| entry.title.as_str()),
+        Some("Follow up with maintainer")
+    );
+
+    let child_entries = entries
+        .iter()
+        .filter(|entry| entry.parent_id.as_deref() == Some(root_id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(child_entries.len(), 2);
+    assert_eq!(child_entries[0].tree_prefix, "├─ ");
+    assert_eq!(child_entries[1].tree_prefix, "└─ ");
+    assert!(child_entries.iter().any(|entry| entry.is_recent_completion));
 }
 
 #[test]
@@ -796,6 +843,7 @@ fn build_repl_ui_state_groups_pending_steps() {
     let messages = vec![user, assistant, tool];
     let pending_view = PendingReplView {
         messages: materialize_runtime_messages(&messages),
+        spinner_verb: "Running list_dir".to_owned(),
         progress_label: "running list_dir".to_owned(),
         steps: vec![PendingReplStep {
             step: 1,
@@ -853,6 +901,7 @@ fn pending_interrupt_messages_preserve_partial_preview_before_marker() {
     );
     let pending_view = PendingReplView {
         messages: vec![user.clone(), partial.clone()],
+        spinner_verb: "Working".to_owned(),
         progress_label: "Working".to_owned(),
         steps: Vec::new(),
         queued_inputs: Vec::new(),
@@ -873,6 +922,7 @@ fn pending_interrupt_messages_preserve_partial_preview_before_marker() {
 fn toggle_all_pending_repl_groups_switches_between_expanded_and_collapsed() {
     let pending_view = Arc::new(Mutex::new(PendingReplView {
         messages: Vec::new(),
+        spinner_verb: "Working".to_owned(),
         progress_label: "Working".to_owned(),
         steps: vec![
             PendingReplStep {
