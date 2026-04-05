@@ -1,15 +1,18 @@
 use super::{
     build_repl_command_input_message, build_repl_command_output_message, build_repl_ui_state,
     build_resume_choice_list, build_startup_screens, build_startup_ui_state, build_text_message,
-    build_tool_result_message, choose_active_session, command_suggestions,
-    handle_repl_slash_command, message_action_copy_text, message_primary_input, message_text,
-    navigate_prompt_history_down, navigate_prompt_history_up, pane_from_shortcut,
-    pending_interrupt_messages, prompt_history_from_messages, render_auth_command_with_resume,
-    render_remote_control_command, resolve_continue_target, resolved_command_registry,
-    resumable_sessions, resume_hint_text, should_echo_command_result_in_footer, should_exit_repl,
-    toggle_all_pending_repl_groups, ActiveSessionStore, Cli, LocalBridgeHandler, Message,
-    MessageRole, PendingReplStep, PendingReplView, ReplInteractionState, ReplSessionState,
-    ResumePickerState, ResumeTargetHint, StartupPreferences,
+    build_tool_result_message, choose_active_session, command_suggestions, delete_prompt_selection,
+    handle_prompt_mouse_action, handle_repl_slash_command, insert_prompt_text, is_paste_shortcut,
+    is_selection_copy_shortcut, message_action_copy_text, message_primary_input, message_text,
+    move_prompt_selection, navigate_prompt_history_down, navigate_prompt_history_up,
+    pane_from_shortcut, pane_from_shortcut_for_terminal, pending_interrupt_messages,
+    prompt_history_from_messages, prompt_selection_text, render_auth_command_with_resume,
+    render_remote_control_command, repl_shortcut_action_for_key, resolve_continue_target,
+    resolved_command_registry, resumable_sessions, resume_hint_text,
+    should_echo_command_result_in_footer, should_exit_repl, toggle_all_pending_repl_groups,
+    ActiveSessionStore, Cli, LocalBridgeHandler, Message, MessageRole, PendingReplStep,
+    PendingReplView, PromptSelectionMove, ReplInteractionState, ReplSessionState,
+    ReplShortcutAction, ResumePickerState, ResumeTargetHint, StartupPreferences,
 };
 use code_agent_bridge::{
     base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
@@ -22,8 +25,8 @@ use code_agent_providers::{
 };
 use code_agent_session::{materialize_runtime_messages, LocalSessionStore, SessionSummary};
 use code_agent_tools::compatibility_tool_registry;
-use code_agent_ui::{TranscriptSelectionPoint, TranscriptSelectionState};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use code_agent_ui::{PromptSelectionState, TranscriptSelectionPoint, TranscriptSelectionState};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 
 fn repl_session_state(session_id: SessionId) -> ReplSessionState {
     ReplSessionState {
@@ -299,6 +302,252 @@ fn pane_shortcut_accepts_supported_platform_modifiers() {
         pane_from_shortcut(&alt_shortcut),
         Some(code_agent_ui::PaneKind::Transcript)
     );
+
+    let shifted_control_shortcut = KeyEvent::new(
+        KeyCode::Char('1'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    assert!(pane_from_shortcut(&shifted_control_shortcut).is_none());
+}
+
+#[test]
+fn pane_shortcut_accepts_apple_terminal_option_symbols() {
+    assert_eq!(
+        pane_from_shortcut_for_terminal(
+            &KeyEvent::new(KeyCode::Char('¡'), KeyModifiers::NONE),
+            Some("Apple_Terminal")
+        ),
+        Some(code_agent_ui::PaneKind::Transcript)
+    );
+    assert_eq!(
+        pane_from_shortcut_for_terminal(
+            &KeyEvent::new(KeyCode::Char('™'), KeyModifiers::NONE),
+            Some("Apple_Terminal")
+        ),
+        Some(code_agent_ui::PaneKind::Diff)
+    );
+    assert_eq!(
+        pane_from_shortcut_for_terminal(
+            &KeyEvent::new(KeyCode::Char('£'), KeyModifiers::NONE),
+            Some("Apple_Terminal")
+        ),
+        Some(code_agent_ui::PaneKind::FileViewer)
+    );
+    assert_eq!(
+        pane_from_shortcut_for_terminal(
+            &KeyEvent::new(KeyCode::Char('¢'), KeyModifiers::NONE),
+            Some("Apple_Terminal")
+        ),
+        Some(code_agent_ui::PaneKind::Tasks)
+    );
+    assert_eq!(
+        pane_from_shortcut_for_terminal(
+            &KeyEvent::new(KeyCode::Char('∞'), KeyModifiers::NONE),
+            Some("Apple_Terminal")
+        ),
+        Some(code_agent_ui::PaneKind::Permissions)
+    );
+    assert_eq!(
+        pane_from_shortcut_for_terminal(
+            &KeyEvent::new(KeyCode::Char('§'), KeyModifiers::NONE),
+            Some("Apple_Terminal")
+        ),
+        Some(code_agent_ui::PaneKind::Logs)
+    );
+    assert!(pane_from_shortcut_for_terminal(
+        &KeyEvent::new(KeyCode::Char('¡'), KeyModifiers::NONE),
+        Some("vscode")
+    )
+    .is_none());
+}
+
+#[test]
+fn selection_copy_shortcut_matches_explicit_copy_bindings() {
+    let terminal_copy = KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    assert!(is_selection_copy_shortcut(&terminal_copy));
+
+    let kitty_copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+    assert!(is_selection_copy_shortcut(&kitty_copy));
+
+    let plain_ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert!(!is_selection_copy_shortcut(&plain_ctrl_c));
+}
+
+#[test]
+fn paste_shortcut_matches_expected_bindings() {
+    let super_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER);
+    assert!(is_paste_shortcut(&super_v));
+
+    let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+    assert!(is_paste_shortcut(&ctrl_v));
+
+    let shift_insert = KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT);
+    assert!(is_paste_shortcut(&shift_insert));
+
+    let plain_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+    assert!(!is_paste_shortcut(&plain_v));
+}
+
+#[test]
+fn repl_shortcut_routing_is_modifier_specific() {
+    let mut interaction_state = ReplInteractionState::default();
+
+    let ctrl_shift_c = KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    assert_eq!(
+        repl_shortcut_action_for_key(&ctrl_shift_c, &interaction_state),
+        None
+    );
+
+    interaction_state.transcript_selection = Some(TranscriptSelectionState {
+        anchor: TranscriptSelectionPoint {
+            line_index: 0,
+            column: 0,
+        },
+        focus: TranscriptSelectionPoint {
+            line_index: 0,
+            column: 1,
+        },
+    });
+    assert_eq!(
+        repl_shortcut_action_for_key(&ctrl_shift_c, &interaction_state),
+        Some(ReplShortcutAction::CopySelection)
+    );
+
+    interaction_state.transcript_selection = None;
+    interaction_state.prompt_selection = Some(PromptSelectionState {
+        anchor: 1,
+        focus: 3,
+    });
+    assert_eq!(
+        repl_shortcut_action_for_key(&ctrl_shift_c, &interaction_state),
+        Some(ReplShortcutAction::CopySelection)
+    );
+
+    interaction_state.transcript_mode = true;
+    interaction_state.transcript_search.open = true;
+    let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+    assert_eq!(
+        repl_shortcut_action_for_key(&ctrl_o, &interaction_state),
+        Some(ReplShortcutAction::ToggleTranscriptMode)
+    );
+}
+
+#[test]
+fn prompt_selection_extracts_selected_input_text() {
+    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    input_buffer.replace("abcdef");
+    input_buffer.cursor = 1;
+    let mut interaction_state = ReplInteractionState::default();
+
+    assert!(move_prompt_selection(
+        &mut interaction_state,
+        &mut input_buffer,
+        PromptSelectionMove::Right,
+    ));
+    assert!(move_prompt_selection(
+        &mut interaction_state,
+        &mut input_buffer,
+        PromptSelectionMove::Right,
+    ));
+
+    assert_eq!(
+        interaction_state.prompt_selection,
+        Some(PromptSelectionState {
+            anchor: 1,
+            focus: 3
+        })
+    );
+    assert_eq!(
+        prompt_selection_text(&input_buffer, &interaction_state).as_deref(),
+        Some("bc")
+    );
+}
+
+#[test]
+fn delete_prompt_selection_removes_selected_range() {
+    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    input_buffer.replace("abcdef");
+    let mut interaction_state = ReplInteractionState::default();
+    interaction_state.prompt_selection = Some(PromptSelectionState {
+        anchor: 2,
+        focus: 5,
+    });
+
+    assert!(delete_prompt_selection(
+        &mut interaction_state,
+        &mut input_buffer
+    ));
+
+    assert_eq!(input_buffer.as_str(), "abf");
+    assert_eq!(input_buffer.cursor, 2);
+    assert!(interaction_state.prompt_selection.is_none());
+}
+
+#[test]
+fn insert_prompt_text_replaces_selected_range() {
+    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    input_buffer.replace("abcdef");
+    let mut interaction_state = ReplInteractionState::default();
+    interaction_state.prompt_selection = Some(PromptSelectionState {
+        anchor: 1,
+        focus: 4,
+    });
+
+    assert!(insert_prompt_text(
+        &mut interaction_state,
+        &mut input_buffer,
+        "XYZ",
+    ));
+
+    assert_eq!(input_buffer.as_str(), "aXYZef");
+    assert_eq!(input_buffer.cursor, 4);
+    assert!(interaction_state.prompt_selection.is_none());
+}
+
+#[test]
+fn prompt_mouse_drag_updates_cursor_and_selection() {
+    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    input_buffer.replace("abcdef");
+    let mut interaction_state = ReplInteractionState::default();
+
+    assert!(handle_prompt_mouse_action(
+        &MouseEventKind::Down(MouseButton::Left),
+        1,
+        &mut interaction_state,
+        &mut input_buffer,
+    ));
+    assert_eq!(input_buffer.cursor, 1);
+    assert_eq!(interaction_state.prompt_mouse_anchor, Some(1));
+    assert!(interaction_state.prompt_selection.is_none());
+
+    assert!(handle_prompt_mouse_action(
+        &MouseEventKind::Drag(MouseButton::Left),
+        4,
+        &mut interaction_state,
+        &mut input_buffer,
+    ));
+    assert_eq!(input_buffer.cursor, 4);
+    assert_eq!(
+        interaction_state.prompt_selection,
+        Some(PromptSelectionState {
+            anchor: 1,
+            focus: 4,
+        })
+    );
+
+    assert!(!handle_prompt_mouse_action(
+        &MouseEventKind::Up(MouseButton::Left),
+        4,
+        &mut interaction_state,
+        &mut input_buffer,
+    ));
+    assert!(interaction_state.prompt_mouse_anchor.is_none());
 }
 
 #[test]
@@ -673,6 +922,8 @@ fn build_repl_ui_state_hides_prompt_in_transcript_mode() {
             ..Default::default()
         },
         message_actions: None,
+        prompt_selection: None,
+        prompt_mouse_anchor: None,
         transcript_selection: None,
     };
 

@@ -46,10 +46,10 @@ use code_agent_ui::{
     transcript_line_from_message, transcript_search_match_items, transcript_search_scroll_for_view,
     transcript_selectable_lines_for_view, transcript_selection_text_for_view,
     transcript_visual_scroll_for_view, ChoiceListItem, ChoiceListState, CommandPaletteEntry,
-    Notification, PaneKind, PanePreview, PermissionPromptState, QuestionUiEntry, RatatuiApp,
-    StatusLevel, TaskUiEntry, TranscriptGroup, TranscriptMessageActionsState,
-    TranscriptSearchState, TranscriptSelectableLine, TranscriptSelectionPoint,
-    TranscriptSelectionState, UiMouseAction, UiState,
+    Notification, PaneKind, PanePreview, PermissionPromptState, PromptSelectionState,
+    QuestionUiEntry, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup,
+    TranscriptMessageActionsState, TranscriptSearchState, TranscriptSelectableLine,
+    TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction, UiState,
 };
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
@@ -928,22 +928,59 @@ fn pane_from_digit(ch: char) -> Option<PaneKind> {
     Some(PaneKind::ALL[index - 1])
 }
 
-fn pane_shortcut_modifiers_for_terminal() -> KeyModifiers {
-    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER
+fn apple_terminal_option_digit(ch: char) -> Option<PaneKind> {
+    match ch {
+        '¡' => pane_from_digit('1'),
+        '™' => pane_from_digit('2'),
+        '£' => pane_from_digit('3'),
+        '¢' => pane_from_digit('4'),
+        '∞' => pane_from_digit('5'),
+        '§' => pane_from_digit('6'),
+        _ => None,
+    }
+}
+
+fn key_routing_modifiers(modifiers: KeyModifiers) -> KeyModifiers {
+    modifiers
+        & (KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
+fn key_matches_char_with_modifiers(key: &KeyEvent, ch: char, modifiers: KeyModifiers) -> bool {
+    matches!(key.code, KeyCode::Char(code) if code.to_ascii_lowercase() == ch)
+        && key_routing_modifiers(key.modifiers) == modifiers
+}
+
+fn is_plain_ctrl_char(key: &KeyEvent, ch: char) -> bool {
+    key_matches_char_with_modifiers(key, ch, KeyModifiers::CONTROL)
+}
+
+fn pane_from_shortcut_for_terminal(
+    key: &crossterm::event::KeyEvent,
+    term_program: Option<&str>,
+) -> Option<PaneKind> {
+    let modifiers = key_routing_modifiers(key.modifiers);
+    if modifiers == KeyModifiers::CONTROL
+        || modifiers == KeyModifiers::ALT
+        || modifiers == KeyModifiers::SUPER
+    {
+        return match key.code {
+            KeyCode::Char(ch) => pane_from_digit(ch),
+            _ => None,
+        };
+    }
+
+    if term_program == Some("Apple_Terminal") {
+        return match key.code {
+            KeyCode::Char(ch) => apple_terminal_option_digit(ch),
+            _ => None,
+        };
+    }
+
+    None
 }
 
 fn pane_from_shortcut(key: &crossterm::event::KeyEvent) -> Option<PaneKind> {
-    if !key
-        .modifiers
-        .intersects(pane_shortcut_modifiers_for_terminal())
-    {
-        return None;
-    }
-
-    match key.code {
-        KeyCode::Char(ch) => pane_from_digit(ch),
-        _ => None,
-    }
+    pane_from_shortcut_for_terminal(key, std::env::var("TERM_PROGRAM").ok().as_deref())
 }
 
 fn recent_task_preview(cwd: &Path) -> PanePreview {
@@ -1166,11 +1203,82 @@ struct ReplInteractionState {
     transcript_mode: bool,
     transcript_search: ReplTranscriptSearchState,
     message_actions: Option<ReplMessageActionState>,
+    prompt_selection: Option<PromptSelectionState>,
+    prompt_mouse_anchor: Option<usize>,
     transcript_selection: Option<TranscriptSelectionState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptSelectionMove {
+    Left,
+    Right,
+    LineStart,
+    LineEnd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplShortcutAction {
+    CopySelection,
+    ContextCtrlC,
+    ToggleTranscriptMode,
+    EnterMessageActions,
+    SelectPane(PaneKind),
+    RotatePaneForward,
+    RotatePaneBackward,
+}
+
+fn is_selection_copy_shortcut(key: &KeyEvent) -> bool {
+    key_matches_char_with_modifiers(key, 'c', KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        || key_matches_char_with_modifiers(key, 'c', KeyModifiers::SUPER)
+}
+
+fn repl_shortcut_action_for_key(
+    key: &KeyEvent,
+    interaction_state: &ReplInteractionState,
+) -> Option<ReplShortcutAction> {
+    if (interaction_state.transcript_selection.is_some()
+        || interaction_state.prompt_selection.is_some())
+        && is_selection_copy_shortcut(key)
+    {
+        return Some(ReplShortcutAction::CopySelection);
+    }
+
+    if is_plain_ctrl_char(key, 'c') {
+        return Some(ReplShortcutAction::ContextCtrlC);
+    }
+
+    if is_plain_ctrl_char(key, 'o') {
+        return Some(ReplShortcutAction::ToggleTranscriptMode);
+    }
+
+    if matches!(key.code, KeyCode::Up)
+        && key.modifiers == KeyModifiers::SHIFT
+        && interaction_state.message_actions.is_none()
+        && interaction_state.transcript_selection.is_none()
+        && !interaction_state.transcript_search.open
+    {
+        return Some(ReplShortcutAction::EnterMessageActions);
+    }
+
+    if interaction_state.transcript_mode {
+        return None;
+    }
+
+    if let Some(pane) = pane_from_shortcut(key) {
+        return Some(ReplShortcutAction::SelectPane(pane));
+    }
+
+    match key.code {
+        KeyCode::Tab => Some(ReplShortcutAction::RotatePaneForward),
+        KeyCode::BackTab => Some(ReplShortcutAction::RotatePaneBackward),
+        _ => None,
+    }
 }
 
 fn enter_transcript_mode(interaction_state: &mut ReplInteractionState, active_pane: &mut PaneKind) {
     interaction_state.transcript_mode = true;
+    interaction_state.prompt_selection = None;
+    interaction_state.prompt_mouse_anchor = None;
     *active_pane = PaneKind::Transcript;
 }
 
@@ -1178,6 +1286,8 @@ fn exit_transcript_mode(interaction_state: &mut ReplInteractionState) {
     interaction_state.transcript_mode = false;
     interaction_state.transcript_search.reset();
     interaction_state.message_actions = None;
+    interaction_state.prompt_selection = None;
+    interaction_state.prompt_mouse_anchor = None;
     interaction_state.transcript_selection = None;
 }
 
@@ -1348,6 +1458,8 @@ fn enter_message_actions(
     };
 
     interaction_state.transcript_search.reset();
+    interaction_state.prompt_selection = None;
+    interaction_state.prompt_mouse_anchor = None;
     interaction_state.transcript_selection = None;
     interaction_state.message_actions = Some(ReplMessageActionState {
         selected_item: item.item_index,
@@ -1664,6 +1776,220 @@ fn transcript_selection_copy_text(
         })
 }
 
+fn normalize_prompt_selection(
+    selection: &PromptSelectionState,
+    input_len: usize,
+) -> Option<(usize, usize)> {
+    let start = selection.anchor.min(selection.focus).min(input_len);
+    let end = selection.anchor.max(selection.focus).min(input_len);
+    (start < end).then_some((start, end))
+}
+
+fn clear_prompt_selection(interaction_state: &mut ReplInteractionState) {
+    interaction_state.prompt_selection = None;
+}
+
+fn clear_prompt_mouse_anchor(interaction_state: &mut ReplInteractionState) {
+    interaction_state.prompt_mouse_anchor = None;
+}
+
+fn is_paste_shortcut(key: &KeyEvent) -> bool {
+    key_matches_char_with_modifiers(key, 'v', KeyModifiers::SUPER)
+        || key_matches_char_with_modifiers(key, 'v', KeyModifiers::CONTROL)
+        || (matches!(key.code, KeyCode::Insert)
+            && key_routing_modifiers(key.modifiers) == KeyModifiers::SHIFT)
+}
+
+fn insert_buffer_text(input_buffer: &mut code_agent_ui::InputBuffer, text: &str) -> bool {
+    let mut inserted = false;
+    for ch in text.chars() {
+        input_buffer.push(ch);
+        inserted = true;
+    }
+    inserted
+}
+
+fn prompt_selection_move_for_key(key: &KeyEvent) -> Option<PromptSelectionMove> {
+    if key_routing_modifiers(key.modifiers) != KeyModifiers::SHIFT {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Left => Some(PromptSelectionMove::Left),
+        KeyCode::Right => Some(PromptSelectionMove::Right),
+        KeyCode::Home => Some(PromptSelectionMove::LineStart),
+        KeyCode::End => Some(PromptSelectionMove::LineEnd),
+        _ => None,
+    }
+}
+
+fn prompt_selection_text(
+    input_buffer: &code_agent_ui::InputBuffer,
+    interaction_state: &ReplInteractionState,
+) -> Option<String> {
+    let (start, end) = interaction_state
+        .prompt_selection
+        .as_ref()
+        .and_then(|selection| normalize_prompt_selection(selection, input_buffer.chars.len()))?;
+    Some(input_buffer.chars[start..end].iter().collect())
+}
+
+fn repl_selection_copy_text(
+    ui_state: &code_agent_ui::UiState,
+    terminal_width: u16,
+    input_buffer: &code_agent_ui::InputBuffer,
+    interaction_state: &ReplInteractionState,
+) -> Option<String> {
+    if interaction_state.transcript_selection.is_some() {
+        transcript_selection_copy_text(ui_state, terminal_width, interaction_state)
+    } else {
+        prompt_selection_text(input_buffer, interaction_state)
+    }
+}
+
+fn move_prompt_selection_focus(
+    input_buffer: &code_agent_ui::InputBuffer,
+    focus: usize,
+    selection_move: PromptSelectionMove,
+) -> Option<usize> {
+    match selection_move {
+        PromptSelectionMove::Left => focus.checked_sub(1),
+        PromptSelectionMove::Right => (focus < input_buffer.chars.len()).then_some(focus + 1),
+        PromptSelectionMove::LineStart => (focus > 0).then_some(0),
+        PromptSelectionMove::LineEnd => {
+            (focus < input_buffer.chars.len()).then_some(input_buffer.chars.len())
+        }
+    }
+}
+
+fn move_prompt_selection(
+    interaction_state: &mut ReplInteractionState,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    selection_move: PromptSelectionMove,
+) -> bool {
+    let anchor = interaction_state
+        .prompt_selection
+        .as_ref()
+        .map(|selection| selection.anchor)
+        .unwrap_or_else(|| input_buffer.cursor.min(input_buffer.chars.len()));
+    let focus = interaction_state
+        .prompt_selection
+        .as_ref()
+        .map(|selection| selection.focus)
+        .unwrap_or(anchor);
+    let Some(next_focus) = move_prompt_selection_focus(input_buffer, focus, selection_move) else {
+        return false;
+    };
+
+    input_buffer.cursor = next_focus;
+    if next_focus == anchor {
+        interaction_state.prompt_selection = None;
+    } else {
+        interaction_state.prompt_selection = Some(PromptSelectionState {
+            anchor,
+            focus: next_focus,
+        });
+    }
+    true
+}
+
+fn set_prompt_cursor(
+    interaction_state: &mut ReplInteractionState,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    cursor: usize,
+) -> bool {
+    let next_cursor = cursor.min(input_buffer.chars.len());
+    let changed =
+        input_buffer.cursor != next_cursor || interaction_state.prompt_selection.is_some();
+    input_buffer.cursor = next_cursor;
+    interaction_state.prompt_selection = None;
+    changed
+}
+
+fn insert_prompt_text(
+    interaction_state: &mut ReplInteractionState,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    text: &str,
+) -> bool {
+    let deleted = delete_prompt_selection(interaction_state, input_buffer);
+    let inserted = insert_buffer_text(input_buffer, text);
+    deleted || inserted
+}
+
+fn set_prompt_selection(
+    interaction_state: &mut ReplInteractionState,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    anchor: usize,
+    focus: usize,
+) -> bool {
+    let anchor = anchor.min(input_buffer.chars.len());
+    let focus = focus.min(input_buffer.chars.len());
+    let previous_cursor = input_buffer.cursor;
+    let previous_selection = interaction_state.prompt_selection.clone();
+    let had_message_actions = interaction_state.message_actions.take().is_some();
+    let had_transcript_selection = interaction_state.transcript_selection.take().is_some();
+
+    input_buffer.cursor = focus;
+    interaction_state.prompt_selection =
+        (anchor != focus).then_some(PromptSelectionState { anchor, focus });
+
+    previous_cursor != input_buffer.cursor
+        || previous_selection != interaction_state.prompt_selection
+        || had_message_actions
+        || had_transcript_selection
+}
+
+fn handle_prompt_mouse_action(
+    mouse_kind: &MouseEventKind,
+    cursor: usize,
+    interaction_state: &mut ReplInteractionState,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+) -> bool {
+    let cursor = cursor.min(input_buffer.chars.len());
+    match mouse_kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            interaction_state.prompt_mouse_anchor = Some(cursor);
+            let had_message_actions = interaction_state.message_actions.take().is_some();
+            let had_transcript_selection = interaction_state.transcript_selection.take().is_some();
+            had_message_actions
+                || had_transcript_selection
+                || set_prompt_cursor(interaction_state, input_buffer, cursor)
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let anchor = interaction_state
+                .prompt_mouse_anchor
+                .unwrap_or_else(|| input_buffer.cursor.min(input_buffer.chars.len()));
+            interaction_state.prompt_mouse_anchor = Some(anchor);
+            set_prompt_selection(interaction_state, input_buffer, anchor, cursor)
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let Some(anchor) = interaction_state.prompt_mouse_anchor.take() else {
+                return false;
+            };
+            set_prompt_selection(interaction_state, input_buffer, anchor, cursor)
+        }
+        _ => false,
+    }
+}
+
+fn delete_prompt_selection(
+    interaction_state: &mut ReplInteractionState,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+) -> bool {
+    let Some((start, end)) = interaction_state
+        .prompt_selection
+        .as_ref()
+        .and_then(|selection| normalize_prompt_selection(selection, input_buffer.chars.len()))
+    else {
+        return false;
+    };
+
+    input_buffer.chars.drain(start..end);
+    input_buffer.cursor = start;
+    interaction_state.prompt_selection = None;
+    true
+}
+
 fn primary_input_keys(tool_name: &str) -> &'static [&'static str] {
     match tool_name {
         "Read" | "Edit" | "Write" | "NotebookEdit" | "file_read" | "file_edit" | "file_write"
@@ -1897,6 +2223,7 @@ fn build_repl_ui_state(
         .transcript_mode
         .then(|| interaction_state.transcript_search.ui_state());
     state.message_actions = message_actions_ui_state(interaction_state, &message_action_items);
+    state.prompt_selection = interaction_state.prompt_selection.clone();
     state.transcript_selection = interaction_state.transcript_selection.clone();
     state.choice_list = choice_list;
     state.compact_banner = compact_banner;
@@ -2263,14 +2590,18 @@ where
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => {
+                        clear_prompt_mouse_anchor(interaction_state);
                         interaction_state.transcript_selection = None;
                         scroll_up(transcript_scroll, 3);
                     }
                     MouseEventKind::ScrollDown => {
+                        clear_prompt_mouse_anchor(interaction_state);
                         interaction_state.transcript_selection = None;
                         scroll_down(transcript_scroll, 3);
                     }
-                    MouseEventKind::Down(MouseButton::Left) => {
+                    MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left) => {
                         if let Some(action) = repl_mouse_action(
                             terminal,
                             registry,
@@ -2297,125 +2628,310 @@ where
                             interaction_state,
                         )? {
                             match action {
-                                UiMouseAction::JumpToBottom => {
+                                UiMouseAction::JumpToBottom
+                                    if matches!(
+                                        mouse.kind,
+                                        MouseEventKind::Down(MouseButton::Left)
+                                    ) =>
+                                {
+                                    clear_prompt_mouse_anchor(interaction_state);
                                     *transcript_scroll = 0;
                                 }
-                                UiMouseAction::ToggleTranscriptGroup(group_id) => {
+                                UiMouseAction::ToggleTranscriptGroup(group_id)
+                                    if matches!(
+                                        mouse.kind,
+                                        MouseEventKind::Down(MouseButton::Left)
+                                    ) =>
+                                {
+                                    clear_prompt_mouse_anchor(interaction_state);
                                     toggle_pending_repl_group(&pending_view, &group_id);
                                 }
+                                UiMouseAction::SetPromptCursor(cursor) => {
+                                    let _ = handle_prompt_mouse_action(
+                                        &mouse.kind,
+                                        cursor,
+                                        interaction_state,
+                                        input_buffer,
+                                    );
+                                }
+                                _ => {}
                             }
+                        } else if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                            clear_prompt_mouse_anchor(interaction_state);
                         }
                     }
                     _ => {}
                 },
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if matches!(key.code, KeyCode::Char('c'))
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        if interaction_state.transcript_search.open {
-                            cancel_transcript_search(
-                                &mut interaction_state.transcript_search,
-                                transcript_scroll,
-                            );
-                            continue;
-                        }
-                        if interaction_state.message_actions.is_some() {
-                            interaction_state.message_actions = None;
-                            continue;
-                        }
-                        if interaction_state.transcript_selection.is_some() {
-                            let app = RatatuiApp::new(format!("{provider}  {active_model}"));
-                            let state = build_repl_ui_state(
-                                &app,
-                                registry,
-                                &pending_snapshot.messages,
-                                Some(&pending_snapshot),
-                                cwd,
-                                provider,
-                                active_model,
-                                session_id,
-                                input_buffer,
-                                status_line,
-                                Some(format!(
-                                    "{} {}",
-                                    pending_spinner_frame(tick),
-                                    pending_snapshot.progress_label
-                                )),
-                                *active_pane,
-                                compact_banner.clone(),
-                                *transcript_scroll,
-                                None,
-                                command_suggestions(registry, input_buffer),
-                                *selected_command_suggestion,
-                                tick,
-                                interaction_state,
-                            );
-                            let size = terminal.size()?;
-                            if let Some(text) = transcript_selection_copy_text(
-                                &state,
-                                size.width,
-                                interaction_state,
-                            ) {
-                                compact_banner = Some(
-                                    copy_text_with_fallback_notice(&text, "selection")
-                                        .unwrap_or_else(|error| format!("Copy failed: {error}")),
-                                );
-                            }
-                            interaction_state.transcript_selection = None;
-                            continue;
-                        }
-                        if interaction_state.transcript_mode {
-                            exit_transcript_mode(interaction_state);
-                            continue;
-                        }
-                        return Ok(PendingReplOperationResult::Interrupted);
-                    }
-
-                    if matches!(key.code, KeyCode::Up)
-                        && key.modifiers == KeyModifiers::SHIFT
-                        && interaction_state.message_actions.is_none()
-                        && interaction_state.transcript_selection.is_none()
-                        && !interaction_state.transcript_search.open
-                    {
-                        let message_action_items = message_action_items_from_runtime(
+                Event::Paste(text) => {
+                    clear_prompt_mouse_anchor(interaction_state);
+                    if interaction_state.transcript_search.open {
+                        let input = &mut interaction_state.transcript_search.input_buffer;
+                        let _ = insert_buffer_text(input, &text);
+                        let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                        let state = build_repl_ui_state(
+                            &app,
+                            registry,
                             &pending_snapshot.messages,
                             Some(&pending_snapshot),
+                            cwd,
+                            provider,
+                            active_model,
+                            session_id,
+                            input_buffer,
+                            status_line,
+                            Some(format!(
+                                "{} {}",
+                                pending_spinner_frame(tick),
+                                pending_snapshot.progress_label
+                            )),
+                            *active_pane,
+                            compact_banner.clone(),
+                            *transcript_scroll,
+                            None,
+                            command_suggestions(registry, input_buffer),
+                            *selected_command_suggestion,
+                            tick,
+                            interaction_state,
                         );
-                        if enter_message_actions(interaction_state, &message_action_items) {
-                            let app = RatatuiApp::new(format!("{provider}  {active_model}"));
-                            let state = build_repl_ui_state(
-                                &app,
-                                registry,
-                                &pending_snapshot.messages,
-                                Some(&pending_snapshot),
-                                cwd,
-                                provider,
-                                active_model,
-                                session_id,
-                                input_buffer,
-                                status_line,
-                                Some(format!(
-                                    "{} {}",
-                                    pending_spinner_frame(tick),
-                                    pending_snapshot.progress_label
-                                )),
-                                *active_pane,
-                                compact_banner.clone(),
-                                *transcript_scroll,
-                                None,
-                                command_suggestions(registry, input_buffer),
-                                *selected_command_suggestion,
-                                tick,
-                                interaction_state,
-                            );
-                            let size = terminal.size()?;
-                            sync_message_action_preview(
-                                &state,
-                                size.width,
-                                size.height,
-                                interaction_state,
-                                transcript_scroll,
-                            );
+                        let size = terminal.size()?;
+                        sync_transcript_search_preview(
+                            &state,
+                            size.width,
+                            size.height,
+                            &mut interaction_state.transcript_search,
+                            transcript_scroll,
+                        );
+                    } else if !interaction_state.transcript_mode && vim_state.is_insert() {
+                        if insert_prompt_text(interaction_state, input_buffer, &text) {
+                            *selected_command_suggestion = 0;
+                        }
+                    }
+                }
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    clear_prompt_mouse_anchor(interaction_state);
+                    if is_paste_shortcut(&key) {
+                        if interaction_state.transcript_search.open {
+                            if let Some(text) = read_text_from_clipboard() {
+                                let input = &mut interaction_state.transcript_search.input_buffer;
+                                let _ = insert_buffer_text(input, &text);
+                                let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                                let state = build_repl_ui_state(
+                                    &app,
+                                    registry,
+                                    &pending_snapshot.messages,
+                                    Some(&pending_snapshot),
+                                    cwd,
+                                    provider,
+                                    active_model,
+                                    session_id,
+                                    input_buffer,
+                                    status_line,
+                                    Some(format!(
+                                        "{} {}",
+                                        pending_spinner_frame(tick),
+                                        pending_snapshot.progress_label
+                                    )),
+                                    *active_pane,
+                                    compact_banner.clone(),
+                                    *transcript_scroll,
+                                    None,
+                                    command_suggestions(registry, input_buffer),
+                                    *selected_command_suggestion,
+                                    tick,
+                                    interaction_state,
+                                );
+                                let size = terminal.size()?;
+                                sync_transcript_search_preview(
+                                    &state,
+                                    size.width,
+                                    size.height,
+                                    &mut interaction_state.transcript_search,
+                                    transcript_scroll,
+                                );
+                            }
+                            continue;
+                        }
+
+                        if !interaction_state.transcript_mode && vim_state.is_insert() {
+                            if let Some(text) = read_text_from_clipboard() {
+                                if insert_prompt_text(interaction_state, input_buffer, &text) {
+                                    *selected_command_suggestion = 0;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if let Some(shortcut) = repl_shortcut_action_for_key(&key, interaction_state) {
+                        match shortcut {
+                            ReplShortcutAction::CopySelection => {
+                                let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                                let state = build_repl_ui_state(
+                                    &app,
+                                    registry,
+                                    &pending_snapshot.messages,
+                                    Some(&pending_snapshot),
+                                    cwd,
+                                    provider,
+                                    active_model,
+                                    session_id,
+                                    input_buffer,
+                                    status_line,
+                                    Some(format!(
+                                        "{} {}",
+                                        pending_spinner_frame(tick),
+                                        pending_snapshot.progress_label
+                                    )),
+                                    *active_pane,
+                                    compact_banner.clone(),
+                                    *transcript_scroll,
+                                    None,
+                                    command_suggestions(registry, input_buffer),
+                                    *selected_command_suggestion,
+                                    tick,
+                                    interaction_state,
+                                );
+                                let size = terminal.size()?;
+                                if let Some(text) = repl_selection_copy_text(
+                                    &state,
+                                    size.width,
+                                    input_buffer,
+                                    interaction_state,
+                                ) {
+                                    compact_banner = Some(
+                                        copy_text_with_fallback_notice(&text, "selection")
+                                            .unwrap_or_else(|error| {
+                                                format!("Copy failed: {error}")
+                                            }),
+                                    );
+                                }
+                                clear_prompt_selection(interaction_state);
+                                interaction_state.transcript_selection = None;
+                            }
+                            ReplShortcutAction::ContextCtrlC => {
+                                if interaction_state.transcript_search.open {
+                                    cancel_transcript_search(
+                                        &mut interaction_state.transcript_search,
+                                        transcript_scroll,
+                                    );
+                                    continue;
+                                }
+                                if interaction_state.message_actions.is_some() {
+                                    interaction_state.message_actions = None;
+                                    continue;
+                                }
+                                if interaction_state.transcript_selection.is_some()
+                                    || interaction_state.prompt_selection.is_some()
+                                {
+                                    let app =
+                                        RatatuiApp::new(format!("{provider}  {active_model}"));
+                                    let state = build_repl_ui_state(
+                                        &app,
+                                        registry,
+                                        &pending_snapshot.messages,
+                                        Some(&pending_snapshot),
+                                        cwd,
+                                        provider,
+                                        active_model,
+                                        session_id,
+                                        input_buffer,
+                                        status_line,
+                                        Some(format!(
+                                            "{} {}",
+                                            pending_spinner_frame(tick),
+                                            pending_snapshot.progress_label
+                                        )),
+                                        *active_pane,
+                                        compact_banner.clone(),
+                                        *transcript_scroll,
+                                        None,
+                                        command_suggestions(registry, input_buffer),
+                                        *selected_command_suggestion,
+                                        tick,
+                                        interaction_state,
+                                    );
+                                    let size = terminal.size()?;
+                                    if let Some(text) = repl_selection_copy_text(
+                                        &state,
+                                        size.width,
+                                        input_buffer,
+                                        interaction_state,
+                                    ) {
+                                        compact_banner = Some(
+                                            copy_text_with_fallback_notice(&text, "selection")
+                                                .unwrap_or_else(|error| {
+                                                    format!("Copy failed: {error}")
+                                                }),
+                                        );
+                                    }
+                                    clear_prompt_selection(interaction_state);
+                                    interaction_state.transcript_selection = None;
+                                    continue;
+                                }
+                                if interaction_state.transcript_mode {
+                                    exit_transcript_mode(interaction_state);
+                                    continue;
+                                }
+                                return Ok(PendingReplOperationResult::Interrupted);
+                            }
+                            ReplShortcutAction::ToggleTranscriptMode => {
+                                if interaction_state.transcript_mode {
+                                    exit_transcript_mode(interaction_state);
+                                } else {
+                                    enter_transcript_mode(interaction_state, active_pane);
+                                }
+                            }
+                            ReplShortcutAction::EnterMessageActions => {
+                                let message_action_items = message_action_items_from_runtime(
+                                    &pending_snapshot.messages,
+                                    Some(&pending_snapshot),
+                                );
+                                if enter_message_actions(interaction_state, &message_action_items) {
+                                    let app =
+                                        RatatuiApp::new(format!("{provider}  {active_model}"));
+                                    let state = build_repl_ui_state(
+                                        &app,
+                                        registry,
+                                        &pending_snapshot.messages,
+                                        Some(&pending_snapshot),
+                                        cwd,
+                                        provider,
+                                        active_model,
+                                        session_id,
+                                        input_buffer,
+                                        status_line,
+                                        Some(format!(
+                                            "{} {}",
+                                            pending_spinner_frame(tick),
+                                            pending_snapshot.progress_label
+                                        )),
+                                        *active_pane,
+                                        compact_banner.clone(),
+                                        *transcript_scroll,
+                                        None,
+                                        command_suggestions(registry, input_buffer),
+                                        *selected_command_suggestion,
+                                        tick,
+                                        interaction_state,
+                                    );
+                                    let size = terminal.size()?;
+                                    sync_message_action_preview(
+                                        &state,
+                                        size.width,
+                                        size.height,
+                                        interaction_state,
+                                        transcript_scroll,
+                                    );
+                                }
+                            }
+                            ReplShortcutAction::SelectPane(pane) => {
+                                *active_pane = pane;
+                            }
+                            ReplShortcutAction::RotatePaneForward => {
+                                *active_pane = rotate_pane(*active_pane, true);
+                            }
+                            ReplShortcutAction::RotatePaneBackward => {
+                                *active_pane = rotate_pane(*active_pane, false);
+                            }
                         }
                         continue;
                     }
@@ -2450,6 +2966,7 @@ where
                                     prompt_text.filter(|text| !text.trim().is_empty())
                                 {
                                     input_buffer.replace(prompt_text);
+                                    clear_prompt_selection(interaction_state);
                                     interaction_state.message_actions = None;
                                     if interaction_state.transcript_mode {
                                         exit_transcript_mode(interaction_state);
@@ -2587,9 +3104,7 @@ where
 
                         continue;
                     }
-                    if matches!(key.code, KeyCode::Char('e'))
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
+                    if is_plain_ctrl_char(&key, 'e') {
                         toggle_all_pending_repl_groups(&pending_view);
                         continue;
                     }
@@ -2799,13 +3314,6 @@ where
                             }
                         }
 
-                        if matches!(key.code, KeyCode::Char('o'))
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            exit_transcript_mode(interaction_state);
-                            continue;
-                        }
-
                         match key.code {
                             KeyCode::Esc => {
                                 exit_transcript_mode(interaction_state);
@@ -2911,16 +3419,24 @@ where
                         continue;
                     }
 
-                    if matches!(key.code, KeyCode::Char('o'))
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    if vim_state.is_insert() {
+                        if let Some(selection_move) = prompt_selection_move_for_key(&key) {
+                            let _ = move_prompt_selection(
+                                interaction_state,
+                                input_buffer,
+                                selection_move,
+                            );
+                            continue;
+                        }
+                    }
+
+                    if interaction_state.prompt_selection.is_some()
+                        && matches!(key.code, KeyCode::Esc)
                     {
-                        enter_transcript_mode(interaction_state, active_pane);
+                        clear_prompt_selection(interaction_state);
                         continue;
                     }
-                    if let Some(pane) = pane_from_shortcut(&key) {
-                        *active_pane = pane;
-                        continue;
-                    }
+
                     match key.code {
                         KeyCode::Esc if vim_state.enabled => {
                             if matches!(vim_state.mode, code_agent_ui::vim::VimMode::Insert) {
@@ -2931,9 +3447,8 @@ where
                                 );
                             }
                         }
-                        KeyCode::Tab => *active_pane = rotate_pane(*active_pane, true),
-                        KeyCode::BackTab => *active_pane = rotate_pane(*active_pane, false),
                         KeyCode::Up => {
+                            clear_prompt_selection(interaction_state);
                             let suggestions = sync_command_selection(
                                 registry,
                                 input_buffer,
@@ -2951,6 +3466,7 @@ where
                             }
                         }
                         KeyCode::Down => {
+                            clear_prompt_selection(interaction_state);
                             let suggestions = sync_command_selection(
                                 registry,
                                 input_buffer,
@@ -2965,17 +3481,50 @@ where
                         }
                         KeyCode::PageUp => scroll_up(transcript_scroll, 5),
                         KeyCode::PageDown => scroll_down(transcript_scroll, 5),
+                        KeyCode::Home if vim_state.is_insert() => {
+                            let _ = set_prompt_cursor(interaction_state, input_buffer, 0);
+                        }
+                        KeyCode::End if vim_state.is_insert() => {
+                            let end_cursor = input_buffer.chars.len();
+                            let _ = set_prompt_cursor(interaction_state, input_buffer, end_cursor);
+                        }
                         KeyCode::Home => *transcript_scroll = u16::MAX,
                         KeyCode::End => *transcript_scroll = 0,
                         KeyCode::Left if vim_state.is_insert() => {
-                            input_buffer.cursor = input_buffer.cursor.saturating_sub(1);
+                            if let Some((start, _)) = interaction_state
+                                .prompt_selection
+                                .as_ref()
+                                .and_then(|selection| {
+                                    normalize_prompt_selection(selection, input_buffer.chars.len())
+                                })
+                            {
+                                let _ = set_prompt_cursor(interaction_state, input_buffer, start);
+                            } else {
+                                let next_cursor = input_buffer.cursor.saturating_sub(1);
+                                let _ =
+                                    set_prompt_cursor(interaction_state, input_buffer, next_cursor);
+                            }
                         }
                         KeyCode::Right if vim_state.is_insert() => {
-                            input_buffer.cursor =
-                                (input_buffer.cursor + 1).min(input_buffer.chars.len());
+                            if let Some((_, end)) = interaction_state
+                                .prompt_selection
+                                .as_ref()
+                                .and_then(|selection| {
+                                    normalize_prompt_selection(selection, input_buffer.chars.len())
+                                })
+                            {
+                                let _ = set_prompt_cursor(interaction_state, input_buffer, end);
+                            } else {
+                                let next_cursor =
+                                    (input_buffer.cursor + 1).min(input_buffer.chars.len());
+                                let _ =
+                                    set_prompt_cursor(interaction_state, input_buffer, next_cursor);
+                            }
                         }
                         KeyCode::Backspace if vim_state.is_insert() => {
-                            input_buffer.pop();
+                            if !delete_prompt_selection(interaction_state, input_buffer) {
+                                input_buffer.pop();
+                            }
                             *selected_command_suggestion = 0;
                         }
                         KeyCode::Char(ch)
@@ -2983,6 +3532,7 @@ where
                                 && (key.modifiers.is_empty()
                                     || key.modifiers == KeyModifiers::SHIFT) =>
                         {
+                            let _ = delete_prompt_selection(interaction_state, input_buffer);
                             input_buffer.push(ch);
                             *selected_command_suggestion = 0;
                         }
@@ -3002,11 +3552,13 @@ where
                                     && !prompt_text.contains(char::is_whitespace)
                                     && prompt_text != selected_name
                                 {
+                                    clear_prompt_selection(interaction_state);
                                     apply_selected_command(input_buffer, selected);
                                     continue;
                                 }
                             }
                             queue_pending_repl_input(&pending_view, prompt_text);
+                            clear_prompt_selection(interaction_state);
                             input_buffer.clear();
                             *selected_command_suggestion = 0;
                         }

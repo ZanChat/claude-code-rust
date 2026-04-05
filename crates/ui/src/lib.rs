@@ -145,6 +145,7 @@ pub struct TranscriptGroup {
 pub enum UiMouseAction {
     JumpToBottom,
     ToggleTranscriptGroup(String),
+    SetPromptCursor(usize),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -226,6 +227,12 @@ pub struct TranscriptSelectionState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PromptSelectionState {
+    pub anchor: usize,
+    pub focus: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TranscriptSelectableLine {
     pub item_index: usize,
     pub line_index: usize,
@@ -250,6 +257,7 @@ pub struct UiState {
     pub transcript_mode: bool,
     pub transcript_search: Option<TranscriptSearchState>,
     pub message_actions: Option<TranscriptMessageActionsState>,
+    pub prompt_selection: Option<PromptSelectionState>,
     pub transcript_selection: Option<TranscriptSelectionState>,
     pub command_palette: Vec<CommandPaletteEntry>,
     pub command_suggestions: Vec<CommandPaletteEntry>,
@@ -541,12 +549,22 @@ fn overlay_kind(state: &UiState) -> Option<OverlayKind> {
     }
 }
 
-fn pane_shortcut_label() -> &'static str {
+fn pane_shortcut_label_for_terminal(term_program: Option<&str>) -> &'static str {
     if cfg!(target_os = "macos") {
-        "Cmd/Ctrl+1-6"
+        if term_program == Some("vscode") {
+            "Ctrl/Alt+1-6"
+        } else if term_program == Some("Apple_Terminal") {
+            "Alt+1-6"
+        } else {
+            "Cmd/Ctrl/Alt+1-6"
+        }
     } else {
-        "Ctrl+1-6"
+        "Ctrl/Alt+1-6"
     }
+}
+
+fn pane_shortcut_label() -> &'static str {
+    pane_shortcut_label_for_terminal(std::env::var("TERM_PROGRAM").ok().as_deref())
 }
 
 fn transcript_toggle_label(state: &UiState, active_pane: PaneKind) -> Option<&'static str> {
@@ -959,6 +977,15 @@ fn selection_range_for_line(
     (range_start < range_end).then_some((range_start, range_end))
 }
 
+fn prompt_selection_range(
+    selection: &PromptSelectionState,
+    input_len: usize,
+) -> Option<(usize, usize)> {
+    let start = selection.anchor.min(selection.focus).min(input_len);
+    let end = selection.anchor.max(selection.focus).min(input_len);
+    (start < end).then_some((start, end))
+}
+
 fn highlight_transcript_render_line(
     state: &UiState,
     render_line: &TranscriptRenderLine,
@@ -1045,10 +1072,21 @@ fn group_header_lines(group: &TranscriptGroup, width: u16) -> Vec<Line<'static>>
     lines
 }
 
-fn empty_transcript_render_lines(
-    width: u16,
-    command_palette: &[CommandPaletteEntry],
-) -> Vec<TranscriptRenderLine> {
+fn empty_transcript_render_lines(state: &UiState, width: u16) -> Vec<TranscriptRenderLine> {
+    if !state.input_buffer.is_empty()
+        || !state.queued_inputs.is_empty()
+        || state.progress_message.is_some()
+    {
+        return vec![regular_render_line(
+            Line::from(Span::styled(
+                "Transcript",
+                Style::default().fg(Color::DarkGray),
+            )),
+            None,
+            "Transcript",
+        )];
+    }
+
     let mut lines = vec![
         regular_render_line(
             Line::from(Span::styled(
@@ -1067,9 +1105,9 @@ fn empty_transcript_render_lines(
             "Type a prompt below or start with / to browse commands.",
         ),
     ];
-    if !command_palette.is_empty() {
+    if !state.command_palette.is_empty() {
         lines.push(regular_render_line(Line::from(""), None, ""));
-        for entry in command_palette.iter().take(4) {
+        for entry in state.command_palette.iter().take(4) {
             let combined = format!("{}  {}", entry.name, entry.description);
             for segment in wrap_plain_text(&combined, width.max(1) as usize) {
                 lines.push(regular_render_line(
@@ -1085,7 +1123,7 @@ fn empty_transcript_render_lines(
 
 fn transcript_visual_lines(state: &UiState, width: u16) -> Vec<TranscriptRenderLine> {
     if state.transcript_lines.is_empty() && state.transcript_groups.is_empty() {
-        return empty_transcript_render_lines(width, &state.command_palette);
+        return empty_transcript_render_lines(state, width);
     }
 
     let mut lines = Vec::new();
@@ -2101,8 +2139,35 @@ fn footer_widget(
 
 fn input_prompt_line(state: &UiState) -> Line<'static> {
     let text = state.input_buffer.as_str();
+    let text_len = text.chars().count();
+
+    if let Some((start, end)) = state
+        .prompt_selection
+        .as_ref()
+        .and_then(|selection| prompt_selection_range(selection, text_len))
+    {
+        let left = text.chars().take(start).collect::<String>();
+        let selected = text
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect::<String>();
+        let right = text.chars().skip(end).collect::<String>();
+        let mut spans = vec![Span::raw("> ")];
+        if !left.is_empty() {
+            spans.push(Span::raw(left));
+        }
+        if !selected.is_empty() {
+            spans.push(Span::styled(selected, selection_highlight_style()));
+        }
+        if !right.is_empty() {
+            spans.push(Span::raw(right));
+        }
+        return Line::from(spans);
+    }
+
     let pos = state.input_buffer.cursor.min(text.chars().count());
-    if pos < text.chars().count() {
+    if pos < text_len {
         let left = text.chars().take(pos).collect::<String>();
         let cursor_char = text.chars().skip(pos).take(1).collect::<String>();
         let right = text.chars().skip(pos + 1).collect::<String>();
@@ -2448,6 +2513,51 @@ fn point_in_rect(column: u16, row: u16, rect: Rect) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
+fn prompt_cursor_action_for_position(
+    state: &UiState,
+    prompt_area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<UiMouseAction> {
+    if !state.show_input || prompt_area.width == 0 || prompt_area.height <= 2 {
+        return None;
+    }
+
+    let prompt_inner = Rect::new(
+        prompt_area.x,
+        prompt_area.y.saturating_add(1),
+        prompt_area.width,
+        prompt_area.height.saturating_sub(2),
+    );
+    if !point_in_rect(column, row, prompt_inner) {
+        return None;
+    }
+
+    let prompt_text = format!("> {}", state.input_buffer.as_str());
+    let wrapped = wrap_plain_text(
+        &prompt_text,
+        prompt_area.width.saturating_sub(2).max(1) as usize,
+    );
+    let local_row = row.saturating_sub(prompt_inner.y) as usize;
+    let prompt_index = if let Some(line) = wrapped.get(local_row) {
+        let prefix = wrapped
+            .iter()
+            .take(local_row)
+            .map(|segment| segment.chars().count())
+            .sum::<usize>();
+        let local_column = column.saturating_sub(prompt_inner.x) as usize;
+        prefix + local_column.min(line.chars().count())
+    } else {
+        prompt_text.chars().count()
+    };
+
+    Some(UiMouseAction::SetPromptCursor(
+        prompt_index
+            .saturating_sub(2)
+            .min(state.input_buffer.chars.len()),
+    ))
+}
+
 pub fn mouse_action_for_position(
     state: &UiState,
     width: u16,
@@ -2579,6 +2689,12 @@ pub fn mouse_action_for_position(
         );
         if point_in_rect(column, row, pill_area) {
             return Some(UiMouseAction::JumpToBottom);
+        }
+    }
+    if state.show_input {
+        let input_area = vertical[4];
+        if let Some(action) = prompt_cursor_action_for_position(state, input_area, column, row) {
+            return Some(action);
         }
     }
     if !point_in_rect(column, row, body_layout.transcript_area) {
@@ -2835,13 +2951,14 @@ pub fn render_to_string(state: &UiState, width: u16, height: u16) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        footer_primary_text, mouse_action_for_position, pane_shortcut_label, render_to_string,
-        transcript_search_match_items, transcript_search_scroll_for_view,
-        transcript_selectable_lines_for_view, transcript_selection_text_for_view,
-        transcript_toggle_label, transcript_visual_lines, ChoiceListItem, ChoiceListState,
-        Notification, PaneKind, PermissionPromptState, RatatuiApp, StatusLevel, TranscriptGroup,
-        TranscriptLine, TranscriptMessageActionsState, TranscriptSearchState,
-        TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
+        footer_primary_text, input_prompt_line, mouse_action_for_position,
+        pane_shortcut_label_for_terminal, render_to_string, transcript_search_match_items,
+        transcript_search_scroll_for_view, transcript_selectable_lines_for_view,
+        transcript_selection_text_for_view, transcript_toggle_label, transcript_visual_lines,
+        ChoiceListItem, ChoiceListState, Notification, PaneKind, PermissionPromptState,
+        PromptSelectionState, RatatuiApp, StatusLevel, TranscriptGroup, TranscriptLine,
+        TranscriptMessageActionsState, TranscriptSearchState, TranscriptSelectionPoint,
+        TranscriptSelectionState, UiMouseAction,
     };
     use code_agent_core::{compatibility_command_registry, ContentBlock, Message, MessageRole};
     use std::collections::BTreeMap;
@@ -2943,12 +3060,23 @@ mod tests {
     #[test]
     fn pane_shortcut_label_matches_supported_shortcuts() {
         let expected = if cfg!(target_os = "macos") {
-            "Cmd/Ctrl+1-6"
+            "Cmd/Ctrl/Alt+1-6"
         } else {
-            "Ctrl+1-6"
+            "Ctrl/Alt+1-6"
         };
 
-        assert_eq!(pane_shortcut_label(), expected);
+        assert_eq!(pane_shortcut_label_for_terminal(None), expected);
+
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                pane_shortcut_label_for_terminal(Some("vscode")),
+                "Ctrl/Alt+1-6"
+            );
+            assert_eq!(
+                pane_shortcut_label_for_terminal(Some("Apple_Terminal")),
+                "Alt+1-6"
+            );
+        }
     }
 
     #[test]
@@ -3009,6 +3137,21 @@ mod tests {
 
         assert!(rendered.contains("/help"));
         assert!(rendered.contains("/hooks"));
+    }
+
+    #[test]
+    fn hides_transcript_empty_state_while_typing_prompt() {
+        let app = RatatuiApp::new("typing");
+        let mut state = app.state_from_messages(vec![], &compatibility_command_registry().all());
+        state.show_input = true;
+        state.input_buffer.replace("hello world");
+
+        let rendered = render_to_string(&state, 100, 24).unwrap();
+
+        assert!(!rendered.contains("Start a conversation"));
+        assert!(!rendered.contains("Type a prompt below or start with /"));
+        assert!(rendered.contains("Transcript"));
+        assert!(rendered.contains("hello world"));
     }
 
     #[test]
@@ -3212,6 +3355,28 @@ mod tests {
     }
 
     #[test]
+    fn prompt_mouse_hit_testing_reports_cursor_targets() {
+        let mut state = RatatuiApp::new("prompt-mouse").initial_state();
+        state.show_input = true;
+        state.input_buffer.replace("abcdef");
+
+        let mut saw_start = false;
+        let mut saw_middle = false;
+        for row in 0..24 {
+            for column in 0..80 {
+                match mouse_action_for_position(&state, 80, 24, column, row) {
+                    Some(UiMouseAction::SetPromptCursor(0)) => saw_start = true,
+                    Some(UiMouseAction::SetPromptCursor(3)) => saw_middle = true,
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(saw_start);
+        assert!(saw_middle);
+    }
+
+    #[test]
     fn renders_long_backend_error_in_prompt() {
         let mut state = RatatuiApp::new("error").initial_state();
         state.show_input = true;
@@ -3350,6 +3515,23 @@ mod tests {
         let lines = transcript_visual_lines(&state, 80);
 
         assert!(lines[0].line.spans.iter().any(|span| {
+            span.content.as_ref() == "bcd" && span.style.bg == Some(super::Color::Yellow)
+        }));
+    }
+
+    #[test]
+    fn prompt_selection_highlights_exact_range() {
+        let mut state = RatatuiApp::new("prompt-selection").initial_state();
+        state.show_input = true;
+        state.input_buffer.replace("abcdef");
+        state.prompt_selection = Some(PromptSelectionState {
+            anchor: 1,
+            focus: 4,
+        });
+
+        let line = input_prompt_line(&state);
+
+        assert!(line.spans.iter().any(|span| {
             span.content.as_ref() == "bcd" && span.style.bg == Some(super::Color::Yellow)
         }));
     }
