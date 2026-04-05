@@ -545,6 +545,42 @@ fn prompt_mouse_hit_testing_reports_cursor_targets() {
 }
 
 #[test]
+fn transcript_item_history_group_arrow_has_click_target() {
+    let mut state = RatatuiApp::new("history-arrow-hit").initial_state();
+    state.transcript_items = vec![TranscriptItem::Group(TranscriptGroup {
+        id: "history-group-1".to_owned(),
+        title: "Read 2 files".to_owned(),
+        subtitle: Some("3 messages · src/lib.rs".to_owned()),
+        expanded: false,
+        single_item: true,
+        lines: vec![TranscriptLine {
+            role: "history_tool_call".to_owned(),
+            text: "Read src/lib.rs".to_owned(),
+            author_label: None,
+        }],
+    })];
+
+    let mut saw_toggle = false;
+    for row in 0..24 {
+        for column in 0..80 {
+            if mouse_action_for_position(&state, 80, 24, column, row)
+                == Some(UiMouseAction::ToggleTranscriptGroup(
+                    "history-group-1".to_owned(),
+                ))
+            {
+                saw_toggle = true;
+                break;
+            }
+        }
+        if saw_toggle {
+            break;
+        }
+    }
+
+    assert!(saw_toggle);
+}
+
+#[test]
 fn choice_list_renders_label_and_detail_inline() {
     let mut state = RatatuiApp::new("choice-list-inline").initial_state();
     state.choice_list = Some(ChoiceListState {

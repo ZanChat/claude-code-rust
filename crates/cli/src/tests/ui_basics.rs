@@ -211,6 +211,62 @@ fn command_suggestions_stop_after_command_arguments_start() {
 }
 
 #[test]
+fn prompt_up_prioritizes_command_suggestions_before_history() {
+    let registry = compatibility_command_registry();
+    let mut input = code_agent_ui::InputBuffer::new();
+    input.replace("/m");
+    let history = vec!["older prompt".to_owned()];
+    let mut selected_command_suggestion = 0usize;
+    let mut history_index = None;
+    let mut history_draft = None;
+
+    let suggestions = command_suggestions(&registry, &input);
+    assert!(suggestions.len() > 1);
+
+    navigate_prompt_input_up(
+        &registry,
+        &mut input,
+        &mut selected_command_suggestion,
+        &history,
+        &mut history_index,
+        &mut history_draft,
+    );
+
+    assert_eq!(input.as_str(), "/m");
+    assert_eq!(selected_command_suggestion, suggestions.len() - 1);
+    assert!(history_index.is_none());
+    assert!(history_draft.is_none());
+}
+
+#[test]
+fn prompt_down_prioritizes_command_suggestions_before_history() {
+    let registry = compatibility_command_registry();
+    let mut input = code_agent_ui::InputBuffer::new();
+    input.replace("/m");
+    let history = vec!["older prompt".to_owned()];
+    let mut selected_command_suggestion = 0usize;
+    let mut history_index = None;
+    let mut history_draft = None;
+
+    let suggestions = command_suggestions(&registry, &input);
+    assert!(suggestions.len() > 1);
+
+    navigate_prompt_input_down(
+        &registry,
+        &mut input,
+        &mut selected_command_suggestion,
+        &history,
+        &mut history_index,
+        &mut history_draft,
+    );
+
+    assert_eq!(input.as_str(), "/m");
+    assert_eq!(selected_command_suggestion, 1);
+    assert!(history_index.is_none());
+    assert!(history_draft.is_none());
+}
+
+#[test]
 fn pane_shortcut_accepts_supported_platform_modifiers() {
     let plain = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
     assert!(pane_from_shortcut(&plain).is_none());

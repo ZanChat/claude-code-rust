@@ -249,7 +249,7 @@ pub(crate) async fn run_interactive_repl(
                                 UiMouseAction::ToggleTranscriptGroup(group_id)
                                     if matches!(
                                         mouse.kind,
-                                        MouseEventKind::Down(MouseButton::Left)
+                                        MouseEventKind::Up(MouseButton::Left)
                                     ) =>
                                 {
                                     clear_prompt_mouse_anchor(&mut interaction_state);
@@ -1517,45 +1517,26 @@ pub(crate) async fn run_interactive_repl(
                 }
                 KeyCode::Up => {
                     clear_prompt_selection(&mut interaction_state);
-                    let suggestions = sync_command_selection(
+                    navigate_prompt_input_up(
                         registry,
-                        &input_buffer,
+                        &mut input_buffer,
                         &mut selected_command_suggestion,
+                        &prompt_history,
+                        &mut prompt_history_index,
+                        &mut prompt_history_draft,
                     );
-                    if suggestions.len() > 1 {
-                        selected_command_suggestion = if selected_command_suggestion == 0 {
-                            suggestions.len() - 1
-                        } else {
-                            selected_command_suggestion - 1
-                        };
-                    } else {
-                        navigate_prompt_history_up(
-                            &prompt_history,
-                            &mut input_buffer,
-                            &mut prompt_history_index,
-                            &mut prompt_history_draft,
-                        );
-                    }
                     dirty = true;
                 }
                 KeyCode::Down => {
                     clear_prompt_selection(&mut interaction_state);
-                    let suggestions = sync_command_selection(
+                    navigate_prompt_input_down(
                         registry,
-                        &input_buffer,
+                        &mut input_buffer,
                         &mut selected_command_suggestion,
+                        &prompt_history,
+                        &mut prompt_history_index,
+                        &mut prompt_history_draft,
                     );
-                    if suggestions.len() > 1 {
-                        selected_command_suggestion =
-                            (selected_command_suggestion + 1) % suggestions.len();
-                    } else {
-                        navigate_prompt_history_down(
-                            &prompt_history,
-                            &mut input_buffer,
-                            &mut prompt_history_index,
-                            &mut prompt_history_draft,
-                        );
-                    }
                     dirty = true;
                 }
                 KeyCode::PageUp => {

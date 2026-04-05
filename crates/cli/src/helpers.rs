@@ -359,6 +359,88 @@ pub(crate) fn navigate_prompt_history_down(
     true
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptInputNavigationDirection {
+    Up,
+    Down,
+}
+
+fn navigate_prompt_input(
+    registry: &CommandRegistry,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    selected_command_suggestion: &mut usize,
+    history: &[String],
+    history_index: &mut Option<usize>,
+    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+    direction: PromptInputNavigationDirection,
+) {
+    let suggestions = sync_command_selection(registry, input_buffer, selected_command_suggestion);
+    if suggestions.len() > 1 {
+        match direction {
+            PromptInputNavigationDirection::Up => {
+                *selected_command_suggestion = if *selected_command_suggestion == 0 {
+                    suggestions.len() - 1
+                } else {
+                    *selected_command_suggestion - 1
+                };
+            }
+            PromptInputNavigationDirection::Down => {
+                *selected_command_suggestion =
+                    (*selected_command_suggestion + 1) % suggestions.len();
+            }
+        }
+        return;
+    }
+
+    match direction {
+        PromptInputNavigationDirection::Up => {
+            let _ = navigate_prompt_history_up(history, input_buffer, history_index, history_draft);
+        }
+        PromptInputNavigationDirection::Down => {
+            let _ =
+                navigate_prompt_history_down(history, input_buffer, history_index, history_draft);
+        }
+    }
+}
+
+pub(crate) fn navigate_prompt_input_up(
+    registry: &CommandRegistry,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    selected_command_suggestion: &mut usize,
+    history: &[String],
+    history_index: &mut Option<usize>,
+    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+) {
+    navigate_prompt_input(
+        registry,
+        input_buffer,
+        selected_command_suggestion,
+        history,
+        history_index,
+        history_draft,
+        PromptInputNavigationDirection::Up,
+    )
+}
+
+pub(crate) fn navigate_prompt_input_down(
+    registry: &CommandRegistry,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    selected_command_suggestion: &mut usize,
+    history: &[String],
+    history_index: &mut Option<usize>,
+    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+) {
+    navigate_prompt_input(
+        registry,
+        input_buffer,
+        selected_command_suggestion,
+        history,
+        history_index,
+        history_draft,
+        PromptInputNavigationDirection::Down,
+    )
+}
+
 pub(crate) fn prompt_history_search_matches(history: &[String], query: &str) -> Vec<usize> {
     let query = query.trim();
     if query.is_empty() {

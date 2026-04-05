@@ -7,6 +7,8 @@ async fn run_pending_repl_operation<F, T>(
     active_model: &str,
     session_id: SessionId,
     input_buffer: &mut code_agent_ui::InputBuffer,
+    prompt_history_index: &mut Option<usize>,
+    prompt_history_draft: &mut Option<code_agent_ui::InputBuffer>,
     status_line: &str,
     active_pane: &mut PaneKind,
     compact_banner: Option<String>,
@@ -82,7 +84,7 @@ where
                                 UiMouseAction::ToggleTranscriptGroup(group_id)
                                     if matches!(
                                         mouse.kind,
-                                        MouseEventKind::Down(MouseButton::Left)
+                                        MouseEventKind::Up(MouseButton::Left)
                                     ) =>
                                 {
                                     clear_prompt_mouse_anchor(interaction_state);
@@ -158,6 +160,10 @@ where
                             transcript_scroll,
                         );
                     } else if !interaction_state.transcript_mode && vim_state.is_insert() {
+                        reset_prompt_history_navigation(
+                            prompt_history_index,
+                            prompt_history_draft,
+                        );
                         if insert_prompt_text(interaction_state, input_buffer, &text) {
                             *selected_command_suggestion = 0;
                         }
@@ -223,6 +229,10 @@ where
 
                         if !interaction_state.transcript_mode && vim_state.is_insert() {
                             if let Some(text) = read_text_from_clipboard() {
+                                reset_prompt_history_navigation(
+                                    prompt_history_index,
+                                    prompt_history_draft,
+                                );
                                 if insert_prompt_text(interaction_state, input_buffer, &text) {
                                     *selected_command_suggestion = 0;
                                 }
@@ -1159,35 +1169,25 @@ where
                         }
                         KeyCode::Up => {
                             clear_prompt_selection(interaction_state);
-                            let suggestions = sync_command_selection(
+                            navigate_prompt_input_up(
                                 registry,
                                 input_buffer,
                                 selected_command_suggestion,
+                                &prompt_history_from_messages(&pending_snapshot.messages),
+                                prompt_history_index,
+                                prompt_history_draft,
                             );
-                            if !input_buffer.is_empty() && suggestions.len() > 1 {
-                                *selected_command_suggestion = if *selected_command_suggestion == 0
-                                {
-                                    suggestions.len() - 1
-                                } else {
-                                    *selected_command_suggestion - 1
-                                };
-                            } else {
-                                scroll_up(transcript_scroll, 1);
-                            }
                         }
                         KeyCode::Down => {
                             clear_prompt_selection(interaction_state);
-                            let suggestions = sync_command_selection(
+                            navigate_prompt_input_down(
                                 registry,
                                 input_buffer,
                                 selected_command_suggestion,
+                                &prompt_history_from_messages(&pending_snapshot.messages),
+                                prompt_history_index,
+                                prompt_history_draft,
                             );
-                            if !input_buffer.is_empty() && suggestions.len() > 1 {
-                                *selected_command_suggestion =
-                                    (*selected_command_suggestion + 1) % suggestions.len();
-                            } else {
-                                scroll_down(transcript_scroll, 1);
-                            }
                         }
                         KeyCode::PageUp => scroll_up(transcript_scroll, 5),
                         KeyCode::PageDown => scroll_down(transcript_scroll, 5),
@@ -1232,6 +1232,10 @@ where
                             }
                         }
                         KeyCode::Backspace if vim_state.is_insert() => {
+                            reset_prompt_history_navigation(
+                                prompt_history_index,
+                                prompt_history_draft,
+                            );
                             if !delete_prompt_selection(interaction_state, input_buffer) {
                                 input_buffer.pop();
                             }
@@ -1242,6 +1246,10 @@ where
                                 && (key.modifiers.is_empty()
                                     || key.modifiers == KeyModifiers::SHIFT) =>
                         {
+                            reset_prompt_history_navigation(
+                                prompt_history_index,
+                                prompt_history_draft,
+                            );
                             let _ = delete_prompt_selection(interaction_state, input_buffer);
                             input_buffer.push(ch);
                             *selected_command_suggestion = 0;
@@ -1262,11 +1270,19 @@ where
                                     && !prompt_text.contains(char::is_whitespace)
                                     && prompt_text != selected_name
                                 {
+                                    reset_prompt_history_navigation(
+                                        prompt_history_index,
+                                        prompt_history_draft,
+                                    );
                                     clear_prompt_selection(interaction_state);
                                     apply_selected_command(input_buffer, selected);
                                     continue;
                                 }
                             }
+                            reset_prompt_history_navigation(
+                                prompt_history_index,
+                                prompt_history_draft,
+                            );
                             queue_pending_repl_input(&pending_view, prompt_text);
                             clear_prompt_selection(interaction_state);
                             input_buffer.clear();
