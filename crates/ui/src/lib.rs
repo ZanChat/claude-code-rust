@@ -1119,6 +1119,10 @@ fn resolved_transcript_items(state: &UiState) -> Vec<TranscriptItem> {
 }
 
 fn group_header_lines(group: &TranscriptGroup, width: u16) -> Vec<Line<'static>> {
+    if group.single_item {
+        return single_item_group_header_lines(group, width);
+    }
+
     let mut lines = Vec::new();
     let icon = if group.expanded { "▼" } else { "▶" };
     let title_style = Style::default()
@@ -1141,6 +1145,101 @@ fn group_header_lines(group: &TranscriptGroup, width: u16) -> Vec<Line<'static>>
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(segment, subtitle_style),
+            ]));
+        }
+    }
+
+    lines
+}
+
+fn single_item_group_header_lines(group: &TranscriptGroup, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let icon_style = if group.expanded {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let summary_style = Style::default().add_modifier(Modifier::DIM);
+    let hint_style = Style::default().fg(Color::DarkGray);
+
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    for (index, segment) in wrap_plain_text(&group.title, content_width)
+        .into_iter()
+        .enumerate()
+    {
+        lines.push(if index == 0 {
+            Line::from(vec![
+                Span::styled(if group.expanded { "▼" } else { "▶" }, icon_style),
+                Span::raw(" "),
+                Span::styled(segment, summary_style),
+            ])
+        } else {
+            Line::from(vec![Span::raw("  "), Span::styled(segment, summary_style)])
+        });
+    }
+
+    if !group.expanded {
+        if let Some(subtitle) = group
+            .subtitle
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            for (index, segment) in
+                wrap_plain_text(&subtitle, width.saturating_sub(5).max(1) as usize)
+                    .into_iter()
+                    .enumerate()
+            {
+                lines.push(Line::from(vec![
+                    Span::styled(if index == 0 { "  ⎿ " } else { "    " }, hint_style),
+                    Span::styled(segment, hint_style),
+                ]));
+            }
+        }
+    }
+
+    lines
+}
+
+fn single_item_group_detail_style(role: &str) -> Style {
+    match role {
+        "history_tool_call" => Style::default().add_modifier(Modifier::BOLD),
+        "history_tool_error" => Style::default().fg(Color::Red),
+        _ => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn single_item_group_detail_lines(group: &TranscriptGroup, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    for transcript_line in &group.lines {
+        if transcript_line.text.trim().is_empty() {
+            continue;
+        }
+
+        if transcript_line.role == "history_tool_call" && !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+
+        let (first_prefix, continuation_prefix, content_width) = match transcript_line.role.as_str()
+        {
+            "history_tool_call" => ("  ", "  ", width.saturating_sub(2).max(1) as usize),
+            _ => ("  ⎿ ", "    ", width.saturating_sub(5).max(1) as usize),
+        };
+
+        let style = single_item_group_detail_style(&transcript_line.role);
+        for (index, segment) in wrap_plain_text(&transcript_line.text, content_width)
+            .into_iter()
+            .enumerate()
+        {
+            lines.push(Line::from(vec![
+                Span::raw(if index == 0 {
+                    first_prefix.to_owned()
+                } else {
+                    continuation_prefix.to_owned()
+                }),
+                Span::styled(segment, style),
             ]));
         }
     }
@@ -1230,31 +1329,13 @@ fn transcript_visual_lines(state: &UiState, width: u16) -> Vec<TranscriptRenderL
 
                 if group.expanded && !group.lines.is_empty() {
                     if group.single_item {
-                        for (line_index, transcript_line) in group.lines.iter().enumerate() {
-                            let is_last = line_index + 1 == group.lines.len();
-                            let first_prefix = if is_last { "  └ " } else { "  ├ " };
-                            let continuation_prefix = if is_last { "    " } else { "  │ " };
-
-                            for (wrapped_index, line) in
-                                wrapped_transcript_lines(transcript_line, width.saturating_sub(4))
-                                    .into_iter()
-                                    .enumerate()
-                            {
-                                let line = indent_line(
-                                    line,
-                                    if wrapped_index == 0 {
-                                        first_prefix
-                                    } else {
-                                        continuation_prefix
-                                    },
-                                );
-                                let plain_text = line_text(&line);
-                                lines.push(regular_render_line(
-                                    line,
-                                    Some(group_item_index),
-                                    plain_text,
-                                ));
-                            }
+                        for line in single_item_group_detail_lines(group, width) {
+                            let plain_text = line_text(&line);
+                            lines.push(regular_render_line(
+                                line,
+                                Some(group_item_index),
+                                plain_text,
+                            ));
                         }
                     } else {
                         lines.push(regular_render_line(Line::from(""), None, ""));
@@ -4045,23 +4126,23 @@ mod tests {
     }
 
     #[test]
-    fn single_item_transcript_groups_render_tree_connectors_when_expanded() {
+    fn single_item_transcript_groups_render_compact_details_when_expanded() {
         let mut state = RatatuiApp::new("history-tree").initial_state();
         state.transcript_items = vec![TranscriptItem::Group(TranscriptGroup {
             id: "history-group-1".to_owned(),
             title: "Read 2 files".to_owned(),
-            subtitle: Some("4 messages".to_owned()),
+            subtitle: Some("Use Ctrl+R to review".to_owned()),
             expanded: true,
             single_item: true,
             lines: vec![
                 TranscriptLine {
-                    role: "assistant".to_owned(),
-                    text: "Tool call: read_file".to_owned(),
+                    role: "history_tool_call".to_owned(),
+                    text: "Read src/lib.rs".to_owned(),
                     author_label: None,
                 },
                 TranscriptLine {
-                    role: "tool".to_owned(),
-                    text: "src/lib.rs".to_owned(),
+                    role: "history_tool_result".to_owned(),
+                    text: "pub fn render_to_string(...)".to_owned(),
                     author_label: None,
                 },
             ],
@@ -4069,7 +4150,11 @@ mod tests {
 
         let rendered = render_to_string(&state, 80, 24).unwrap();
 
-        assert!(rendered.contains("├") || rendered.contains("└"));
+        assert!(rendered.contains("▼ Read 2 files"));
+        assert!(rendered.contains("  Read src/lib.rs"));
+        assert!(rendered.contains("  ⎿ pub fn render_to_string(...)"));
+        assert!(!rendered.contains("├"));
+        assert!(!rendered.contains("└"));
     }
 
     #[test]

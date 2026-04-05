@@ -1116,7 +1116,7 @@ fn build_repl_ui_state_collapses_history_tool_runs_into_single_group() {
     assert!(group.single_item);
     assert!(!group.expanded);
     assert!(group.title.contains("Read 1 file"));
-    assert!(group.title.contains("Searched 1 query"));
+    assert!(group.title.contains("searched 1 query"));
 }
 
 #[test]

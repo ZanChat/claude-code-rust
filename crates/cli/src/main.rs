@@ -50,8 +50,9 @@ use code_agent_ui::{
     transcript_visual_scroll_for_view, ChoiceListItem, ChoiceListState, CommandPaletteEntry,
     Notification, PaneKind, PanePreview, PermissionPromptState, PromptHistorySearchState,
     PromptSelectionState, QuestionUiEntry, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup,
-    TranscriptItem, TranscriptMessageActionsState, TranscriptSearchState, TranscriptSelectableLine,
-    TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction, UiState,
+    TranscriptItem, TranscriptLine, TranscriptMessageActionsState, TranscriptSearchState,
+    TranscriptSelectableLine, TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
+    UiState,
 };
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
@@ -2744,16 +2745,6 @@ impl HistoryTranscriptGroupAccumulator {
 
     fn into_group(self, expanded_history_groups: &BTreeSet<String>) -> TranscriptGroup {
         let group_id = history_transcript_group_id(&self.first_message);
-        let mut subtitle_parts = vec![format!(
-            "{} {}",
-            self.messages.len(),
-            if self.messages.len() == 1 {
-                "message"
-            } else {
-                "messages"
-            }
-        )];
-
         let mut unique_hints = Vec::new();
         for hint in self.hints.iter().rev() {
             if unique_hints
@@ -2768,15 +2759,15 @@ impl HistoryTranscriptGroupAccumulator {
             }
         }
         unique_hints.reverse();
-        subtitle_parts.extend(unique_hints);
+        let subtitle = unique_hints.last().cloned();
 
         TranscriptGroup {
             id: group_id.clone(),
             title: history_transcript_group_title(&self),
-            subtitle: Some(subtitle_parts.join(" · ")),
+            subtitle,
             expanded: expanded_history_groups.contains(&group_id),
             single_item: true,
-            lines: UiState::from_messages(self.messages).transcript_lines,
+            lines: history_transcript_detail_lines(&self.messages),
         }
     }
 }
@@ -2793,54 +2784,77 @@ fn history_transcript_group_title(group: &HistoryTranscriptGroupAccumulator) -> 
     let mut parts = Vec::new();
 
     if group.read_count > 0 {
-        parts.push(format!(
-            "Read {} {}",
-            group.read_count,
-            if group.read_count == 1 {
-                "file"
-            } else {
-                "files"
-            }
+        parts.push((
+            "Read",
+            "read",
+            format!(
+                "{} {}",
+                group.read_count,
+                if group.read_count == 1 {
+                    "file"
+                } else {
+                    "files"
+                }
+            ),
         ));
     }
     if group.search_count > 0 {
-        parts.push(format!(
-            "Searched {} {}",
-            group.search_count,
-            if group.search_count == 1 {
-                "query"
-            } else {
-                "queries"
-            }
+        parts.push((
+            "Searched",
+            "searched",
+            format!(
+                "{} {}",
+                group.search_count,
+                if group.search_count == 1 {
+                    "query"
+                } else {
+                    "queries"
+                }
+            ),
         ));
     }
     if group.list_count > 0 {
-        parts.push(format!(
-            "Listed {} {}",
-            group.list_count,
-            if group.list_count == 1 {
-                "directory"
-            } else {
-                "directories"
-            }
+        parts.push((
+            "Listed",
+            "listed",
+            format!(
+                "{} {}",
+                group.list_count,
+                if group.list_count == 1 {
+                    "directory"
+                } else {
+                    "directories"
+                }
+            ),
         ));
     }
     if group.bash_count > 0 {
-        parts.push(format!(
-            "Ran {} {}",
-            group.bash_count,
-            if group.bash_count == 1 {
-                "command"
-            } else {
-                "commands"
-            }
+        parts.push((
+            "Ran",
+            "ran",
+            format!(
+                "{} {}",
+                group.bash_count,
+                if group.bash_count == 1 {
+                    "command"
+                } else {
+                    "commands"
+                }
+            ),
         ));
     }
 
     if parts.is_empty() {
         "Tool activity".to_owned()
     } else {
-        parts.join(" · ")
+        parts
+            .into_iter()
+            .enumerate()
+            .map(|(index, (leading, trailing, detail))| {
+                format!("{} {detail}", if index == 0 { leading } else { trailing })
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -2871,6 +2885,91 @@ fn history_transcript_hint(call: &code_agent_core::ToolCall) -> Option<String> {
     }
 
     Some(preview_lines_from_text(condensed, 1, 56).join(" "))
+}
+
+fn history_preview_lines(text: &str, max_lines: usize, max_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.chars().count() <= max_width {
+            lines.push(trimmed.to_owned());
+        } else {
+            let mut clipped = trimmed
+                .chars()
+                .take(max_width.saturating_sub(3))
+                .collect::<String>();
+            clipped.push_str("...");
+            lines.push(clipped);
+        }
+        if lines.len() == max_lines {
+            break;
+        }
+    }
+    lines
+}
+
+fn history_tool_call_detail_text(call: &code_agent_core::ToolCall) -> String {
+    let display_name = tool_display_name(&call.name);
+    let Some(primary_input) = tool_primary_input(call) else {
+        return display_name;
+    };
+
+    let compact = preview_lines_from_text(primary_input.value, 1, 72).join(" ");
+    match primary_input.label {
+        "query" | "pattern" => format!(r#"{display_name} ("{compact}")"#),
+        _ => format!("{display_name} ({compact})"),
+    }
+}
+
+fn history_tool_result_detail_lines(result: &code_agent_core::ToolResult) -> Vec<TranscriptLine> {
+    let previews =
+        history_preview_lines(&result.output_text, if result.is_error { 2 } else { 1 }, 76);
+    let role = if result.is_error {
+        "history_tool_error"
+    } else {
+        "history_tool_result"
+    };
+
+    previews
+        .into_iter()
+        .map(|text| TranscriptLine {
+            role: role.to_owned(),
+            text,
+            author_label: None,
+        })
+        .collect()
+}
+
+fn history_transcript_detail_lines(messages: &[Message]) -> Vec<TranscriptLine> {
+    let mut lines = Vec::new();
+
+    for message in messages {
+        if let Some(call) = message_tool_call(message) {
+            lines.push(TranscriptLine {
+                role: "history_tool_call".to_owned(),
+                text: history_tool_call_detail_text(call),
+                author_label: None,
+            });
+            continue;
+        }
+
+        if let Some(result) = message_tool_result(message) {
+            lines.extend(history_tool_result_detail_lines(result));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(TranscriptLine {
+            role: "history_tool_result".to_owned(),
+            text: "No additional details.".to_owned(),
+            author_label: None,
+        });
+    }
+
+    lines
 }
 
 fn push_history_transcript_line_item(
