@@ -109,20 +109,29 @@ fn enabled_tool_names(tool_registry: &ToolRegistry) -> BTreeSet<String> {
 fn using_your_tools_section(enabled_tools: &BTreeSet<String>) -> Option<String> {
     let mut items = Vec::new();
 
+    if enabled_tools.contains("bash") {
+        items.push(
+            "Do NOT use bash when a relevant dedicated tool exists. This is CRITICAL to assisting the user correctly.",
+        );
+    }
     if enabled_tools.contains("file_read") {
-        items.push("To read files use file_read instead of cat, head, tail, or sed.");
+        items.push(
+            "To read files use file_read instead of cat, head, tail, sed, awk, or perl via bash.",
+        );
     }
     if enabled_tools.contains("file_edit") {
-        items.push("To edit files use file_edit instead of sed or awk.");
+        items.push("To edit files use file_edit instead of sed, awk, perl, or shell one-liners.");
     }
     if enabled_tools.contains("file_write") {
-        items.push("To create or replace files use file_write instead of shell redirection.");
+        items.push(
+            "To create or replace files use file_write instead of shell redirection or here-docs.",
+        );
     }
     if enabled_tools.contains("glob") {
         items.push("To search for files use glob instead of find or ls.");
     }
     if enabled_tools.contains("grep") {
-        items.push("To search file contents use grep instead of grep or rg via bash.");
+        items.push("To search file contents use grep instead of running grep or rg via bash.");
     }
     if enabled_tools.contains("web_fetch") {
         items.push("Use web_fetch for specific URLs or remote documents.");
@@ -131,7 +140,9 @@ fn using_your_tools_section(enabled_tools: &BTreeSet<String>) -> Option<String> 
         items.push("Use web_search for fresh external context when the task needs current information.");
     }
     if enabled_tools.contains("bash") {
-        items.push("Reserve bash for system commands and terminal operations that truly require shell execution. Prefer a dedicated tool when one exists.");
+        items.push(
+            "Reserve bash for system commands, builds, tests, package managers, and terminal operations that truly require shell execution.",
+        );
     }
     if enabled_tools.contains("mcp") {
         items.push("Use mcp to call registered MCP tools when the task needs capabilities exposed by an MCP server.");

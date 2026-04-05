@@ -146,11 +146,7 @@ impl HttpProvider {
     ) -> Result<Box<dyn ProviderStream>> {
         let payload = build_openai_chat_completions_payload(&request);
         let response = self
-            .client
-            .post(&url)
-            .headers(self.openai_headers(&request.extra_headers)?)
-            .json(&payload)
-            .send()
+            .post_openai_json_with_retry(&url, &request.extra_headers, &payload)
             .await?;
         let status = response.status();
         let body = response.text().await?;
@@ -224,43 +220,79 @@ impl HttpProvider {
             supports_verbosity,
         );
 
+        let response = self
+            .post_openai_json_with_retry(&url, &request.extra_headers, &payload)
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await?;
+            return Err(anyhow!(
+                "{} request failed with status {}: {}",
+                openai_request_failure_label(self.provider),
+                status,
+                compact_error_body(&body)
+            ));
+        }
+
+        Ok(Box::new(OpenAIResponsesSseStream::new(response)))
+    }
+
+    async fn post_openai_json_with_retry(
+        &self,
+        url: &str,
+        extra_headers: &BTreeMap<String, String>,
+        payload: &Value,
+    ) -> Result<reqwest::Response> {
+        let headers = self.openai_headers(extra_headers)?;
         let max_retries = openai_responses_max_retries();
         let mut attempt = 0usize;
+
         loop {
             attempt += 1;
-            let response = self
+            match self
                 .client
-                .post(&url)
-                .headers(self.openai_headers(&request.extra_headers)?)
-                .json(&payload)
+                .post(url)
+                .headers(headers.clone())
+                .json(payload)
                 .send()
-                .await?;
-            let status = response.status();
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    let retry_after = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
 
-            if !status.is_success() {
-                let body = response.text().await?;
-                if should_retry_openai_responses_status(status) && attempt <= max_retries {
-                    sleep(openai_responses_retry_delay(
-                        attempt,
-                        retry_after.as_deref(),
-                    ))
-                    .await;
-                    continue;
+                    if should_retry_openai_responses_status(status) && attempt <= max_retries {
+                        let _ = response.bytes().await;
+                        sleep(openai_responses_retry_delay(
+                            attempt,
+                            retry_after.as_deref(),
+                        ))
+                        .await;
+                        continue;
+                    }
+
+                    return Ok(response);
                 }
-                return Err(anyhow!(
-                    "{} request failed with status {}: {}",
-                    openai_request_failure_label(self.provider),
-                    status,
-                    compact_error_body(&body)
-                ));
-            }
+                Err(error) => {
+                    if should_retry_openai_send_error(&error) && attempt <= max_retries {
+                        sleep(openai_responses_retry_delay(attempt, None)).await;
+                        continue;
+                    }
 
-            return Ok(Box::new(OpenAIResponsesSseStream::new(response)));
+                    return Err(anyhow!(
+                        "{} request failed while sending request to {} after {} attempt{}: {}",
+                        openai_request_failure_label(self.provider),
+                        url,
+                        attempt,
+                        if attempt == 1 { "" } else { "s" },
+                        error
+                    ));
+                }
+            }
         }
     }
 
@@ -1073,6 +1105,10 @@ pub(crate) fn should_retry_openai_responses_status(status: reqwest::StatusCode) 
             | reqwest::StatusCode::CONFLICT
             | reqwest::StatusCode::TOO_MANY_REQUESTS
     ) || status.is_server_error()
+}
+
+pub(crate) fn should_retry_openai_send_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || (error.is_request() && !error.is_body())
 }
 
 pub(crate) fn openai_responses_retry_delay(

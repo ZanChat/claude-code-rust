@@ -644,6 +644,7 @@ fn runtime_system_prompt_loads_instruction_and_mcp_sections() {
     );
 
     assert!(prompt.contains("You are Claude Code"));
+    assert!(prompt.contains("Do NOT use bash when a relevant dedicated tool exists"));
     assert!(prompt.contains("To read files use file_read"));
     assert!(prompt.contains("Use bun."));
     assert!(prompt.contains("Read the docs resources before falling back to shell commands."));

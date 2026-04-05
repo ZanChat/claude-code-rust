@@ -123,7 +123,9 @@ pub fn compatibility_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "file_read".to_owned(),
-            description: "Read files from the active workspace.".to_owned(),
+            description:
+                "Read workspace files directly. Use this instead of shell commands like cat, head, tail, or sed when you need file contents."
+                    .to_owned(),
             kind: ToolKind::FileSystem,
             input_schema: schemars::schema_for!(FileReadToolInput),
             read_only: true,
@@ -131,7 +133,9 @@ pub fn compatibility_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "file_write".to_owned(),
-            description: "Write or replace workspace files.".to_owned(),
+            description:
+                "Create or replace workspace files. Use this instead of shell redirection or here-docs."
+                    .to_owned(),
             kind: ToolKind::FileSystem,
             input_schema: schemars::schema_for!(FileWriteToolInput),
             read_only: false,
@@ -139,7 +143,9 @@ pub fn compatibility_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "file_edit".to_owned(),
-            description: "Apply targeted edits to an existing file.".to_owned(),
+            description:
+                "Apply targeted edits to an existing file. Use this instead of sed, awk, perl, or shell one-liners."
+                    .to_owned(),
             kind: ToolKind::FileSystem,
             input_schema: schemars::schema_for!(FileEditToolInput),
             read_only: false,
@@ -154,21 +160,21 @@ pub fn compatibility_tool_specs() -> Vec<ToolSpec> {
         ),
         compatibility_tool(
             "grep",
-            "Search text in the workspace.",
+            "Search text in workspace files directly instead of running grep or rg through bash.",
             ToolKind::Search,
             true,
             false,
         ),
         compatibility_tool(
             "bash",
-            "Execute a shell command in the project.",
+            "Execute a shell command in the project only when no dedicated tool fits. Do not use this for reading or editing workspace files.",
             ToolKind::Shell,
             false,
             true,
         ),
         compatibility_tool(
             "powershell",
-            "Execute a PowerShell command when the runtime requires it.",
+            "Execute a PowerShell command only when the runtime requires it and no dedicated tool fits.",
             ToolKind::Shell,
             false,
             true,

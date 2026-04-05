@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use time::{Date, Month, PrimitiveDateTime, Time};
@@ -44,6 +44,76 @@ struct CapturedHttpRequest {
     body: String,
 }
 
+fn read_captured_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        let read = stream.read(&mut chunk).unwrap();
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = position + 4;
+            let header_text = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = header_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while buffer.len() < header_end + content_length {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            if buffer.len() < header_end + content_length {
+                break;
+            }
+            let request_text = String::from_utf8_lossy(&buffer);
+            let mut lines = request_text.lines();
+            let request_line = lines.next().unwrap();
+            let mut request_line_parts = request_line.split_whitespace();
+            let method = request_line_parts.next().unwrap().to_owned();
+            let path = request_line_parts.next().unwrap().to_owned();
+            let mut headers = BTreeMap::new();
+            for line in lines.by_ref() {
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+                }
+            }
+            let body = String::from_utf8_lossy(&buffer[header_end..header_end + content_length])
+                .to_string();
+            return CapturedHttpRequest {
+                method,
+                path,
+                headers,
+                body,
+            };
+        }
+    }
+
+    panic!("server did not receive a complete HTTP request")
+}
+
+fn write_json_response(stream: &mut TcpStream, body_string: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body_string.len(),
+        body_string
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
 async fn spawn_json_server(
     response_body: serde_json::Value,
 ) -> (String, std::thread::JoinHandle<CapturedHttpRequest>) {
@@ -52,71 +122,31 @@ async fn spawn_json_server(
     let body_string = serde_json::to_string(&response_body).unwrap();
     let handle = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 4096];
+        let captured = read_captured_http_request(&mut stream);
+        write_json_response(&mut stream, &body_string);
+        captured
+    });
 
-        loop {
-            let read = stream.read(&mut chunk).unwrap();
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-                let header_end = position + 4;
-                let header_text = String::from_utf8_lossy(&buffer[..header_end]);
-                let content_length = header_text
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                while buffer.len() < header_end + content_length {
-                    let read = stream.read(&mut chunk).unwrap();
-                    if read == 0 {
-                        break;
-                    }
-                    buffer.extend_from_slice(&chunk[..read]);
-                }
-                if buffer.len() < header_end + content_length {
-                    break;
-                }
-                let request_text = String::from_utf8_lossy(&buffer);
-                let mut lines = request_text.lines();
-                let request_line = lines.next().unwrap();
-                let mut request_line_parts = request_line.split_whitespace();
-                let method = request_line_parts.next().unwrap().to_owned();
-                let path = request_line_parts.next().unwrap().to_owned();
-                let mut headers = BTreeMap::new();
-                for line in lines.by_ref() {
-                    if line.is_empty() {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':') {
-                        headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
-                    }
-                }
-                let body =
-                    String::from_utf8_lossy(&buffer[header_end..header_end + content_length])
-                        .to_string();
-                let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body_string.len(),
-                        body_string
-                    );
-                stream.write_all(response.as_bytes()).unwrap();
-                return CapturedHttpRequest {
-                    method,
-                    path,
-                    headers,
-                    body,
-                };
-            }
-        }
+    (format!("http://{address}"), handle)
+}
 
-        panic!("server did not receive a complete HTTP request")
+async fn spawn_flaky_json_server(
+    response_body: serde_json::Value,
+) -> (
+    String,
+    std::thread::JoinHandle<(usize, CapturedHttpRequest)>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let body_string = serde_json::to_string(&response_body).unwrap();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        drop(stream);
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let captured = read_captured_http_request(&mut stream);
+        write_json_response(&mut stream, &body_string);
+        (2, captured)
     });
 
     (format!("http://{address}"), handle)
@@ -779,6 +809,60 @@ async fn sends_openai_responses_requests() {
     assert_eq!(body["input"][0]["role"], "user");
     assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
     assert_eq!(body["tools"][0]["type"], "function");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retries_openai_compatible_chat_completions_send_failures() {
+    let (base_url, server) = spawn_flaky_json_server(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "retry ok"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 8,
+            "completion_tokens": 2
+        }
+    }))
+    .await;
+    let provider = HttpProvider::with_base_url(
+        ApiProvider::OpenAICompatible,
+        AuthMaterial {
+            api_key: Some("compat-key".to_owned()),
+            bearer_token: Some("compat-key".to_owned()),
+            ..AuthMaterial::default()
+        },
+        format!("{base_url}/generativelanguage.googleapis.com/v1beta/openai"),
+    );
+    let request = ProviderRequest {
+        model: "gemini-3.1-pro-preview".to_owned(),
+        messages: vec![Message::new(
+            MessageRole::User,
+            vec![ContentBlock::Text {
+                text: "hello gemini".to_owned(),
+            }],
+        )],
+        ..ProviderRequest::default()
+    };
+
+    let collected = collect_provider_response(&provider, request).await.unwrap();
+    let (attempts, captured) = server.join().unwrap();
+    let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+
+    assert_eq!(attempts, 2);
+    assert_eq!(collected.text, "retry ok");
+    assert_eq!(captured.method, "POST");
+    assert_eq!(
+        captured.path,
+        "/generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    );
+    assert_eq!(
+        captured.headers.get("authorization").map(String::as_str),
+        Some("Bearer compat-key")
+    );
+    assert_eq!(body["messages"][0]["role"], "user");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
