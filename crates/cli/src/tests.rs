@@ -2,13 +2,14 @@ use super::{
     build_repl_command_input_message, build_repl_command_output_message, build_repl_ui_state,
     build_resume_choice_list, build_startup_screens, build_startup_ui_state, build_text_message,
     build_tool_result_message, choose_active_session, command_suggestions,
-    handle_repl_slash_command, message_text, navigate_prompt_history_down,
-    navigate_prompt_history_up, pane_from_shortcut, pending_interrupt_messages,
-    prompt_history_from_messages, render_auth_command_with_resume, render_remote_control_command,
-    resolve_continue_target, resolved_command_registry, resumable_sessions, resume_hint_text,
-    should_echo_command_result_in_footer, should_exit_repl, toggle_all_pending_repl_groups,
-    ActiveSessionStore, Cli, LocalBridgeHandler, Message, MessageRole, PendingReplStep,
-    PendingReplView, ReplSessionState, ResumePickerState, ResumeTargetHint, StartupPreferences,
+    handle_repl_slash_command, message_action_copy_text, message_primary_input, message_text,
+    navigate_prompt_history_down, navigate_prompt_history_up, pane_from_shortcut,
+    pending_interrupt_messages, prompt_history_from_messages, render_auth_command_with_resume,
+    render_remote_control_command, resolve_continue_target, resolved_command_registry,
+    resumable_sessions, resume_hint_text, should_echo_command_result_in_footer, should_exit_repl,
+    toggle_all_pending_repl_groups, ActiveSessionStore, Cli, LocalBridgeHandler, Message,
+    MessageRole, PendingReplStep, PendingReplView, ReplInteractionState, ReplSessionState,
+    ResumePickerState, ResumeTargetHint, StartupPreferences,
 };
 use code_agent_bridge::{
     base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
@@ -21,6 +22,7 @@ use code_agent_providers::{
 };
 use code_agent_session::{materialize_runtime_messages, LocalSessionStore, SessionSummary};
 use code_agent_tools::compatibility_tool_registry;
+use code_agent_ui::{TranscriptSelectionPoint, TranscriptSelectionState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn repl_session_state(session_id: SessionId) -> ReplSessionState {
@@ -287,14 +289,16 @@ fn pane_shortcut_accepts_supported_platform_modifiers() {
     );
 
     let super_shortcut = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SUPER);
-    if cfg!(target_os = "macos") {
-        assert_eq!(
-            pane_from_shortcut(&super_shortcut),
-            Some(code_agent_ui::PaneKind::Transcript)
-        );
-    } else {
-        assert!(pane_from_shortcut(&super_shortcut).is_none());
-    }
+    assert_eq!(
+        pane_from_shortcut(&super_shortcut),
+        Some(code_agent_ui::PaneKind::Transcript)
+    );
+
+    let alt_shortcut = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT);
+    assert_eq!(
+        pane_from_shortcut(&alt_shortcut),
+        Some(code_agent_ui::PaneKind::Transcript)
+    );
 }
 
 #[test]
@@ -508,6 +512,7 @@ fn build_repl_ui_state_handles_empty_command_suggestions() {
         Vec::new(),
         0,
         0,
+        &ReplInteractionState::default(),
     );
 
     assert!(state.show_input);
@@ -573,6 +578,7 @@ fn build_repl_ui_state_groups_pending_steps() {
         Vec::new(),
         0,
         0,
+        &ReplInteractionState::default(),
     );
 
     assert_eq!(state.transcript_lines.len(), 1);
@@ -650,6 +656,197 @@ fn toggle_all_pending_repl_groups_switches_between_expanded_and_collapsed() {
     toggle_all_pending_repl_groups(&pending_view);
     let state = pending_view.lock().unwrap();
     assert!(state.steps.iter().all(|entry| !entry.expanded));
+}
+
+#[test]
+fn build_repl_ui_state_hides_prompt_in_transcript_mode() {
+    let app = code_agent_ui::RatatuiApp::new("repl-transcript");
+    let registry = compatibility_command_registry();
+    let mut search_input = code_agent_ui::InputBuffer::new();
+    search_input.replace("error");
+    let interaction_state = ReplInteractionState {
+        transcript_mode: true,
+        transcript_search: super::ReplTranscriptSearchState {
+            input_buffer: search_input,
+            open: true,
+            active_item: Some(0),
+            ..Default::default()
+        },
+        message_actions: None,
+        transcript_selection: None,
+    };
+
+    let state = build_repl_ui_state(
+        &app,
+        &registry,
+        &[],
+        None,
+        Path::new("."),
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        SessionId::new_v4(),
+        &code_agent_ui::InputBuffer::new(),
+        "status",
+        None,
+        code_agent_ui::PaneKind::Tasks,
+        None,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        &interaction_state,
+    );
+
+    assert!(!state.show_input);
+    assert!(state.transcript_mode);
+    assert_eq!(state.active_pane, Some(code_agent_ui::PaneKind::Transcript));
+    assert!(state.transcript_search.is_some());
+}
+
+#[test]
+fn build_repl_ui_state_keeps_prompt_visible_for_message_actions() {
+    let app = code_agent_ui::RatatuiApp::new("repl-message-actions");
+    let registry = compatibility_command_registry();
+    let session_id = SessionId::new_v4();
+    let assistant_tool_call = Message::new(
+        MessageRole::Assistant,
+        vec![ContentBlock::ToolCall {
+            call: code_agent_core::ToolCall {
+                id: "tool-call-1".to_owned(),
+                name: "read_file".to_owned(),
+                input_json: json!({
+                    "path": "src/main.rs"
+                })
+                .to_string(),
+                thought_signature: None,
+            },
+        }],
+    );
+    let interaction_state = ReplInteractionState {
+        message_actions: Some(super::ReplMessageActionState { selected_item: 0 }),
+        ..Default::default()
+    };
+
+    let state = build_repl_ui_state(
+        &app,
+        &registry,
+        &[assistant_tool_call],
+        None,
+        Path::new("."),
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        session_id,
+        &code_agent_ui::InputBuffer::new(),
+        "status",
+        None,
+        code_agent_ui::PaneKind::Tasks,
+        None,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        &interaction_state,
+    );
+
+    assert!(state.show_input);
+    assert_eq!(state.active_pane, Some(code_agent_ui::PaneKind::Transcript));
+    assert_eq!(
+        state
+            .message_actions
+            .as_ref()
+            .and_then(|actions| actions.primary_input_label.as_deref()),
+        Some("path")
+    );
+    assert_eq!(
+        state
+            .message_actions
+            .as_ref()
+            .map(|actions| actions.editable),
+        Some(false)
+    );
+}
+
+#[test]
+fn build_repl_ui_state_exposes_transcript_selection() {
+    let app = code_agent_ui::RatatuiApp::new("repl-selection");
+    let registry = compatibility_command_registry();
+    let interaction_state = ReplInteractionState {
+        transcript_mode: true,
+        transcript_selection: Some(TranscriptSelectionState {
+            anchor: TranscriptSelectionPoint {
+                line_index: 0,
+                column: 2,
+            },
+            focus: TranscriptSelectionPoint {
+                line_index: 0,
+                column: 5,
+            },
+        }),
+        ..Default::default()
+    };
+
+    let state = build_repl_ui_state(
+        &app,
+        &registry,
+        &[build_text_message(
+            SessionId::new_v4(),
+            MessageRole::Assistant,
+            "selection target".to_owned(),
+            None,
+        )],
+        None,
+        Path::new("."),
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        SessionId::new_v4(),
+        &code_agent_ui::InputBuffer::new(),
+        "status",
+        None,
+        code_agent_ui::PaneKind::Tasks,
+        None,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        &interaction_state,
+    );
+
+    assert_eq!(
+        state.transcript_selection,
+        interaction_state.transcript_selection
+    );
+}
+
+#[test]
+fn message_action_copy_prefers_tool_primary_input() {
+    let assistant_tool_call = Message::new(
+        MessageRole::Assistant,
+        vec![ContentBlock::ToolCall {
+            call: code_agent_core::ToolCall {
+                id: "tool-call-1".to_owned(),
+                name: "run_in_terminal".to_owned(),
+                input_json: json!({
+                    "command": "cargo test -p code-agent-ui"
+                })
+                .to_string(),
+                thought_signature: None,
+            },
+        }],
+    );
+
+    assert_eq!(
+        message_primary_input(&assistant_tool_call)
+            .as_ref()
+            .map(|input| input.label),
+        Some("command")
+    );
+    assert_eq!(
+        message_action_copy_text(&assistant_tool_call).as_deref(),
+        Some("cargo test -p code-agent-ui")
+    );
 }
 
 #[tokio::test]

@@ -199,6 +199,39 @@ pub struct QuestionUiEntry {
     pub task_title: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptSearchState {
+    pub input_buffer: InputBuffer,
+    pub open: bool,
+    pub active_item: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptMessageActionsState {
+    pub active_item: usize,
+    pub editable: bool,
+    pub primary_input_label: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptSelectionPoint {
+    pub line_index: usize,
+    pub column: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptSelectionState {
+    pub anchor: TranscriptSelectionPoint,
+    pub focus: TranscriptSelectionPoint,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptSelectableLine {
+    pub item_index: usize,
+    pub line_index: usize,
+    pub text: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct UiState {
     pub messages: Vec<Message>,
@@ -214,6 +247,10 @@ pub struct UiState {
     pub input_buffer: InputBuffer,
     pub prompt_helper: Option<String>,
     pub show_input: bool,
+    pub transcript_mode: bool,
+    pub transcript_search: Option<TranscriptSearchState>,
+    pub message_actions: Option<TranscriptMessageActionsState>,
+    pub transcript_selection: Option<TranscriptSelectionState>,
     pub command_palette: Vec<CommandPaletteEntry>,
     pub command_suggestions: Vec<CommandPaletteEntry>,
     pub selected_command_suggestion: Option<usize>,
@@ -237,16 +274,7 @@ impl UiState {
     pub fn from_messages(messages: Vec<Message>) -> Self {
         let transcript_lines = messages
             .iter()
-            .map(|message| TranscriptLine {
-                role: transcript_role(message),
-                text: message
-                    .blocks
-                    .iter()
-                    .filter_map(content_block_text)
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-                author_label: transcript_author_label(message),
-            })
+            .map(transcript_line_from_message)
             .collect::<Vec<_>>();
 
         let mut state = Self {
@@ -285,6 +313,19 @@ fn transcript_role(message: &Message) -> String {
         .get(UI_ROLE_ATTRIBUTE)
         .cloned()
         .unwrap_or_else(|| format!("{:?}", message.role).to_lowercase())
+}
+
+pub fn transcript_line_from_message(message: &Message) -> TranscriptLine {
+    TranscriptLine {
+        role: transcript_role(message),
+        text: message
+            .blocks
+            .iter()
+            .filter_map(content_block_text)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        author_label: transcript_author_label(message),
+    }
 }
 
 fn content_block_text(block: &ContentBlock) -> Option<String> {
@@ -762,20 +803,203 @@ enum TranscriptRenderLineKind {
 struct TranscriptRenderLine {
     line: Line<'static>,
     kind: TranscriptRenderLineKind,
+    item_index: Option<usize>,
+    plain_text: String,
 }
 
-fn regular_render_line(line: Line<'static>) -> TranscriptRenderLine {
+fn regular_render_line(
+    line: Line<'static>,
+    item_index: Option<usize>,
+    plain_text: impl Into<String>,
+) -> TranscriptRenderLine {
     TranscriptRenderLine {
         line,
         kind: TranscriptRenderLineKind::Regular,
+        item_index,
+        plain_text: plain_text.into(),
     }
 }
 
-fn group_header_render_line(id: &str, line: Line<'static>) -> TranscriptRenderLine {
+fn group_header_render_line(
+    id: &str,
+    line: Line<'static>,
+    item_index: Option<usize>,
+    plain_text: impl Into<String>,
+) -> TranscriptRenderLine {
     TranscriptRenderLine {
         line,
         kind: TranscriptRenderLineKind::GroupHeader(id.to_owned()),
+        item_index,
+        plain_text: plain_text.into(),
     }
+}
+
+fn styled_line(line: Line<'static>, style: Style) -> Line<'static> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| Span::styled(span.content.to_string(), span.style.patch(style)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn slice_chars(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect::<String>()
+}
+
+fn push_span(spans: &mut Vec<Span<'static>>, text: String, style: Style) {
+    if !text.is_empty() {
+        spans.push(Span::styled(text, style));
+    }
+}
+
+fn highlight_line_range(
+    line: Line<'static>,
+    start: usize,
+    end: usize,
+    style: Style,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+
+    for span in line.spans {
+        let content = span.content.to_string();
+        let span_len = content.chars().count();
+        let span_start = offset;
+        let span_end = offset + span_len;
+
+        if end <= span_start || start >= span_end {
+            push_span(&mut spans, content, span.style);
+            offset = span_end;
+            continue;
+        }
+
+        let local_start = start.saturating_sub(span_start).min(span_len);
+        let local_end = end.saturating_sub(span_start).min(span_len);
+        push_span(
+            &mut spans,
+            slice_chars(&content, 0, local_start),
+            span.style,
+        );
+        push_span(
+            &mut spans,
+            slice_chars(&content, local_start, local_end),
+            span.style.patch(style),
+        );
+        push_span(
+            &mut spans,
+            slice_chars(&content, local_end, span_len),
+            span.style,
+        );
+        offset = span_end;
+    }
+
+    Line::from(spans)
+}
+
+fn search_highlight_style() -> Style {
+    Style::default()
+        .fg(Color::White)
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn message_action_highlight_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn selection_highlight_style() -> Style {
+    Style::default().fg(Color::Black).bg(Color::Yellow)
+}
+
+fn normalize_selection(
+    selection: &TranscriptSelectionState,
+) -> Option<(TranscriptSelectionPoint, TranscriptSelectionPoint)> {
+    if selection.anchor == selection.focus {
+        return None;
+    }
+
+    if selection.anchor.line_index < selection.focus.line_index
+        || (selection.anchor.line_index == selection.focus.line_index
+            && selection.anchor.column <= selection.focus.column)
+    {
+        Some((selection.anchor.clone(), selection.focus.clone()))
+    } else {
+        Some((selection.focus.clone(), selection.anchor.clone()))
+    }
+}
+
+fn selection_range_for_line(
+    selection: &TranscriptSelectionState,
+    line_index: usize,
+    line_len: usize,
+) -> Option<(usize, usize)> {
+    let (start, end) = normalize_selection(selection)?;
+    if line_index < start.line_index || line_index > end.line_index {
+        return None;
+    }
+
+    let range_start = if line_index == start.line_index {
+        start.column.min(line_len)
+    } else {
+        0
+    };
+    let range_end = if line_index == end.line_index {
+        end.column.min(line_len)
+    } else {
+        line_len
+    };
+
+    (range_start < range_end).then_some((range_start, range_end))
+}
+
+fn highlight_transcript_render_line(
+    state: &UiState,
+    render_line: &TranscriptRenderLine,
+    visual_index: usize,
+) -> Line<'static> {
+    let mut line = render_line.line.clone();
+
+    if render_line
+        .item_index
+        .zip(
+            state
+                .transcript_search
+                .as_ref()
+                .and_then(|search| search.active_item),
+        )
+        .is_some_and(|(item_index, active_item)| item_index == active_item)
+    {
+        line = styled_line(line, search_highlight_style());
+    }
+
+    if render_line
+        .item_index
+        .zip(
+            state
+                .message_actions
+                .as_ref()
+                .map(|actions| actions.active_item),
+        )
+        .is_some_and(|(item_index, active_item)| item_index == active_item)
+    {
+        line = styled_line(line, message_action_highlight_style());
+    }
+
+    if let Some(selection) = state.transcript_selection.as_ref() {
+        let line_len = render_line.plain_text.chars().count();
+        if let Some((start, end)) = selection_range_for_line(selection, visual_index, line_len) {
+            line = highlight_line_range(line, start, end, selection_highlight_style());
+        }
+    }
+
+    line
 }
 
 fn indent_line(line: Line<'static>, indent: &str) -> Line<'static> {
@@ -826,21 +1050,33 @@ fn empty_transcript_render_lines(
     command_palette: &[CommandPaletteEntry],
 ) -> Vec<TranscriptRenderLine> {
     let mut lines = vec![
-        regular_render_line(Line::from(Span::styled(
+        regular_render_line(
+            Line::from(Span::styled(
+                "Start a conversation",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            None,
             "Start a conversation",
-            Style::default().add_modifier(Modifier::BOLD),
-        ))),
-        regular_render_line(Line::from(Span::styled(
+        ),
+        regular_render_line(
+            Line::from(Span::styled(
+                "Type a prompt below or start with / to browse commands.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            None,
             "Type a prompt below or start with / to browse commands.",
-            Style::default().fg(Color::DarkGray),
-        ))),
+        ),
     ];
     if !command_palette.is_empty() {
-        lines.push(regular_render_line(Line::from("")));
+        lines.push(regular_render_line(Line::from(""), None, ""));
         for entry in command_palette.iter().take(4) {
             let combined = format!("{}  {}", entry.name, entry.description);
             for segment in wrap_plain_text(&combined, width.max(1) as usize) {
-                lines.push(regular_render_line(Line::from(segment)));
+                lines.push(regular_render_line(
+                    Line::from(segment.clone()),
+                    None,
+                    segment,
+                ));
             }
         }
     }
@@ -853,38 +1089,336 @@ fn transcript_visual_lines(state: &UiState, width: u16) -> Vec<TranscriptRenderL
     }
 
     let mut lines = Vec::new();
+    let mut item_index = 0usize;
 
     for (index, transcript_line) in state.transcript_lines.iter().enumerate() {
         for line in wrapped_transcript_lines(transcript_line, width) {
-            lines.push(regular_render_line(line));
+            let plain_text = line_text(&line);
+            lines.push(regular_render_line(line, Some(item_index), plain_text));
         }
+        item_index += 1;
         if index + 1 < state.transcript_lines.len() || !state.transcript_groups.is_empty() {
-            lines.push(regular_render_line(Line::from("")));
+            lines.push(regular_render_line(Line::from(""), None, ""));
         }
     }
 
     for (group_index, group) in state.transcript_groups.iter().enumerate() {
         for line in group_header_lines(group, width) {
-            lines.push(group_header_render_line(&group.id, line));
+            let plain_text = line_text(&line);
+            lines.push(group_header_render_line(
+                &group.id,
+                line,
+                Some(item_index),
+                plain_text,
+            ));
         }
+        item_index += 1;
 
         if group.expanded && !group.lines.is_empty() {
-            lines.push(regular_render_line(Line::from("")));
+            lines.push(regular_render_line(Line::from(""), None, ""));
             for (line_index, transcript_line) in group.lines.iter().enumerate() {
                 for line in wrapped_transcript_lines(transcript_line, width.saturating_sub(2)) {
-                    lines.push(regular_render_line(indent_line(line, "  ")));
+                    let line = indent_line(line, "  ");
+                    let plain_text = line_text(&line);
+                    lines.push(regular_render_line(line, Some(item_index), plain_text));
                 }
+                item_index += 1;
                 if line_index + 1 < group.lines.len() {
-                    lines.push(regular_render_line(Line::from("")));
+                    lines.push(regular_render_line(Line::from(""), None, ""));
                 }
             }
         }
 
         if group_index + 1 < state.transcript_groups.len() {
-            lines.push(regular_render_line(Line::from("")));
+            lines.push(regular_render_line(Line::from(""), None, ""));
         }
     }
+
+    for (visual_index, render_line) in lines.iter_mut().enumerate() {
+        render_line.line = highlight_transcript_render_line(state, render_line, visual_index);
+    }
+
     lines
+}
+
+fn transcript_searchable_items(state: &UiState) -> Vec<(usize, String)> {
+    let mut items = Vec::new();
+    let mut item_index = 0usize;
+
+    for transcript_line in &state.transcript_lines {
+        items.push((item_index, transcript_line.text.clone()));
+        item_index += 1;
+    }
+
+    for group in &state.transcript_groups {
+        let mut header_text = group.title.clone();
+        if let Some(subtitle) = group
+            .subtitle
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            header_text.push('\n');
+            header_text.push_str(subtitle);
+        }
+        items.push((item_index, header_text));
+        item_index += 1;
+
+        if group.expanded {
+            for transcript_line in &group.lines {
+                items.push((item_index, transcript_line.text.clone()));
+                item_index += 1;
+            }
+        }
+    }
+
+    items
+}
+
+pub fn transcript_search_match_items(state: &UiState, query: &str) -> Vec<usize> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let needle = query.to_lowercase();
+    transcript_searchable_items(state)
+        .into_iter()
+        .filter_map(|(item_index, text)| {
+            text.to_lowercase().contains(&needle).then_some(item_index)
+        })
+        .collect()
+}
+
+fn footer_height_for_state(state: &UiState) -> u16 {
+    if state.show_input || state.transcript_mode {
+        2
+    } else {
+        1
+    }
+}
+
+fn transcript_body_area_for_view(state: &UiState, width: u16, height: u16) -> Option<Rect> {
+    let area = Rect::new(0, 0, width, height);
+    let layout = layout_mode(area, state);
+    if matches!(layout, LayoutMode::TooSmall) {
+        return None;
+    }
+
+    let overlay_visible = overlay_kind(state).is_some();
+    let suggestions_visible =
+        state.show_input && !overlay_visible && !state.command_suggestions.is_empty();
+    let header_width = area.width.saturating_sub(4);
+    let header_height = header_height(state, header_width);
+    let activity_width = area.width.saturating_sub(4);
+    let activity_content = activity_lines(state);
+    let mut activity_height =
+        if should_show_activity_section(state, overlay_visible, suggestions_visible) {
+            wrapped_lines_height(&activity_content, activity_width).min(
+                if matches!(layout, LayoutMode::Compact) {
+                    6
+                } else {
+                    10
+                },
+            )
+        } else {
+            0
+        };
+    let mut suggestion_height = if suggestions_visible {
+        let suggestion_lines = state
+            .command_suggestions
+            .iter()
+            .take(MAX_VISIBLE_SUGGESTIONS)
+            .enumerate()
+            .map(|(index, entry)| {
+                let selected = state.selected_command_suggestion == Some(index);
+                let prefix = if selected { "> " } else { "  " };
+                Line::from(format!("{prefix}{:<14} {}", entry.name, entry.description))
+            })
+            .collect::<Vec<_>>();
+        wrapped_lines_height(&suggestion_lines, area.width.saturating_sub(4))
+            .min(MAX_VISIBLE_SUGGESTIONS as u16 + 2)
+    } else {
+        0
+    };
+    let prompt_height = if state.show_input {
+        prompt_row_height(state, area.width.saturating_sub(2)).max(
+            if matches!(layout, LayoutMode::Compact) {
+                COMPACT_INPUT_HEIGHT.saturating_sub(3)
+            } else {
+                STANDARD_INPUT_HEIGHT.saturating_sub(3)
+            },
+        )
+    } else {
+        0
+    };
+    let mut footer_height = footer_height_for_state(state);
+    let transcript_min_height = if state.show_input {
+        if matches!(layout, LayoutMode::Compact) {
+            4
+        } else {
+            5
+        }
+    } else if matches!(layout, LayoutMode::Compact) {
+        7
+    } else {
+        8
+    };
+
+    if state.show_input {
+        let max_reserved = area.height.saturating_sub(transcript_min_height);
+        while activity_height + suggestion_height + prompt_height + footer_height > max_reserved {
+            if suggestion_height > 0 {
+                suggestion_height -= 1;
+                continue;
+            }
+            if activity_height > 0 {
+                activity_height -= 1;
+                continue;
+            }
+            if footer_height > 1 {
+                footer_height -= 1;
+                continue;
+            }
+            break;
+        }
+    }
+
+    let vertical = if state.show_input {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(header_height),
+                Constraint::Min(transcript_min_height),
+                Constraint::Length(activity_height),
+                Constraint::Length(suggestion_height),
+                Constraint::Length(prompt_height),
+                Constraint::Length(footer_height),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(header_height),
+                Constraint::Min(transcript_min_height),
+                Constraint::Length(footer_height),
+            ])
+            .split(area)
+    };
+
+    Some(vertical[1])
+}
+
+fn scroll_for_visual_line(
+    total_lines: usize,
+    viewport_height: u16,
+    visual_line: usize,
+) -> Option<u16> {
+    if total_lines == 0 || viewport_height == 0 {
+        return None;
+    }
+
+    let max_scroll = total_lines.saturating_sub(viewport_height as usize) as u16;
+    let desired = total_lines.saturating_sub(viewport_height as usize + visual_line) as u16;
+    Some(desired.min(max_scroll))
+}
+
+pub fn transcript_search_scroll_for_view(
+    state: &UiState,
+    width: u16,
+    height: u16,
+    item_index: usize,
+) -> Option<u16> {
+    let body_area = transcript_body_area_for_view(state, width, height)?;
+    let lines = transcript_visual_lines(state, body_area.width);
+    let visual_line = lines
+        .iter()
+        .position(|line| line.item_index == Some(item_index))?;
+    let no_sticky = scroll_for_visual_line(lines.len(), body_area.height, visual_line)?;
+    if no_sticky == 0 {
+        return Some(0);
+    }
+
+    scroll_for_visual_line(
+        lines.len(),
+        body_area.height.saturating_sub(1).max(1),
+        visual_line,
+    )
+}
+
+pub fn transcript_visual_scroll_for_view(
+    state: &UiState,
+    width: u16,
+    height: u16,
+    visual_line: usize,
+) -> Option<u16> {
+    let body_area = transcript_body_area_for_view(state, width, height)?;
+    let lines = transcript_visual_lines(state, body_area.width);
+    let no_sticky = scroll_for_visual_line(lines.len(), body_area.height, visual_line)?;
+    if no_sticky == 0 {
+        return Some(0);
+    }
+
+    scroll_for_visual_line(
+        lines.len(),
+        body_area.height.saturating_sub(1).max(1),
+        visual_line,
+    )
+}
+
+pub fn transcript_selectable_lines_for_view(
+    state: &UiState,
+    width: u16,
+) -> Vec<TranscriptSelectableLine> {
+    transcript_visual_lines(state, width)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(line_index, line)| match line.kind {
+            TranscriptRenderLineKind::Regular => {
+                line.item_index.map(|item_index| TranscriptSelectableLine {
+                    item_index,
+                    line_index,
+                    text: line.plain_text,
+                })
+            }
+            TranscriptRenderLineKind::GroupHeader(_) => None,
+        })
+        .collect()
+}
+
+pub fn transcript_selection_text_for_view(
+    state: &UiState,
+    width: u16,
+    selection: &TranscriptSelectionState,
+) -> Option<String> {
+    let selectable_lines = transcript_selectable_lines_for_view(state, width);
+    let (start, end) = normalize_selection(selection)?;
+    let mut segments = Vec::new();
+
+    for line in selectable_lines {
+        if line.line_index < start.line_index || line.line_index > end.line_index {
+            continue;
+        }
+
+        let line_len = line.text.chars().count();
+        let slice_start = if line.line_index == start.line_index {
+            start.column.min(line_len)
+        } else {
+            0
+        };
+        let slice_end = if line.line_index == end.line_index {
+            end.column.min(line_len)
+        } else {
+            line_len
+        };
+        if slice_start >= slice_end {
+            continue;
+        }
+
+        segments.push(slice_chars(&line.text, slice_start, slice_end));
+    }
+
+    (!segments.is_empty()).then(|| segments.join("\n"))
 }
 
 fn clamped_transcript_scroll(
@@ -1422,6 +1956,56 @@ fn marquee_text(text: &str, width: u16, tick: usize) -> String {
 }
 
 fn footer_primary_text(state: &UiState, suggestions_visible: bool) -> String {
+    if let Some(actions) = state.message_actions.as_ref() {
+        let mut parts = vec![if actions.editable {
+            "Message actions · Enter edit"
+        } else {
+            "Message actions · Enter reuse"
+        }
+        .to_owned()];
+        parts.push("c copy".to_owned());
+        if let Some(label) = actions.primary_input_label.as_deref() {
+            parts.push(format!("p copy {label}"));
+        }
+        return parts.join(" · ");
+    }
+    if let Some(search) = state.transcript_search.as_ref() {
+        let query = search.input_buffer.as_str();
+        let matches = transcript_search_match_items(state, &query);
+        if search.open {
+            if matches.is_empty() {
+                return "Search · Enter keep · Esc cancel".to_owned();
+            }
+            let active_position = search
+                .active_item
+                .and_then(|item| matches.iter().position(|candidate| *candidate == item))
+                .map(|index| index + 1)
+                .unwrap_or(1);
+            return format!(
+                "Search · {active_position}/{} match{} · Enter keep · Esc cancel · n/N next",
+                matches.len(),
+                if matches.len() == 1 { "" } else { "es" }
+            );
+        }
+        if !query.trim().is_empty() {
+            if matches.is_empty() {
+                return format!("Transcript mode · / {query} · no matches · q exit");
+            }
+            let active_position = search
+                .active_item
+                .and_then(|item| matches.iter().position(|candidate| *candidate == item))
+                .map(|index| index + 1)
+                .unwrap_or(1);
+            return format!(
+                "Transcript mode · / {query} · {active_position}/{} match{} · n/N next · q exit",
+                matches.len(),
+                if matches.len() == 1 { "" } else { "es" }
+            );
+        }
+    }
+    if state.transcript_mode {
+        return "Transcript mode · / search · q or Esc exit".to_owned();
+    }
     if state.vim_state.is_insert() {
         return "-- INSERT --".to_owned();
     }
@@ -1457,6 +2041,50 @@ fn footer_widget(
     width: u16,
     suggestions_visible: bool,
 ) -> Paragraph<'static> {
+    if let Some(search) = state
+        .transcript_search
+        .as_ref()
+        .filter(|search| search.open)
+    {
+        let search_text = search.input_buffer.as_str();
+        let search_line = if search.input_buffer.cursor < search_text.chars().count() {
+            let left = search_text
+                .chars()
+                .take(search.input_buffer.cursor)
+                .collect::<String>();
+            let cursor_char = search_text
+                .chars()
+                .skip(search.input_buffer.cursor)
+                .take(1)
+                .collect::<String>();
+            let right = search_text
+                .chars()
+                .skip(search.input_buffer.cursor + 1)
+                .collect::<String>();
+            Line::from(vec![
+                Span::raw("/ "),
+                Span::raw(left),
+                Span::styled(
+                    cursor_char,
+                    Style::default().bg(Color::White).fg(Color::Black),
+                ),
+                Span::raw(right),
+            ])
+        } else {
+            Line::from(vec![
+                Span::raw(format!("/ {search_text}")),
+                Span::styled(" ", Style::default().bg(Color::White)),
+            ])
+        };
+
+        let hint = compose_footer_line(
+            &footer_primary_text(state, suggestions_visible),
+            pane_shortcut_label(),
+            width,
+        );
+        return Paragraph::new(vec![search_line, hint]).wrap(Wrap { trim: false });
+    }
+
     let secondary_text = line_text(&status_line(state));
     let primary = compose_footer_line(
         &footer_primary_text(state, suggestions_visible),
@@ -1880,7 +2508,7 @@ pub fn mouse_action_for_position(
     } else {
         0
     };
-    let mut footer_height = if state.show_input { 2 } else { 1 };
+    let mut footer_height = footer_height_for_state(state);
     let transcript_min_height = if state.show_input {
         if matches!(layout, LayoutMode::Compact) {
             4
@@ -2027,7 +2655,7 @@ fn render_frame(frame: &mut Frame<'_>, state: &UiState) {
     } else {
         0
     };
-    let mut footer_height = if state.show_input { 2 } else { 1 };
+    let mut footer_height = footer_height_for_state(state);
     let transcript_min_height = if state.show_input {
         if matches!(layout, LayoutMode::Compact) {
             4
@@ -2154,15 +2782,28 @@ fn render_frame(frame: &mut Frame<'_>, state: &UiState) {
             footer_area.height,
         );
         if footer_inner.width > 0 && footer_inner.height > 0 {
-            frame.render_widget(
-                Paragraph::new(vec![compose_footer_line(
-                    &line_text(&status_line(state)),
-                    pane_shortcut_label(),
-                    footer_width,
-                )])
-                .wrap(Wrap { trim: false }),
-                footer_inner,
-            );
+            if state.transcript_mode {
+                frame.render_widget(
+                    footer_widget(
+                        state,
+                        active_pane,
+                        layout,
+                        footer_width,
+                        suggestions_visible,
+                    ),
+                    footer_inner,
+                );
+            } else {
+                frame.render_widget(
+                    Paragraph::new(vec![compose_footer_line(
+                        &line_text(&status_line(state)),
+                        pane_shortcut_label(),
+                        footer_width,
+                    )])
+                    .wrap(Wrap { trim: false }),
+                    footer_inner,
+                );
+            }
         }
     }
 
@@ -2195,9 +2836,12 @@ pub fn render_to_string(state: &UiState, width: u16, height: u16) -> Result<Stri
 mod tests {
     use super::{
         footer_primary_text, mouse_action_for_position, pane_shortcut_label, render_to_string,
-        transcript_toggle_label, ChoiceListItem, ChoiceListState, Notification, PaneKind,
-        PermissionPromptState, RatatuiApp, StatusLevel, TranscriptGroup, TranscriptLine,
-        UiMouseAction,
+        transcript_search_match_items, transcript_search_scroll_for_view,
+        transcript_selectable_lines_for_view, transcript_selection_text_for_view,
+        transcript_toggle_label, transcript_visual_lines, ChoiceListItem, ChoiceListState,
+        Notification, PaneKind, PermissionPromptState, RatatuiApp, StatusLevel, TranscriptGroup,
+        TranscriptLine, TranscriptMessageActionsState, TranscriptSearchState,
+        TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
     };
     use code_agent_core::{compatibility_command_registry, ContentBlock, Message, MessageRole};
     use std::collections::BTreeMap;
@@ -2579,5 +3223,157 @@ mod tests {
 
         assert!(initial.contains("chatgpt-codex"));
         assert!(scrolled.contains("call_id") || scrolled.contains("Field required"));
+    }
+
+    #[test]
+    fn footer_switches_to_message_actions_hints() {
+        let mut state = RatatuiApp::new("message-actions").initial_state();
+        state.show_input = true;
+        state.message_actions = Some(TranscriptMessageActionsState {
+            active_item: 0,
+            editable: false,
+            primary_input_label: Some("path".to_owned()),
+        });
+
+        let footer = footer_primary_text(&state, false);
+
+        assert!(footer.contains("Message actions"));
+        assert!(footer.contains("c copy"));
+        assert!(footer.contains("p copy path"));
+    }
+
+    #[test]
+    fn transcript_search_matches_visible_items() {
+        let mut state = RatatuiApp::new("search").initial_state();
+        state.transcript_lines = vec![
+            TranscriptLine {
+                role: "user".to_owned(),
+                text: "first prompt".to_owned(),
+                author_label: None,
+            },
+            TranscriptLine {
+                role: "assistant".to_owned(),
+                text: "error output".to_owned(),
+                author_label: None,
+            },
+        ];
+        state.transcript_groups = vec![TranscriptGroup {
+            id: "pending-step-1".to_owned(),
+            title: "Step 1".to_owned(),
+            subtitle: Some("error detail".to_owned()),
+            expanded: true,
+            lines: vec![TranscriptLine {
+                role: "assistant".to_owned(),
+                text: "resolved".to_owned(),
+                author_label: None,
+            }],
+        }];
+
+        assert_eq!(transcript_search_match_items(&state, "error"), vec![1, 2]);
+    }
+
+    #[test]
+    fn transcript_search_scroll_targets_match() {
+        let mut state = RatatuiApp::new("search-scroll").initial_state();
+        state.transcript_mode = true;
+        let mut input = super::InputBuffer::new();
+        input.replace("line 1");
+        state.transcript_search = Some(TranscriptSearchState {
+            input_buffer: input,
+            open: false,
+            active_item: Some(0),
+        });
+        state.transcript_lines = (1..=14)
+            .map(|index| TranscriptLine {
+                role: "assistant".to_owned(),
+                text: format!("line {index}"),
+                author_label: None,
+            })
+            .collect();
+
+        assert!(
+            transcript_search_scroll_for_view(&state, 72, 12, 0).is_some_and(|scroll| scroll > 0)
+        );
+    }
+
+    #[test]
+    fn transcript_selection_text_uses_visual_line_slices() {
+        let mut state = RatatuiApp::new("selection").initial_state();
+        state.transcript_lines = vec![TranscriptLine {
+            role: "assistant".to_owned(),
+            text: "abcdef".to_owned(),
+            author_label: None,
+        }];
+
+        let selectable_lines = transcript_selectable_lines_for_view(&state, 80);
+        let text = &selectable_lines[0].text;
+        let offset = text.find("abcdef").unwrap();
+        let selection = TranscriptSelectionState {
+            anchor: TranscriptSelectionPoint {
+                line_index: selectable_lines[0].line_index,
+                column: offset + 1,
+            },
+            focus: TranscriptSelectionPoint {
+                line_index: selectable_lines[0].line_index,
+                column: offset + 4,
+            },
+        };
+
+        assert_eq!(
+            transcript_selection_text_for_view(&state, 80, &selection).as_deref(),
+            Some("bcd")
+        );
+    }
+
+    #[test]
+    fn transcript_selection_highlights_exact_range() {
+        let mut state = RatatuiApp::new("selection-highlight").initial_state();
+        state.transcript_lines = vec![TranscriptLine {
+            role: "assistant".to_owned(),
+            text: "abcdef".to_owned(),
+            author_label: None,
+        }];
+        let selectable_lines = transcript_selectable_lines_for_view(&state, 80);
+        let text = &selectable_lines[0].text;
+        let offset = text.find("abcdef").unwrap();
+        state.transcript_selection = Some(TranscriptSelectionState {
+            anchor: TranscriptSelectionPoint {
+                line_index: selectable_lines[0].line_index,
+                column: offset + 1,
+            },
+            focus: TranscriptSelectionPoint {
+                line_index: selectable_lines[0].line_index,
+                column: offset + 4,
+            },
+        });
+
+        let lines = transcript_visual_lines(&state, 80);
+
+        assert!(lines[0].line.spans.iter().any(|span| {
+            span.content.as_ref() == "bcd" && span.style.bg == Some(super::Color::Yellow)
+        }));
+    }
+
+    #[test]
+    fn message_actions_highlight_selected_transcript_item() {
+        let mut state = RatatuiApp::new("action-highlight").initial_state();
+        state.message_actions = Some(TranscriptMessageActionsState {
+            active_item: 0,
+            editable: true,
+            primary_input_label: None,
+        });
+        state.transcript_lines = vec![TranscriptLine {
+            role: "user".to_owned(),
+            text: "selected row".to_owned(),
+            author_label: None,
+        }];
+
+        let lines = transcript_visual_lines(&state, 80);
+
+        assert!(lines[0]
+            .line
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(super::Color::Cyan)));
     }
 }

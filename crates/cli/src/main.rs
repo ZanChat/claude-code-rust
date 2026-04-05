@@ -43,14 +43,18 @@ use code_agent_session::{
 use code_agent_tools::{compatibility_tool_registry, ToolCallRequest, ToolContext, ToolRegistry};
 use code_agent_ui::{
     draw_terminal as draw_tui, mouse_action_for_position, render_to_string as render_tui_to_string,
-    ChoiceListItem, ChoiceListState, CommandPaletteEntry, Notification, PaneKind, PanePreview,
-    PermissionPromptState, QuestionUiEntry, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup,
-    UiMouseAction, UiState,
+    transcript_line_from_message, transcript_search_match_items, transcript_search_scroll_for_view,
+    transcript_selectable_lines_for_view, transcript_selection_text_for_view,
+    transcript_visual_scroll_for_view, ChoiceListItem, ChoiceListState, CommandPaletteEntry,
+    Notification, PaneKind, PanePreview, PermissionPromptState, QuestionUiEntry, RatatuiApp,
+    StatusLevel, TaskUiEntry, TranscriptGroup, TranscriptMessageActionsState,
+    TranscriptSearchState, TranscriptSelectableLine, TranscriptSelectionPoint,
+    TranscriptSelectionState, UiMouseAction, UiState,
 };
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -66,7 +70,6 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::future::Future;
-use std::io::stdout;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -925,17 +928,15 @@ fn pane_from_digit(ch: char) -> Option<PaneKind> {
     Some(PaneKind::ALL[index - 1])
 }
 
-fn pane_shortcut_modifiers() -> KeyModifiers {
-    // VS Code's integrated terminal on macOS often intercepts Cmd+digit before the app sees it.
-    if cfg!(target_os = "macos") {
-        KeyModifiers::SUPER | KeyModifiers::CONTROL
-    } else {
-        KeyModifiers::CONTROL
-    }
+fn pane_shortcut_modifiers_for_terminal() -> KeyModifiers {
+    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER
 }
 
 fn pane_from_shortcut(key: &crossterm::event::KeyEvent) -> Option<PaneKind> {
-    if !key.modifiers.intersects(pane_shortcut_modifiers()) {
+    if !key
+        .modifiers
+        .intersects(pane_shortcut_modifiers_for_terminal())
+    {
         return None;
     }
 
@@ -1109,6 +1110,678 @@ fn pending_permission_from_tasks(cwd: &Path) -> Option<PermissionPromptState> {
     })
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReplTranscriptSearchState {
+    input_buffer: code_agent_ui::InputBuffer,
+    open: bool,
+    active_item: Option<usize>,
+    saved_input_buffer: code_agent_ui::InputBuffer,
+    saved_active_item: Option<usize>,
+    anchor_scroll: u16,
+}
+
+impl ReplTranscriptSearchState {
+    fn ui_state(&self) -> TranscriptSearchState {
+        TranscriptSearchState {
+            input_buffer: self.input_buffer.clone(),
+            open: self.open,
+            active_item: self.active_item,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplMessageActionState {
+    selected_item: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ReplMessageActionItem {
+    item_index: usize,
+    message: Message,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplMessageActionNavigation {
+    Prev,
+    Next,
+    PrevUser,
+    NextUser,
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ToolPrimaryInput {
+    label: &'static str,
+    value: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReplInteractionState {
+    transcript_mode: bool,
+    transcript_search: ReplTranscriptSearchState,
+    message_actions: Option<ReplMessageActionState>,
+    transcript_selection: Option<TranscriptSelectionState>,
+}
+
+fn enter_transcript_mode(interaction_state: &mut ReplInteractionState, active_pane: &mut PaneKind) {
+    interaction_state.transcript_mode = true;
+    *active_pane = PaneKind::Transcript;
+}
+
+fn exit_transcript_mode(interaction_state: &mut ReplInteractionState) {
+    interaction_state.transcript_mode = false;
+    interaction_state.transcript_search.reset();
+    interaction_state.message_actions = None;
+    interaction_state.transcript_selection = None;
+}
+
+fn open_transcript_search(search_state: &mut ReplTranscriptSearchState, transcript_scroll: u16) {
+    if !search_state.open {
+        search_state.saved_input_buffer = search_state.input_buffer.clone();
+        search_state.saved_active_item = search_state.active_item;
+        search_state.anchor_scroll = transcript_scroll;
+    }
+    search_state.open = true;
+    search_state.input_buffer.cursor = search_state.input_buffer.chars.len();
+}
+
+fn cancel_transcript_search(
+    search_state: &mut ReplTranscriptSearchState,
+    transcript_scroll: &mut u16,
+) {
+    search_state.input_buffer = search_state.saved_input_buffer.clone();
+    search_state.active_item = search_state.saved_active_item;
+    search_state.open = false;
+    *transcript_scroll = search_state.anchor_scroll;
+}
+
+fn sync_transcript_search_preview(
+    ui_state: &code_agent_ui::UiState,
+    terminal_width: u16,
+    terminal_height: u16,
+    search_state: &mut ReplTranscriptSearchState,
+    transcript_scroll: &mut u16,
+) {
+    let query = search_state.input_buffer.as_str();
+    if query.trim().is_empty() {
+        search_state.active_item = None;
+        *transcript_scroll = search_state.anchor_scroll;
+        return;
+    }
+
+    let matches = transcript_search_match_items(ui_state, &query);
+    if matches.is_empty() {
+        search_state.active_item = None;
+        *transcript_scroll = search_state.anchor_scroll;
+        return;
+    }
+
+    let active_item = search_state
+        .active_item
+        .filter(|item| matches.contains(item))
+        .unwrap_or(matches[0]);
+    search_state.active_item = Some(active_item);
+    if let Some(scroll) =
+        transcript_search_scroll_for_view(ui_state, terminal_width, terminal_height, active_item)
+    {
+        *transcript_scroll = scroll;
+    }
+}
+
+fn step_transcript_search_match(
+    ui_state: &code_agent_ui::UiState,
+    terminal_width: u16,
+    terminal_height: u16,
+    search_state: &mut ReplTranscriptSearchState,
+    transcript_scroll: &mut u16,
+    reverse: bool,
+) -> bool {
+    let query = search_state.input_buffer.as_str();
+    let matches = transcript_search_match_items(ui_state, &query);
+    if matches.is_empty() {
+        search_state.active_item = None;
+        return false;
+    }
+
+    let next_index = match search_state
+        .active_item
+        .and_then(|item| matches.iter().position(|candidate| *candidate == item))
+    {
+        Some(index) if reverse => index.checked_sub(1).unwrap_or(matches.len() - 1),
+        Some(index) => {
+            if index + 1 < matches.len() {
+                index + 1
+            } else {
+                0
+            }
+        }
+        None if reverse => matches.len() - 1,
+        None => 0,
+    };
+
+    let active_item = matches[next_index];
+    search_state.active_item = Some(active_item);
+    if let Some(scroll) =
+        transcript_search_scroll_for_view(ui_state, terminal_width, terminal_height, active_item)
+    {
+        *transcript_scroll = scroll;
+    }
+    true
+}
+
+fn push_message_action_items(
+    items: &mut Vec<ReplMessageActionItem>,
+    messages: &[Message],
+    item_index: &mut usize,
+) {
+    for message in messages {
+        let transcript_line = transcript_line_from_message(message);
+        if !transcript_line.text.trim().is_empty() {
+            items.push(ReplMessageActionItem {
+                item_index: *item_index,
+                message: message.clone(),
+            });
+        }
+        *item_index += 1;
+    }
+}
+
+fn message_action_items_from_runtime(
+    runtime_messages: &[Message],
+    pending_view: Option<&PendingReplView>,
+) -> Vec<ReplMessageActionItem> {
+    let mut items = Vec::new();
+    let mut item_index = 0usize;
+
+    if let Some(pending_view) = pending_view.filter(|view| !view.steps.is_empty()) {
+        let first_step_start = pending_view
+            .steps
+            .first()
+            .map(|step| step.start_index.min(runtime_messages.len()))
+            .unwrap_or(runtime_messages.len());
+        push_message_action_items(
+            &mut items,
+            &runtime_messages[..first_step_start],
+            &mut item_index,
+        );
+
+        for (index, step) in pending_view.steps.iter().enumerate() {
+            item_index += 1;
+
+            if !step.expanded {
+                continue;
+            }
+
+            let end_index = pending_view
+                .steps
+                .get(index + 1)
+                .map(|next| next.start_index)
+                .unwrap_or(runtime_messages.len())
+                .min(runtime_messages.len());
+            let start_index = step.start_index.min(end_index);
+            push_message_action_items(
+                &mut items,
+                &runtime_messages[start_index..end_index],
+                &mut item_index,
+            );
+        }
+
+        return items;
+    }
+
+    push_message_action_items(&mut items, runtime_messages, &mut item_index);
+    items
+}
+
+fn enter_message_actions(
+    interaction_state: &mut ReplInteractionState,
+    items: &[ReplMessageActionItem],
+) -> bool {
+    let Some(item) = items.last() else {
+        return false;
+    };
+
+    interaction_state.transcript_search.reset();
+    interaction_state.transcript_selection = None;
+    interaction_state.message_actions = Some(ReplMessageActionState {
+        selected_item: item.item_index,
+    });
+    true
+}
+
+fn normalize_message_actions(
+    interaction_state: &mut ReplInteractionState,
+    items: &[ReplMessageActionItem],
+) -> Option<usize> {
+    let actions = interaction_state.message_actions.as_mut()?;
+    if items.is_empty() {
+        interaction_state.message_actions = None;
+        return None;
+    }
+
+    if !items
+        .iter()
+        .any(|item| item.item_index == actions.selected_item)
+    {
+        actions.selected_item = items.last()?.item_index;
+    }
+
+    Some(actions.selected_item)
+}
+
+fn selected_message_action_item<'a>(
+    interaction_state: &mut ReplInteractionState,
+    items: &'a [ReplMessageActionItem],
+) -> Option<&'a ReplMessageActionItem> {
+    let selected_item = normalize_message_actions(interaction_state, items)?;
+    items.iter().find(|item| item.item_index == selected_item)
+}
+
+fn move_message_action_selection(
+    interaction_state: &mut ReplInteractionState,
+    items: &[ReplMessageActionItem],
+    navigation: ReplMessageActionNavigation,
+) -> bool {
+    let Some(selected_item) = normalize_message_actions(interaction_state, items) else {
+        return false;
+    };
+
+    let Some(current_index) = items
+        .iter()
+        .position(|item| item.item_index == selected_item)
+    else {
+        return false;
+    };
+
+    let target_index = match navigation {
+        ReplMessageActionNavigation::Top => 0,
+        ReplMessageActionNavigation::Bottom => items.len().saturating_sub(1),
+        ReplMessageActionNavigation::Prev => {
+            current_index.checked_sub(1).unwrap_or(items.len() - 1)
+        }
+        ReplMessageActionNavigation::Next => {
+            if current_index + 1 < items.len() {
+                current_index + 1
+            } else {
+                0
+            }
+        }
+        ReplMessageActionNavigation::PrevUser => (1..=items.len())
+            .find_map(|offset| {
+                let index = (current_index + items.len() - offset) % items.len();
+                (items[index].message.role == MessageRole::User).then_some(index)
+            })
+            .unwrap_or(current_index),
+        ReplMessageActionNavigation::NextUser => (1..=items.len())
+            .find_map(|offset| {
+                let index = (current_index + offset) % items.len();
+                (items[index].message.role == MessageRole::User).then_some(index)
+            })
+            .unwrap_or(current_index),
+    };
+
+    let next_item = &items[target_index];
+    if next_item.item_index == selected_item {
+        return false;
+    }
+
+    if let Some(actions) = interaction_state.message_actions.as_mut() {
+        actions.selected_item = next_item.item_index;
+        return true;
+    }
+
+    false
+}
+
+fn sync_message_action_preview(
+    ui_state: &code_agent_ui::UiState,
+    terminal_width: u16,
+    terminal_height: u16,
+    interaction_state: &ReplInteractionState,
+    transcript_scroll: &mut u16,
+) {
+    let Some(selected_item) = interaction_state
+        .message_actions
+        .as_ref()
+        .map(|actions| actions.selected_item)
+    else {
+        return;
+    };
+
+    if let Some(scroll) =
+        transcript_search_scroll_for_view(ui_state, terminal_width, terminal_height, selected_item)
+    {
+        *transcript_scroll = scroll;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptSelectionMove {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+}
+
+fn should_clear_transcript_selection_on_key(key: &KeyEvent) -> bool {
+    let is_nav = matches!(
+        key.code,
+        KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+    );
+    if is_nav
+        && (key.modifiers.contains(KeyModifiers::SHIFT)
+            || key.modifiers.contains(KeyModifiers::ALT)
+            || key.modifiers.contains(KeyModifiers::SUPER))
+    {
+        return false;
+    }
+    true
+}
+
+fn transcript_selection_move_for_key(
+    key: &KeyEvent,
+    selection_exists: bool,
+) -> Option<TranscriptSelectionMove> {
+    if !key.modifiers.contains(KeyModifiers::SHIFT)
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Left => Some(TranscriptSelectionMove::Left),
+        KeyCode::Right => Some(TranscriptSelectionMove::Right),
+        KeyCode::Home => Some(TranscriptSelectionMove::LineStart),
+        KeyCode::End => Some(TranscriptSelectionMove::LineEnd),
+        KeyCode::Up if selection_exists => Some(TranscriptSelectionMove::Up),
+        KeyCode::Down if selection_exists => Some(TranscriptSelectionMove::Down),
+        _ => None,
+    }
+}
+
+fn transcript_selectable_line_position(
+    selectable_lines: &[TranscriptSelectableLine],
+    line_index: usize,
+) -> Option<usize> {
+    selectable_lines
+        .iter()
+        .position(|line| line.line_index == line_index)
+}
+
+fn transcript_selection_default_focus(
+    selectable_lines: &[TranscriptSelectableLine],
+) -> Option<TranscriptSelectionPoint> {
+    let line = selectable_lines.last()?;
+    Some(TranscriptSelectionPoint {
+        line_index: line.line_index,
+        column: line.text.chars().count(),
+    })
+}
+
+fn move_transcript_selection_focus(
+    selectable_lines: &[TranscriptSelectableLine],
+    focus: &TranscriptSelectionPoint,
+    selection_move: TranscriptSelectionMove,
+) -> Option<TranscriptSelectionPoint> {
+    let current_position = transcript_selectable_line_position(selectable_lines, focus.line_index)?;
+    let current_line = &selectable_lines[current_position];
+    let current_len = current_line.text.chars().count();
+
+    let next_focus = match selection_move {
+        TranscriptSelectionMove::Left => {
+            if focus.column > 0 {
+                TranscriptSelectionPoint {
+                    line_index: focus.line_index,
+                    column: focus.column - 1,
+                }
+            } else {
+                let previous_line = selectable_lines.get(current_position.checked_sub(1)?)?;
+                TranscriptSelectionPoint {
+                    line_index: previous_line.line_index,
+                    column: previous_line.text.chars().count(),
+                }
+            }
+        }
+        TranscriptSelectionMove::Right => {
+            if focus.column < current_len {
+                TranscriptSelectionPoint {
+                    line_index: focus.line_index,
+                    column: focus.column + 1,
+                }
+            } else {
+                let next_line = selectable_lines.get(current_position + 1)?;
+                TranscriptSelectionPoint {
+                    line_index: next_line.line_index,
+                    column: 0,
+                }
+            }
+        }
+        TranscriptSelectionMove::LineStart => TranscriptSelectionPoint {
+            line_index: focus.line_index,
+            column: 0,
+        },
+        TranscriptSelectionMove::LineEnd => TranscriptSelectionPoint {
+            line_index: focus.line_index,
+            column: current_len,
+        },
+        TranscriptSelectionMove::Up => {
+            let previous_line = selectable_lines.get(current_position.checked_sub(1)?)?;
+            TranscriptSelectionPoint {
+                line_index: previous_line.line_index,
+                column: focus.column.min(previous_line.text.chars().count()),
+            }
+        }
+        TranscriptSelectionMove::Down => {
+            let next_line = selectable_lines.get(current_position + 1)?;
+            TranscriptSelectionPoint {
+                line_index: next_line.line_index,
+                column: focus.column.min(next_line.text.chars().count()),
+            }
+        }
+    };
+
+    (next_focus != *focus).then_some(next_focus)
+}
+
+fn move_transcript_selection(
+    interaction_state: &mut ReplInteractionState,
+    selectable_lines: &[TranscriptSelectableLine],
+    selection_move: TranscriptSelectionMove,
+) -> Option<TranscriptSelectionPoint> {
+    let anchor = interaction_state
+        .transcript_selection
+        .as_ref()
+        .map(|selection| selection.anchor.clone())
+        .or_else(|| transcript_selection_default_focus(selectable_lines))?;
+    let focus = interaction_state
+        .transcript_selection
+        .as_ref()
+        .map(|selection| selection.focus.clone())
+        .unwrap_or_else(|| anchor.clone());
+    let next_focus = move_transcript_selection_focus(selectable_lines, &focus, selection_move)?;
+
+    if next_focus == anchor {
+        interaction_state.transcript_selection = None;
+        return Some(anchor);
+    }
+
+    interaction_state.transcript_selection = Some(TranscriptSelectionState {
+        anchor,
+        focus: next_focus.clone(),
+    });
+    Some(next_focus)
+}
+
+fn sync_transcript_selection_preview(
+    ui_state: &code_agent_ui::UiState,
+    terminal_width: u16,
+    terminal_height: u16,
+    interaction_state: &ReplInteractionState,
+    transcript_scroll: &mut u16,
+) {
+    let Some(focus_line) = interaction_state
+        .transcript_selection
+        .as_ref()
+        .map(|selection| selection.focus.line_index)
+    else {
+        return;
+    };
+
+    if let Some(scroll) =
+        transcript_visual_scroll_for_view(ui_state, terminal_width, terminal_height, focus_line)
+    {
+        *transcript_scroll = scroll;
+    }
+}
+
+fn transcript_selection_copy_text(
+    ui_state: &code_agent_ui::UiState,
+    terminal_width: u16,
+    interaction_state: &ReplInteractionState,
+) -> Option<String> {
+    interaction_state
+        .transcript_selection
+        .as_ref()
+        .and_then(|selection| {
+            transcript_selection_text_for_view(ui_state, terminal_width, selection)
+        })
+}
+
+fn primary_input_keys(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
+        "Read" | "Edit" | "Write" | "NotebookEdit" | "file_read" | "file_edit" | "file_write"
+        | "read_file" | "create_file" | "apply_patch" | "view_image" | "list_dir"
+        | "edit_notebook_file" | "create_directory" => {
+            &["file_path", "path", "filePath", "dirPath", "notebook_path"]
+        }
+        "Bash" | "bash" | "powershell" | "terminal_capture" | "run_in_terminal" => &["command"],
+        "Grep" | "grep" | "grep_search" => &["pattern", "query"],
+        "Glob" | "glob" | "file_search" => &["pattern", "query"],
+        "WebFetch" | "fetch_webpage" => &["url", "query"],
+        "WebSearch" | "semantic_search" => &["query"],
+        "Task" | "Agent" | "runSubagent" => &["prompt", "description", "query"],
+        _ => &[
+            "command",
+            "file_path",
+            "path",
+            "filePath",
+            "dirPath",
+            "query",
+            "pattern",
+            "url",
+            "prompt",
+            "title",
+        ],
+    }
+}
+
+fn primary_input_label(key: &str) -> &'static str {
+    match key {
+        "file_path" | "path" | "filePath" | "dirPath" | "notebook_path" => "path",
+        "command" => "command",
+        "query" => "query",
+        "pattern" => "pattern",
+        "url" => "url",
+        "prompt" => "prompt",
+        "description" => "description",
+        "title" => "title",
+        _ => "input",
+    }
+}
+
+fn primary_input_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        }
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Array(items) => {
+            let joined = items
+                .iter()
+                .filter_map(primary_input_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!joined.trim().is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
+
+fn tool_primary_input(call: &code_agent_core::ToolCall) -> Option<ToolPrimaryInput> {
+    let payload = serde_json::from_str::<Value>(&call.input_json).ok()?;
+    for key in primary_input_keys(&call.name) {
+        if let Some(value) = payload.get(*key).and_then(primary_input_string) {
+            return Some(ToolPrimaryInput {
+                label: primary_input_label(key),
+                value,
+            });
+        }
+    }
+    None
+}
+
+fn message_tool_call(message: &Message) -> Option<&code_agent_core::ToolCall> {
+    message.blocks.iter().find_map(|block| match block {
+        ContentBlock::ToolCall { call } => Some(call),
+        _ => None,
+    })
+}
+
+fn message_primary_input(message: &Message) -> Option<ToolPrimaryInput> {
+    message_tool_call(message).and_then(tool_primary_input)
+}
+
+fn message_action_copy_text(message: &Message) -> Option<String> {
+    let text = message_text(message);
+    if !text.trim().is_empty() {
+        return Some(text);
+    }
+
+    if let Some(primary_input) = message_primary_input(message) {
+        return Some(primary_input.value);
+    }
+
+    let transcript_line = transcript_line_from_message(message);
+    (!transcript_line.text.trim().is_empty()).then_some(transcript_line.text)
+}
+
+fn message_actions_ui_state(
+    interaction_state: &ReplInteractionState,
+    items: &[ReplMessageActionItem],
+) -> Option<TranscriptMessageActionsState> {
+    let selected_item = interaction_state
+        .message_actions
+        .as_ref()
+        .map(|actions| actions.selected_item)?;
+    let item = items.iter().find(|item| item.item_index == selected_item)?;
+
+    Some(TranscriptMessageActionsState {
+        active_item: selected_item,
+        editable: item.message.role == MessageRole::User,
+        primary_input_label: message_primary_input(&item.message)
+            .map(|input| input.label.to_owned()),
+    })
+}
+
 fn build_repl_ui_state(
     app: &RatatuiApp,
     registry: &code_agent_core::CommandRegistry,
@@ -1128,8 +1801,10 @@ fn build_repl_ui_state(
     command_suggestions: Vec<CommandPaletteEntry>,
     selected_command_suggestion: usize,
     status_marquee_tick: usize,
+    interaction_state: &ReplInteractionState,
 ) -> code_agent_ui::UiState {
     let runtime_messages = materialize_runtime_messages(raw_messages);
+    let message_action_items = message_action_items_from_runtime(&runtime_messages, pending_view);
     let mut state = app.state_from_messages(runtime_messages.clone(), &registry.all());
     if let Some(pending_view) = pending_view {
         state.queued_inputs = pending_view
@@ -1202,12 +1877,27 @@ fn build_repl_ui_state(
     }
     apply_repl_header(&mut state, provider, active_model, cwd, session_id);
     let (task_items, question_items) = load_task_ui_data(cwd);
-    state.show_input = true;
+    state.show_input = !interaction_state.transcript_mode;
     state.input_buffer = input_buffer.clone();
     state.transcript_scroll = transcript_scroll;
     state.status_line = status_line.to_owned();
     state.progress_message = progress_message;
-    state.active_pane = Some(active_pane);
+    state.active_pane = Some(
+        if interaction_state.transcript_mode
+            || interaction_state.message_actions.is_some()
+            || interaction_state.transcript_selection.is_some()
+        {
+            PaneKind::Transcript
+        } else {
+            active_pane
+        },
+    );
+    state.transcript_mode = interaction_state.transcript_mode;
+    state.transcript_search = interaction_state
+        .transcript_mode
+        .then(|| interaction_state.transcript_search.ui_state());
+    state.message_actions = message_actions_ui_state(interaction_state, &message_action_items);
+    state.transcript_selection = interaction_state.transcript_selection.clone();
     state.choice_list = choice_list;
     state.compact_banner = compact_banner;
     state.command_suggestions = command_suggestions;
@@ -1263,6 +1953,7 @@ fn draw_repl_state(
     selected_command_suggestion: &mut usize,
     vim_state: &code_agent_ui::vim::VimState,
     status_marquee_tick: usize,
+    interaction_state: &ReplInteractionState,
 ) -> Result<()> {
     let suggestions = sync_command_selection(registry, input_buffer, selected_command_suggestion);
     let app = RatatuiApp::new(format!("{provider}  {active_model}"));
@@ -1285,6 +1976,7 @@ fn draw_repl_state(
         suggestions,
         *selected_command_suggestion,
         status_marquee_tick,
+        interaction_state,
     );
     state.vim_state = vim_state.clone();
     draw_tui(terminal, &state)
@@ -1309,6 +2001,7 @@ fn repl_mouse_action(
     selected_command_suggestion: usize,
     status_marquee_tick: usize,
     mouse: &MouseEvent,
+    interaction_state: &ReplInteractionState,
 ) -> Result<Option<UiMouseAction>> {
     let app = RatatuiApp::new(format!("{provider}  {active_model}"));
     let state = build_repl_ui_state(
@@ -1330,6 +2023,7 @@ fn repl_mouse_action(
         command_suggestions(registry, input_buffer),
         selected_command_suggestion,
         status_marquee_tick,
+        interaction_state,
     );
     let size = terminal.size()?;
     Ok(mouse_action_for_position(
@@ -1550,6 +2244,7 @@ async fn run_pending_repl_operation<F, T>(
     transcript_scroll: &mut u16,
     selected_command_suggestion: &mut usize,
     vim_state: &mut code_agent_ui::vim::VimState,
+    interaction_state: &mut ReplInteractionState,
     operation: F,
 ) -> Result<PendingReplOperationResult<T>>
 where
@@ -1557,6 +2252,7 @@ where
 {
     let mut operation = std::pin::pin!(operation);
     let mut tick = 0usize;
+    let mut compact_banner = compact_banner;
 
     loop {
         let pending_snapshot = pending_repl_snapshot(&pending_view);
@@ -1567,9 +2263,11 @@ where
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => {
+                        interaction_state.transcript_selection = None;
                         scroll_up(transcript_scroll, 3);
                     }
                     MouseEventKind::ScrollDown => {
+                        interaction_state.transcript_selection = None;
                         scroll_down(transcript_scroll, 3);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -1596,6 +2294,7 @@ where
                             *selected_command_suggestion,
                             tick,
                             &mouse,
+                            interaction_state,
                         )? {
                             match action {
                                 UiMouseAction::JumpToBottom => {
@@ -1613,12 +2312,609 @@ where
                     if matches!(key.code, KeyCode::Char('c'))
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
+                        if interaction_state.transcript_search.open {
+                            cancel_transcript_search(
+                                &mut interaction_state.transcript_search,
+                                transcript_scroll,
+                            );
+                            continue;
+                        }
+                        if interaction_state.message_actions.is_some() {
+                            interaction_state.message_actions = None;
+                            continue;
+                        }
+                        if interaction_state.transcript_selection.is_some() {
+                            let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                            let state = build_repl_ui_state(
+                                &app,
+                                registry,
+                                &pending_snapshot.messages,
+                                Some(&pending_snapshot),
+                                cwd,
+                                provider,
+                                active_model,
+                                session_id,
+                                input_buffer,
+                                status_line,
+                                Some(format!(
+                                    "{} {}",
+                                    pending_spinner_frame(tick),
+                                    pending_snapshot.progress_label
+                                )),
+                                *active_pane,
+                                compact_banner.clone(),
+                                *transcript_scroll,
+                                None,
+                                command_suggestions(registry, input_buffer),
+                                *selected_command_suggestion,
+                                tick,
+                                interaction_state,
+                            );
+                            let size = terminal.size()?;
+                            if let Some(text) = transcript_selection_copy_text(
+                                &state,
+                                size.width,
+                                interaction_state,
+                            ) {
+                                compact_banner = Some(
+                                    copy_text_with_fallback_notice(&text, "selection")
+                                        .unwrap_or_else(|error| format!("Copy failed: {error}")),
+                                );
+                            }
+                            interaction_state.transcript_selection = None;
+                            continue;
+                        }
+                        if interaction_state.transcript_mode {
+                            exit_transcript_mode(interaction_state);
+                            continue;
+                        }
                         return Ok(PendingReplOperationResult::Interrupted);
                     }
-                    if matches!(key.code, KeyCode::Char('o'))
+
+                    if matches!(key.code, KeyCode::Up)
+                        && key.modifiers == KeyModifiers::SHIFT
+                        && interaction_state.message_actions.is_none()
+                        && interaction_state.transcript_selection.is_none()
+                        && !interaction_state.transcript_search.open
+                    {
+                        let message_action_items = message_action_items_from_runtime(
+                            &pending_snapshot.messages,
+                            Some(&pending_snapshot),
+                        );
+                        if enter_message_actions(interaction_state, &message_action_items) {
+                            let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                            let state = build_repl_ui_state(
+                                &app,
+                                registry,
+                                &pending_snapshot.messages,
+                                Some(&pending_snapshot),
+                                cwd,
+                                provider,
+                                active_model,
+                                session_id,
+                                input_buffer,
+                                status_line,
+                                Some(format!(
+                                    "{} {}",
+                                    pending_spinner_frame(tick),
+                                    pending_snapshot.progress_label
+                                )),
+                                *active_pane,
+                                compact_banner.clone(),
+                                *transcript_scroll,
+                                None,
+                                command_suggestions(registry, input_buffer),
+                                *selected_command_suggestion,
+                                tick,
+                                interaction_state,
+                            );
+                            let size = terminal.size()?;
+                            sync_message_action_preview(
+                                &state,
+                                size.width,
+                                size.height,
+                                interaction_state,
+                                transcript_scroll,
+                            );
+                        }
+                        continue;
+                    }
+
+                    if interaction_state.message_actions.is_some() {
+                        let message_action_items = message_action_items_from_runtime(
+                            &pending_snapshot.messages,
+                            Some(&pending_snapshot),
+                        );
+                        if selected_message_action_item(interaction_state, &message_action_items)
+                            .is_none()
+                        {
+                            interaction_state.message_actions = None;
+                            continue;
+                        }
+
+                        let mut selection_changed = false;
+                        match key.code {
+                            KeyCode::Esc => {
+                                interaction_state.message_actions = None;
+                            }
+                            KeyCode::Enter => {
+                                let prompt_text = selected_message_action_item(
+                                    interaction_state,
+                                    &message_action_items,
+                                )
+                                .and_then(|item| {
+                                    (item.message.role == MessageRole::User)
+                                        .then(|| message_text(&item.message))
+                                });
+                                if let Some(prompt_text) =
+                                    prompt_text.filter(|text| !text.trim().is_empty())
+                                {
+                                    input_buffer.replace(prompt_text);
+                                    interaction_state.message_actions = None;
+                                    if interaction_state.transcript_mode {
+                                        exit_transcript_mode(interaction_state);
+                                    }
+                                }
+                            }
+                            KeyCode::Char('c') if key.modifiers.is_empty() => {
+                                if let Some(text) = selected_message_action_item(
+                                    interaction_state,
+                                    &message_action_items,
+                                )
+                                .and_then(|item| message_action_copy_text(&item.message))
+                                {
+                                    compact_banner = Some(
+                                        copy_text_with_fallback_notice(&text, "message")
+                                            .unwrap_or_else(|error| {
+                                                format!("Copy failed: {error}")
+                                            }),
+                                    );
+                                }
+                                interaction_state.message_actions = None;
+                            }
+                            KeyCode::Char('p') if key.modifiers.is_empty() => {
+                                if let Some(primary_input) = selected_message_action_item(
+                                    interaction_state,
+                                    &message_action_items,
+                                )
+                                .and_then(|item| message_primary_input(&item.message))
+                                {
+                                    compact_banner = Some(
+                                        copy_text_with_fallback_notice(
+                                            &primary_input.value,
+                                            primary_input.label,
+                                        )
+                                        .unwrap_or_else(|error| format!("Copy failed: {error}")),
+                                    );
+                                }
+                                interaction_state.message_actions = None;
+                            }
+                            KeyCode::Up if key.modifiers == KeyModifiers::SHIFT => {
+                                selection_changed = move_message_action_selection(
+                                    interaction_state,
+                                    &message_action_items,
+                                    ReplMessageActionNavigation::PrevUser,
+                                );
+                            }
+                            KeyCode::Down if key.modifiers == KeyModifiers::SHIFT => {
+                                selection_changed = move_message_action_selection(
+                                    interaction_state,
+                                    &message_action_items,
+                                    ReplMessageActionNavigation::NextUser,
+                                );
+                            }
+                            KeyCode::Up => {
+                                selection_changed = move_message_action_selection(
+                                    interaction_state,
+                                    &message_action_items,
+                                    ReplMessageActionNavigation::Prev,
+                                );
+                            }
+                            KeyCode::Down => {
+                                selection_changed = move_message_action_selection(
+                                    interaction_state,
+                                    &message_action_items,
+                                    ReplMessageActionNavigation::Next,
+                                );
+                            }
+                            KeyCode::Char('k') if key.modifiers.is_empty() => {
+                                selection_changed = move_message_action_selection(
+                                    interaction_state,
+                                    &message_action_items,
+                                    ReplMessageActionNavigation::Prev,
+                                );
+                            }
+                            KeyCode::Char('j') if key.modifiers.is_empty() => {
+                                selection_changed = move_message_action_selection(
+                                    interaction_state,
+                                    &message_action_items,
+                                    ReplMessageActionNavigation::Next,
+                                );
+                            }
+                            KeyCode::Home => {
+                                selection_changed = move_message_action_selection(
+                                    interaction_state,
+                                    &message_action_items,
+                                    ReplMessageActionNavigation::Top,
+                                );
+                            }
+                            KeyCode::End => {
+                                selection_changed = move_message_action_selection(
+                                    interaction_state,
+                                    &message_action_items,
+                                    ReplMessageActionNavigation::Bottom,
+                                );
+                            }
+                            _ => {}
+                        }
+
+                        if selection_changed {
+                            let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                            let state = build_repl_ui_state(
+                                &app,
+                                registry,
+                                &pending_snapshot.messages,
+                                Some(&pending_snapshot),
+                                cwd,
+                                provider,
+                                active_model,
+                                session_id,
+                                input_buffer,
+                                status_line,
+                                Some(format!(
+                                    "{} {}",
+                                    pending_spinner_frame(tick),
+                                    pending_snapshot.progress_label
+                                )),
+                                *active_pane,
+                                compact_banner.clone(),
+                                *transcript_scroll,
+                                None,
+                                command_suggestions(registry, input_buffer),
+                                *selected_command_suggestion,
+                                tick,
+                                interaction_state,
+                            );
+                            let size = terminal.size()?;
+                            sync_message_action_preview(
+                                &state,
+                                size.width,
+                                size.height,
+                                interaction_state,
+                                transcript_scroll,
+                            );
+                        }
+
+                        continue;
+                    }
+                    if matches!(key.code, KeyCode::Char('e'))
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         toggle_all_pending_repl_groups(&pending_view);
+                        continue;
+                    }
+
+                    if interaction_state.transcript_mode {
+                        if interaction_state.transcript_search.open {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    cancel_transcript_search(
+                                        &mut interaction_state.transcript_search,
+                                        transcript_scroll,
+                                    );
+                                }
+                                KeyCode::Enter => {
+                                    interaction_state.transcript_search.open = false;
+                                    let app =
+                                        RatatuiApp::new(format!("{provider}  {active_model}"));
+                                    let state = build_repl_ui_state(
+                                        &app,
+                                        registry,
+                                        &pending_snapshot.messages,
+                                        Some(&pending_snapshot),
+                                        cwd,
+                                        provider,
+                                        active_model,
+                                        session_id,
+                                        input_buffer,
+                                        status_line,
+                                        Some(format!(
+                                            "{} {}",
+                                            pending_spinner_frame(tick),
+                                            pending_snapshot.progress_label
+                                        )),
+                                        *active_pane,
+                                        compact_banner.clone(),
+                                        *transcript_scroll,
+                                        None,
+                                        command_suggestions(registry, input_buffer),
+                                        *selected_command_suggestion,
+                                        tick,
+                                        interaction_state,
+                                    );
+                                    let size = terminal.size()?;
+                                    sync_transcript_search_preview(
+                                        &state,
+                                        size.width,
+                                        size.height,
+                                        &mut interaction_state.transcript_search,
+                                        transcript_scroll,
+                                    );
+                                    if interaction_state.transcript_search.active_item.is_none() {
+                                        interaction_state.transcript_search.reset();
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    interaction_state.transcript_search.input_buffer.cursor =
+                                        interaction_state
+                                            .transcript_search
+                                            .input_buffer
+                                            .cursor
+                                            .saturating_sub(1);
+                                }
+                                KeyCode::Right => {
+                                    let input =
+                                        &mut interaction_state.transcript_search.input_buffer;
+                                    input.cursor = (input.cursor + 1).min(input.chars.len());
+                                }
+                                KeyCode::Backspace => {
+                                    interaction_state.transcript_search.input_buffer.pop();
+                                    let app =
+                                        RatatuiApp::new(format!("{provider}  {active_model}"));
+                                    let state = build_repl_ui_state(
+                                        &app,
+                                        registry,
+                                        &pending_snapshot.messages,
+                                        Some(&pending_snapshot),
+                                        cwd,
+                                        provider,
+                                        active_model,
+                                        session_id,
+                                        input_buffer,
+                                        status_line,
+                                        Some(format!(
+                                            "{} {}",
+                                            pending_spinner_frame(tick),
+                                            pending_snapshot.progress_label
+                                        )),
+                                        *active_pane,
+                                        compact_banner.clone(),
+                                        *transcript_scroll,
+                                        None,
+                                        command_suggestions(registry, input_buffer),
+                                        *selected_command_suggestion,
+                                        tick,
+                                        interaction_state,
+                                    );
+                                    let size = terminal.size()?;
+                                    sync_transcript_search_preview(
+                                        &state,
+                                        size.width,
+                                        size.height,
+                                        &mut interaction_state.transcript_search,
+                                        transcript_scroll,
+                                    );
+                                }
+                                KeyCode::Char(ch)
+                                    if key.modifiers.is_empty()
+                                        || key.modifiers == KeyModifiers::SHIFT =>
+                                {
+                                    interaction_state.transcript_search.input_buffer.push(ch);
+                                    let app =
+                                        RatatuiApp::new(format!("{provider}  {active_model}"));
+                                    let state = build_repl_ui_state(
+                                        &app,
+                                        registry,
+                                        &pending_snapshot.messages,
+                                        Some(&pending_snapshot),
+                                        cwd,
+                                        provider,
+                                        active_model,
+                                        session_id,
+                                        input_buffer,
+                                        status_line,
+                                        Some(format!(
+                                            "{} {}",
+                                            pending_spinner_frame(tick),
+                                            pending_snapshot.progress_label
+                                        )),
+                                        *active_pane,
+                                        compact_banner.clone(),
+                                        *transcript_scroll,
+                                        None,
+                                        command_suggestions(registry, input_buffer),
+                                        *selected_command_suggestion,
+                                        tick,
+                                        interaction_state,
+                                    );
+                                    let size = terminal.size()?;
+                                    sync_transcript_search_preview(
+                                        &state,
+                                        size.width,
+                                        size.height,
+                                        &mut interaction_state.transcript_search,
+                                        transcript_scroll,
+                                    );
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
+                        if let Some(selection_move) = transcript_selection_move_for_key(
+                            &key,
+                            interaction_state.transcript_selection.is_some(),
+                        ) {
+                            let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                            let state = build_repl_ui_state(
+                                &app,
+                                registry,
+                                &pending_snapshot.messages,
+                                Some(&pending_snapshot),
+                                cwd,
+                                provider,
+                                active_model,
+                                session_id,
+                                input_buffer,
+                                status_line,
+                                Some(format!(
+                                    "{} {}",
+                                    pending_spinner_frame(tick),
+                                    pending_snapshot.progress_label
+                                )),
+                                *active_pane,
+                                compact_banner.clone(),
+                                *transcript_scroll,
+                                None,
+                                command_suggestions(registry, input_buffer),
+                                *selected_command_suggestion,
+                                tick,
+                                interaction_state,
+                            );
+                            let size = terminal.size()?;
+                            let selectable_lines =
+                                transcript_selectable_lines_for_view(&state, size.width);
+                            let _ = move_transcript_selection(
+                                interaction_state,
+                                &selectable_lines,
+                                selection_move,
+                            );
+                            sync_transcript_selection_preview(
+                                &state,
+                                size.width,
+                                size.height,
+                                interaction_state,
+                                transcript_scroll,
+                            );
+                            continue;
+                        }
+
+                        if interaction_state.transcript_selection.is_some() {
+                            if matches!(key.code, KeyCode::Esc) {
+                                interaction_state.transcript_selection = None;
+                                continue;
+                            }
+                            if should_clear_transcript_selection_on_key(&key) {
+                                interaction_state.transcript_selection = None;
+                            }
+                        }
+
+                        if matches!(key.code, KeyCode::Char('o'))
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            exit_transcript_mode(interaction_state);
+                            continue;
+                        }
+
+                        match key.code {
+                            KeyCode::Esc => {
+                                exit_transcript_mode(interaction_state);
+                            }
+                            KeyCode::Char('q') if key.modifiers.is_empty() => {
+                                exit_transcript_mode(interaction_state);
+                            }
+                            KeyCode::Char('/')
+                                if key.modifiers.is_empty()
+                                    || key.modifiers == KeyModifiers::SHIFT =>
+                            {
+                                interaction_state.message_actions = None;
+                                open_transcript_search(
+                                    &mut interaction_state.transcript_search,
+                                    *transcript_scroll,
+                                );
+                            }
+                            KeyCode::Char('n') if key.modifiers.is_empty() => {
+                                let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                                let state = build_repl_ui_state(
+                                    &app,
+                                    registry,
+                                    &pending_snapshot.messages,
+                                    Some(&pending_snapshot),
+                                    cwd,
+                                    provider,
+                                    active_model,
+                                    session_id,
+                                    input_buffer,
+                                    status_line,
+                                    Some(format!(
+                                        "{} {}",
+                                        pending_spinner_frame(tick),
+                                        pending_snapshot.progress_label
+                                    )),
+                                    *active_pane,
+                                    compact_banner.clone(),
+                                    *transcript_scroll,
+                                    None,
+                                    command_suggestions(registry, input_buffer),
+                                    *selected_command_suggestion,
+                                    tick,
+                                    interaction_state,
+                                );
+                                let size = terminal.size()?;
+                                let _ = step_transcript_search_match(
+                                    &state,
+                                    size.width,
+                                    size.height,
+                                    &mut interaction_state.transcript_search,
+                                    transcript_scroll,
+                                    false,
+                                );
+                            }
+                            KeyCode::Char('N')
+                                if key.modifiers.is_empty()
+                                    || key.modifiers == KeyModifiers::SHIFT =>
+                            {
+                                let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                                let state = build_repl_ui_state(
+                                    &app,
+                                    registry,
+                                    &pending_snapshot.messages,
+                                    Some(&pending_snapshot),
+                                    cwd,
+                                    provider,
+                                    active_model,
+                                    session_id,
+                                    input_buffer,
+                                    status_line,
+                                    Some(format!(
+                                        "{} {}",
+                                        pending_spinner_frame(tick),
+                                        pending_snapshot.progress_label
+                                    )),
+                                    *active_pane,
+                                    compact_banner.clone(),
+                                    *transcript_scroll,
+                                    None,
+                                    command_suggestions(registry, input_buffer),
+                                    *selected_command_suggestion,
+                                    tick,
+                                    interaction_state,
+                                );
+                                let size = terminal.size()?;
+                                let _ = step_transcript_search_match(
+                                    &state,
+                                    size.width,
+                                    size.height,
+                                    &mut interaction_state.transcript_search,
+                                    transcript_scroll,
+                                    true,
+                                );
+                            }
+                            KeyCode::Up => scroll_up(transcript_scroll, 1),
+                            KeyCode::Down => scroll_down(transcript_scroll, 1),
+                            KeyCode::PageUp => scroll_up(transcript_scroll, 5),
+                            KeyCode::PageDown => scroll_down(transcript_scroll, 5),
+                            KeyCode::Home => *transcript_scroll = u16::MAX,
+                            KeyCode::End => *transcript_scroll = 0,
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    if matches!(key.code, KeyCode::Char('o'))
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        enter_transcript_mode(interaction_state, active_pane);
                         continue;
                     }
                     if let Some(pane) = pane_from_shortcut(&key) {
@@ -1745,6 +3041,7 @@ where
             selected_command_suggestion,
             vim_state,
             tick,
+            interaction_state,
         )?;
 
         tokio::select! {

@@ -3,3 +3,7 @@ Cargo.lock
 Claude-Code-main-run.code-workspace
 .env.*
 .code-agent/
+test.rs
+test
+*.diff
+*.py
