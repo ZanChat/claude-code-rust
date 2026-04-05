@@ -2021,7 +2021,15 @@ pub(crate) async fn run_interactive_repl(
             }
             if let Event::Paste(text) = event {
                 clear_prompt_mouse_anchor(&mut interaction_state);
-                if interaction_state.transcript_search.open {
+                if let Some(search_state) = interaction_state.prompt_history_search.as_mut() {
+                    let _ = insert_buffer_text(&mut search_state.input_buffer, &text);
+                    sync_prompt_history_search_preview(
+                        &prompt_history,
+                        search_state,
+                        &mut input_buffer,
+                    );
+                    dirty = true;
+                } else if interaction_state.transcript_search.open {
                     let input = &mut interaction_state.transcript_search.input_buffer;
                     let _ = insert_buffer_text(input, &text);
                     let app = RatatuiApp::new(format!("{provider}  {active_model}"));
@@ -2165,6 +2173,19 @@ pub(crate) async fn run_interactive_repl(
             }
 
             if is_paste_shortcut(&key) {
+                if let Some(search_state) = interaction_state.prompt_history_search.as_mut() {
+                    if let Some(text) = read_text_from_clipboard() {
+                        let _ = insert_buffer_text(&mut search_state.input_buffer, &text);
+                        sync_prompt_history_search_preview(
+                            &prompt_history,
+                            search_state,
+                            &mut input_buffer,
+                        );
+                        dirty = true;
+                    }
+                    continue;
+                }
+
                 if interaction_state.transcript_search.open {
                     if let Some(text) = read_text_from_clipboard() {
                         let input = &mut interaction_state.transcript_search.input_buffer;
@@ -2261,6 +2282,10 @@ pub(crate) async fn run_interactive_repl(
                         dirty = true;
                     }
                     ReplShortcutAction::ContextCtrlC => {
+                        if cancel_prompt_history_search(&mut interaction_state, &mut input_buffer) {
+                            dirty = true;
+                            continue;
+                        }
                         if interaction_state.transcript_search.open {
                             cancel_transcript_search(
                                 &mut interaction_state.transcript_search,
@@ -2328,6 +2353,19 @@ pub(crate) async fn run_interactive_repl(
                             exit_transcript_mode(&mut interaction_state);
                         } else {
                             enter_transcript_mode(&mut interaction_state, &mut active_pane);
+                        }
+                        dirty = true;
+                    }
+                    ReplShortcutAction::PromptHistorySearch => {
+                        if let Some(search_state) = interaction_state.prompt_history_search.as_mut()
+                        {
+                            let _ = step_prompt_history_search_match(
+                                &prompt_history,
+                                search_state,
+                                &mut input_buffer,
+                            );
+                        } else {
+                            open_prompt_history_search(&mut interaction_state, &input_buffer);
                         }
                         dirty = true;
                     }
@@ -2553,6 +2591,95 @@ pub(crate) async fn run_interactive_repl(
                 continue;
             }
 
+            if interaction_state.prompt_history_search.is_some() {
+                match key.code {
+                    KeyCode::Esc => {
+                        let _ =
+                            cancel_prompt_history_search(&mut interaction_state, &mut input_buffer);
+                        dirty = true;
+                    }
+                    KeyCode::Enter => {
+                        let _ = accept_prompt_history_search(&mut interaction_state);
+                        dirty = true;
+                    }
+                    KeyCode::Left => {
+                        let search_state = interaction_state
+                            .prompt_history_search
+                            .as_mut()
+                            .expect("prompt history search state should exist");
+                        search_state.input_buffer.cursor =
+                            search_state.input_buffer.cursor.saturating_sub(1);
+                        dirty = true;
+                    }
+                    KeyCode::Right => {
+                        let search_state = interaction_state
+                            .prompt_history_search
+                            .as_mut()
+                            .expect("prompt history search state should exist");
+                        search_state.input_buffer.cursor = (search_state.input_buffer.cursor + 1)
+                            .min(search_state.input_buffer.chars.len());
+                        dirty = true;
+                    }
+                    KeyCode::Home => {
+                        let search_state = interaction_state
+                            .prompt_history_search
+                            .as_mut()
+                            .expect("prompt history search state should exist");
+                        search_state.input_buffer.cursor = 0;
+                        dirty = true;
+                    }
+                    KeyCode::End => {
+                        let search_state = interaction_state
+                            .prompt_history_search
+                            .as_mut()
+                            .expect("prompt history search state should exist");
+                        search_state.input_buffer.cursor = search_state.input_buffer.chars.len();
+                        dirty = true;
+                    }
+                    KeyCode::Backspace => {
+                        let should_cancel = interaction_state
+                            .prompt_history_search
+                            .as_ref()
+                            .is_some_and(|search_state| search_state.input_buffer.is_empty());
+                        if should_cancel {
+                            let _ = cancel_prompt_history_search(
+                                &mut interaction_state,
+                                &mut input_buffer,
+                            );
+                        } else {
+                            let search_state = interaction_state
+                                .prompt_history_search
+                                .as_mut()
+                                .expect("prompt history search state should exist");
+                            search_state.input_buffer.pop();
+                            sync_prompt_history_search_preview(
+                                &prompt_history,
+                                search_state,
+                                &mut input_buffer,
+                            );
+                        }
+                        dirty = true;
+                    }
+                    KeyCode::Char(ch)
+                        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        let search_state = interaction_state
+                            .prompt_history_search
+                            .as_mut()
+                            .expect("prompt history search state should exist");
+                        search_state.input_buffer.push(ch);
+                        sync_prompt_history_search_preview(
+                            &prompt_history,
+                            search_state,
+                            &mut input_buffer,
+                        );
+                        dirty = true;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             if interaction_state.transcript_mode {
                 if interaction_state.transcript_search.open {
                     match key.code {
@@ -2647,6 +2774,78 @@ pub(crate) async fn run_interactive_repl(
                                 &mut transcript_scroll,
                             );
                             dirty = true;
+                        }
+                        KeyCode::Char('n') if key.modifiers.is_empty() => {
+                            let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                            let state = build_repl_ui_state(
+                                &app,
+                                registry,
+                                raw_messages,
+                                None,
+                                &cwd,
+                                provider,
+                                &active_model,
+                                repl_session.session_id,
+                                &input_buffer,
+                                &status_line,
+                                None,
+                                active_pane,
+                                compact_banner.clone(),
+                                transcript_scroll,
+                                None,
+                                command_suggestions(registry, &input_buffer),
+                                selected_command_suggestion,
+                                status_marquee_tick,
+                                &interaction_state,
+                            );
+                            let size = terminal.size()?;
+                            if step_transcript_search_match(
+                                &state,
+                                size.width,
+                                size.height,
+                                &mut interaction_state.transcript_search,
+                                &mut transcript_scroll,
+                                false,
+                            ) {
+                                dirty = true;
+                            }
+                        }
+                        KeyCode::Char('N')
+                            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                        {
+                            let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+                            let state = build_repl_ui_state(
+                                &app,
+                                registry,
+                                raw_messages,
+                                None,
+                                &cwd,
+                                provider,
+                                &active_model,
+                                repl_session.session_id,
+                                &input_buffer,
+                                &status_line,
+                                None,
+                                active_pane,
+                                compact_banner.clone(),
+                                transcript_scroll,
+                                None,
+                                command_suggestions(registry, &input_buffer),
+                                selected_command_suggestion,
+                                status_marquee_tick,
+                                &interaction_state,
+                            );
+                            let size = terminal.size()?;
+                            if step_transcript_search_match(
+                                &state,
+                                size.width,
+                                size.height,
+                                &mut interaction_state.transcript_search,
+                                &mut transcript_scroll,
+                                true,
+                            ) {
+                                dirty = true;
+                            }
                         }
                         KeyCode::Char(ch)
                             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>

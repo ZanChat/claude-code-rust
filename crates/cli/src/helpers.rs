@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 pub(crate) fn task_store_for(cwd: &Path) -> CoreLocalTaskStore {
     CoreLocalTaskStore::new(cwd.join(".code-agent"))
@@ -356,4 +357,29 @@ pub(crate) fn navigate_prompt_history_down(
         }
     }
     true
+}
+
+pub(crate) fn prompt_history_search_matches(history: &[String], query: &str) -> Vec<usize> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut matches = Vec::new();
+
+    for (index, entry) in history.iter().enumerate().rev() {
+        let normalized = entry.trim();
+        if normalized.is_empty() {
+            continue;
+        }
+        if !normalized.contains(query) {
+            continue;
+        }
+        if seen.insert(normalized.to_owned()) {
+            matches.push(index);
+        }
+    }
+
+    matches
 }

@@ -191,6 +191,8 @@ pub struct TaskUiEntry {
     pub title: String,
     pub kind: String,
     pub status: TaskStatus,
+    pub owner_label: Option<String>,
+    pub blocker_labels: Vec<String>,
     pub input: Option<String>,
     pub output: Option<String>,
     pub tree_prefix: String,
@@ -215,8 +217,16 @@ pub struct TranscriptSearchState {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TranscriptMessageActionsState {
     pub active_item: usize,
-    pub editable: bool,
+    pub enter_label: Option<String>,
     pub primary_input_label: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PromptHistorySearchState {
+    pub input_buffer: InputBuffer,
+    pub active_match: Option<usize>,
+    pub match_count: usize,
+    pub failed_match: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -262,6 +272,7 @@ pub struct UiState {
     pub transcript_mode: bool,
     pub transcript_search: Option<TranscriptSearchState>,
     pub message_actions: Option<TranscriptMessageActionsState>,
+    pub prompt_history_search: Option<PromptHistorySearchState>,
     pub prompt_selection: Option<PromptSelectionState>,
     pub transcript_selection: Option<TranscriptSelectionState>,
     pub command_palette: Vec<CommandPaletteEntry>,
@@ -1615,6 +1626,30 @@ fn task_header_line(task: &TaskUiEntry, render_as_root: bool) -> Line<'static> {
     spans.push(Span::styled(format!("{icon} "), icon_style));
     spans.push(Span::styled(task.title.clone(), title_style));
 
+    if let Some(owner) = task
+        .owner_label
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        spans.push(Span::styled(
+            format!(" (@{owner})"),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    if !task.blocker_labels.is_empty() {
+        let blockers = task
+            .blocker_labels
+            .iter()
+            .map(|label| format!("#{label}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        spans.push(Span::styled(
+            format!("  ➤ blocked by {blockers}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
     if let Some(kind) = task_kind_label(&task.kind) {
         spans.push(Span::styled(
             format!("  [{kind}]"),
@@ -2193,17 +2228,39 @@ fn marquee_text(text: &str, width: u16, tick: usize) -> String {
 
 fn footer_primary_text(state: &UiState, suggestions_visible: bool) -> String {
     if let Some(actions) = state.message_actions.as_ref() {
-        let mut parts = vec![if actions.editable {
-            "Message actions · Enter edit"
-        } else {
-            "Message actions · Enter reuse"
+        let mut parts = vec!["Message actions".to_owned()];
+        if let Some(label) = actions.enter_label.as_deref() {
+            parts.push(format!("Enter {label}"));
         }
-        .to_owned()];
         parts.push("c copy".to_owned());
         if let Some(label) = actions.primary_input_label.as_deref() {
             parts.push(format!("p copy {label}"));
         }
+        parts.push("Up/Down navigate".to_owned());
+        parts.push("Esc back".to_owned());
         return parts.join(" · ");
+    }
+    if let Some(search) = state.prompt_history_search.as_ref() {
+        let query = search.input_buffer.as_str();
+        if query.trim().is_empty() {
+            return "History search · Type to search · Enter keep · Esc cancel".to_owned();
+        }
+        if search.match_count == 0 {
+            return format!(
+                "History search · {query} · no matches · Enter keep · Esc cancel · Ctrl+R next"
+            );
+        }
+        if search.failed_match {
+            return format!(
+                "History search · {query} · end of matches · Enter keep · Esc cancel · Ctrl+R next"
+            );
+        }
+        return format!(
+            "History search · {}/{} match{} · Enter keep · Esc cancel · Ctrl+R next",
+            search.active_match.unwrap_or(1),
+            search.match_count,
+            if search.match_count == 1 { "" } else { "es" }
+        );
     }
     if let Some(search) = state.transcript_search.as_ref() {
         let query = search.input_buffer.as_str();
@@ -2364,6 +2421,35 @@ fn input_prompt_line(state: &UiState) -> Line<'static> {
         return Line::from(spans);
     }
 
+    if let Some(search) = state.prompt_history_search.as_ref() {
+        let query = search.input_buffer.as_str();
+        if !query.trim().is_empty() && !search.failed_match {
+            if let Some((start, end)) = prompt_history_match_range(&text, &query) {
+                let left = text.chars().take(start).collect::<String>();
+                let matched = text
+                    .chars()
+                    .skip(start)
+                    .take(end.saturating_sub(start))
+                    .collect::<String>();
+                let right = text.chars().skip(end).collect::<String>();
+                let mut spans = vec![Span::raw("> ")];
+                if !left.is_empty() {
+                    spans.push(Span::raw(left));
+                }
+                if !matched.is_empty() {
+                    spans.push(Span::styled(
+                        matched,
+                        Style::default().bg(Color::Cyan).fg(Color::Black),
+                    ));
+                }
+                if !right.is_empty() {
+                    spans.push(Span::raw(right));
+                }
+                return Line::from(spans);
+            }
+        }
+    }
+
     let pos = state.input_buffer.cursor.min(text.chars().count());
     if pos < text_len {
         let left = text.chars().take(pos).collect::<String>();
@@ -2390,6 +2476,18 @@ fn input_widget(state: &UiState) -> Paragraph<'static> {
     Paragraph::new(vec![input_prompt_line(state)])
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::TOP | Borders::BOTTOM))
+}
+
+fn prompt_history_match_range(text: &str, query: &str) -> Option<(usize, usize)> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+
+    let byte_index = text.rfind(query)?;
+    let start = text[..byte_index].chars().count();
+    let end = start + query.chars().count();
+    Some((start, end))
 }
 
 fn command_suggestions_widget(state: &UiState) -> Paragraph<'static> {
@@ -3154,9 +3252,10 @@ mod tests {
         transcript_search_match_items, transcript_search_scroll_for_view,
         transcript_selectable_lines_for_view, transcript_selection_text_for_view,
         transcript_toggle_label, transcript_visual_lines, ChoiceListItem, ChoiceListState,
-        Notification, PaneKind, PermissionPromptState, PromptSelectionState, RatatuiApp,
-        StatusLevel, TaskUiEntry, TranscriptGroup, TranscriptLine, TranscriptMessageActionsState,
-        TranscriptSearchState, TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
+        InputBuffer, Notification, PaneKind, PermissionPromptState, PromptHistorySearchState,
+        PromptSelectionState, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup,
+        TranscriptLine, TranscriptMessageActionsState, TranscriptSearchState,
+        TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
     };
     use code_agent_core::{
         compatibility_command_registry, ContentBlock, Message, MessageRole, TaskStatus,
@@ -3389,6 +3488,8 @@ mod tests {
                 title: "Review workspace".to_owned(),
                 kind: "workflow".to_owned(),
                 status: TaskStatus::Running,
+                owner_label: Some("builder".to_owned()),
+                blocker_labels: Vec::new(),
                 input: None,
                 output: None,
                 tree_prefix: String::new(),
@@ -3401,6 +3502,8 @@ mod tests {
                 title: "Inspect failing tests".to_owned(),
                 kind: "workflow_step".to_owned(),
                 status: TaskStatus::Running,
+                owner_label: None,
+                blocker_labels: vec!["2".to_owned(), "3".to_owned()],
                 input: Some("Open the failing fixture".to_owned()),
                 output: None,
                 tree_prefix: "├─ ".to_owned(),
@@ -3413,6 +3516,8 @@ mod tests {
                 title: "Summarize blockers".to_owned(),
                 kind: "workflow_step".to_owned(),
                 status: TaskStatus::Completed,
+                owner_label: None,
+                blocker_labels: Vec::new(),
                 input: None,
                 output: Some("Missing integration fixture".to_owned()),
                 tree_prefix: "└─ ".to_owned(),
@@ -3425,6 +3530,8 @@ mod tests {
                 title: "Follow up with maintainer".to_owned(),
                 kind: "task".to_owned(),
                 status: TaskStatus::Pending,
+                owner_label: None,
+                blocker_labels: Vec::new(),
                 input: None,
                 output: None,
                 tree_prefix: String::new(),
@@ -3444,10 +3551,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert!(texts.iter().any(|line| line == "● Review workspace"));
         assert!(texts
             .iter()
-            .any(|line| line == "├─ ● Inspect failing tests"));
+            .any(|line| line.contains("Review workspace (@builder)")));
+        assert!(texts
+            .iter()
+            .any(|line| line.contains("├─ ● Inspect failing tests  ➤ blocked by #2, #3")));
         assert!(texts
             .iter()
             .any(|line| line == "│    Open the failing fixture"));
@@ -3690,7 +3799,7 @@ mod tests {
         state.show_input = true;
         state.message_actions = Some(TranscriptMessageActionsState {
             active_item: 0,
-            editable: false,
+            enter_label: None,
             primary_input_label: Some("path".to_owned()),
         });
 
@@ -3699,6 +3808,45 @@ mod tests {
         assert!(footer.contains("Message actions"));
         assert!(footer.contains("c copy"));
         assert!(footer.contains("p copy path"));
+        assert!(footer.contains("Up/Down navigate"));
+        assert!(footer.contains("Esc back"));
+        assert!(!footer.contains("Enter reuse"));
+    }
+
+    #[test]
+    fn footer_switches_to_prompt_history_search_hints() {
+        let mut state = RatatuiApp::new("history-search").initial_state();
+        state.show_input = true;
+        let mut query = InputBuffer::new();
+        query.replace("beta");
+        state.prompt_history_search = Some(PromptHistorySearchState {
+            input_buffer: query,
+            active_match: Some(2),
+            match_count: 3,
+            failed_match: false,
+        });
+
+        let footer = footer_primary_text(&state, false);
+
+        assert!(footer.contains("History search"));
+        assert!(footer.contains("2/3 matches"));
+        assert!(footer.contains("Ctrl+R next"));
+    }
+
+    #[test]
+    fn footer_shows_enter_edit_for_user_message_actions() {
+        let mut state = RatatuiApp::new("message-actions-user").initial_state();
+        state.show_input = true;
+        state.message_actions = Some(TranscriptMessageActionsState {
+            active_item: 0,
+            enter_label: Some("edit".to_owned()),
+            primary_input_label: None,
+        });
+
+        let footer = footer_primary_text(&state, false);
+
+        assert!(footer.contains("Enter edit"));
+        assert!(footer.contains("c copy"));
     }
 
     #[test]
@@ -3831,11 +3979,32 @@ mod tests {
     }
 
     #[test]
+    fn prompt_history_search_highlights_current_match() {
+        let mut state = RatatuiApp::new("prompt-history-highlight").initial_state();
+        state.show_input = true;
+        state.input_buffer.replace("alpha beta gamma");
+        let mut query = InputBuffer::new();
+        query.replace("beta");
+        state.prompt_history_search = Some(PromptHistorySearchState {
+            input_buffer: query,
+            active_match: Some(1),
+            match_count: 2,
+            failed_match: false,
+        });
+
+        let line = input_prompt_line(&state);
+
+        assert!(line.spans.iter().any(|span| {
+            span.content.as_ref() == "beta" && span.style.bg == Some(super::Color::Cyan)
+        }));
+    }
+
+    #[test]
     fn message_actions_highlight_selected_transcript_item() {
         let mut state = RatatuiApp::new("action-highlight").initial_state();
         state.message_actions = Some(TranscriptMessageActionsState {
             active_item: 0,
-            editable: true,
+            enter_label: Some("edit".to_owned()),
             primary_input_label: None,
         });
         state.transcript_lines = vec![TranscriptLine {

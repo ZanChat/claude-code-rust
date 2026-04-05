@@ -1,18 +1,21 @@
 use super::{
-    build_repl_command_input_message, build_repl_command_output_message, build_repl_ui_state,
-    build_resume_choice_list, build_startup_screens, build_startup_ui_state, build_text_message,
-    build_tool_result_message, choose_active_session, command_suggestions, current_time_ms,
+    accept_prompt_history_search, build_repl_command_input_message,
+    build_repl_command_output_message, build_repl_ui_state, build_resume_choice_list,
+    build_startup_screens, build_startup_ui_state, build_text_message, build_tool_result_message,
+    cancel_prompt_history_search, choose_active_session, command_suggestions, current_time_ms,
     delete_prompt_selection, handle_prompt_mouse_action, handle_repl_slash_command,
     insert_prompt_text, is_paste_shortcut, is_selection_copy_shortcut, message_action_copy_text,
     message_primary_input, message_text, move_prompt_selection, navigate_prompt_history_down,
-    navigate_prompt_history_up, pane_from_shortcut, pane_from_shortcut_for_terminal,
-    pending_interrupt_messages, prompt_history_from_messages, prompt_selection_text,
-    render_auth_command_with_resume, render_remote_control_command, repl_shortcut_action_for_key,
-    resolve_continue_target, resolved_command_registry, resumable_sessions, resume_hint_text,
-    should_echo_command_result_in_footer, should_exit_repl, task_entries_for_ui,
-    toggle_all_pending_repl_groups, ActiveSessionStore, Cli, LocalBridgeHandler, Message,
-    MessageRole, PendingReplStep, PendingReplView, PromptSelectionMove, ReplInteractionState,
-    ReplSessionState, ReplShortcutAction, ResumePickerState, ResumeTargetHint, StartupPreferences,
+    navigate_prompt_history_up, open_prompt_history_search, pane_from_shortcut,
+    pane_from_shortcut_for_terminal, pending_interrupt_messages, prompt_history_from_messages,
+    prompt_history_search_matches, prompt_selection_text, render_auth_command_with_resume,
+    render_remote_control_command, repl_shortcut_action_for_key, resolve_continue_target,
+    resolved_command_registry, resumable_sessions, resume_hint_text,
+    should_echo_command_result_in_footer, should_exit_repl, step_prompt_history_search_match,
+    sync_prompt_history_search_preview, task_entries_for_ui, toggle_all_pending_repl_groups,
+    ActiveSessionStore, Cli, LocalBridgeHandler, Message, MessageRole, PendingReplStep,
+    PendingReplView, PromptSelectionMove, ReplInteractionState, ReplSessionState,
+    ReplShortcutAction, ResumePickerState, ResumeTargetHint, StartupPreferences,
 };
 use code_agent_bridge::{
     base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
@@ -262,16 +265,22 @@ fn startup_ui_state_shows_prompt_and_scroll_state() {
 #[test]
 fn task_entries_for_ui_preserve_parent_child_structure() {
     let now = current_time_ms();
+    let worker_id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
 
     let mut root = TaskRecord::new("workflow", "Review workspace");
     root.status = TaskStatus::Running;
     root.updated_at_unix_ms = now - 2_000;
+    root.agent_id = Some(worker_id);
 
     let mut child_running = TaskRecord::new("workflow_step", "Inspect failing tests");
     child_running.parent_task_id = Some(root.id);
     child_running.status = TaskStatus::Running;
     child_running.input = Some("Open the failing fixture".to_owned());
     child_running.updated_at_unix_ms = now - 1_500;
+    child_running.metadata.insert(
+        "blocked_by".to_owned(),
+        "11111111-1111-4111-8111-111111111111, 22222222-2222-4222-8222-222222222222".to_owned(),
+    );
 
     let mut child_recent = TaskRecord::new("workflow_step", "Summarize blockers");
     child_recent.parent_task_id = Some(root.id);
@@ -288,6 +297,7 @@ fn task_entries_for_ui_preserve_parent_child_structure() {
 
     assert_eq!(entries[0].title, "Review workspace");
     assert_eq!(entries[0].tree_prefix, "");
+    assert_eq!(entries[0].owner_label.as_deref(), Some("aaaaaaaa"));
     assert_eq!(
         entries.last().map(|entry| entry.title.as_str()),
         Some("Follow up with maintainer")
@@ -298,8 +308,20 @@ fn task_entries_for_ui_preserve_parent_child_structure() {
         .filter(|entry| entry.parent_id.as_deref() == Some(root_id.as_str()))
         .collect::<Vec<_>>();
     assert_eq!(child_entries.len(), 2);
-    assert_eq!(child_entries[0].tree_prefix, "├─ ");
-    assert_eq!(child_entries[1].tree_prefix, "└─ ");
+    let running_child = child_entries
+        .iter()
+        .find(|entry| entry.title == "Inspect failing tests")
+        .expect("running child should exist");
+    let completed_child = child_entries
+        .iter()
+        .find(|entry| entry.title == "Summarize blockers")
+        .expect("completed child should exist");
+    assert_eq!(running_child.tree_prefix, "└─ ");
+    assert_eq!(completed_child.tree_prefix, "├─ ");
+    assert_eq!(
+        running_child.blocker_labels,
+        vec!["11111111".to_owned(), "22222222".to_owned()]
+    );
     assert!(child_entries.iter().any(|entry| entry.is_recent_completion));
 }
 
@@ -482,6 +504,24 @@ fn repl_shortcut_routing_is_modifier_specific() {
     assert_eq!(
         repl_shortcut_action_for_key(&ctrl_o, &interaction_state),
         Some(ReplShortcutAction::ToggleTranscriptMode)
+    );
+}
+
+#[test]
+fn ctrl_r_enters_prompt_history_search_only_from_prompt_mode() {
+    let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+    let interaction_state = ReplInteractionState::default();
+
+    assert_eq!(
+        repl_shortcut_action_for_key(&ctrl_r, &interaction_state),
+        Some(ReplShortcutAction::PromptHistorySearch)
+    );
+
+    let mut transcript_state = ReplInteractionState::default();
+    transcript_state.transcript_mode = true;
+    assert_eq!(
+        repl_shortcut_action_for_key(&ctrl_r, &transcript_state),
+        None
     );
 }
 
@@ -671,6 +711,82 @@ fn prompt_history_navigation_restores_draft_after_latest_entry() {
     assert_eq!(input.as_str(), "draft");
     assert_eq!(history_index, None);
     assert!(history_draft.is_none());
+}
+
+#[test]
+fn prompt_history_search_matches_are_newest_first_and_unique() {
+    let history = vec![
+        "alpha build".to_owned(),
+        "beta fix".to_owned(),
+        "alpha build".to_owned(),
+        "gamma".to_owned(),
+    ];
+
+    let matches = prompt_history_search_matches(&history, "alpha");
+
+    assert_eq!(matches, vec![2]);
+}
+
+#[test]
+fn prompt_history_search_preview_cancel_and_accept_follow_ts_behavior() {
+    let history = vec![
+        "beta one".to_owned(),
+        "alpha beta".to_owned(),
+        "beta two".to_owned(),
+    ];
+    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    input_buffer.replace("draft prompt");
+    let mut interaction_state = ReplInteractionState::default();
+
+    open_prompt_history_search(&mut interaction_state, &input_buffer);
+    let search_state = interaction_state
+        .prompt_history_search
+        .as_mut()
+        .expect("search state should exist");
+    search_state.input_buffer.replace("beta");
+    sync_prompt_history_search_preview(&history, search_state, &mut input_buffer);
+
+    assert_eq!(input_buffer.as_str(), "beta two");
+    assert_eq!(search_state.ui_state().active_match, Some(1));
+    assert_eq!(search_state.ui_state().match_count, 3);
+    assert!(!search_state.ui_state().failed_match);
+
+    let _ = step_prompt_history_search_match(&history, search_state, &mut input_buffer);
+    assert_eq!(input_buffer.as_str(), "alpha beta");
+    assert_eq!(search_state.ui_state().active_match, Some(2));
+
+    let _ = step_prompt_history_search_match(&history, search_state, &mut input_buffer);
+    assert_eq!(input_buffer.as_str(), "beta one");
+    assert_eq!(search_state.ui_state().active_match, Some(3));
+
+    assert!(!step_prompt_history_search_match(
+        &history,
+        search_state,
+        &mut input_buffer,
+    ));
+    assert!(search_state.ui_state().failed_match);
+    assert_eq!(input_buffer.as_str(), "beta one");
+
+    assert!(accept_prompt_history_search(&mut interaction_state));
+    assert!(interaction_state.prompt_history_search.is_none());
+    assert_eq!(input_buffer.as_str(), "beta one");
+
+    open_prompt_history_search(&mut interaction_state, &input_buffer);
+    let search_state = interaction_state
+        .prompt_history_search
+        .as_mut()
+        .expect("search state should exist");
+    search_state.input_buffer.replace("nomatch");
+    sync_prompt_history_search_preview(&history, search_state, &mut input_buffer);
+    assert!(search_state.ui_state().failed_match);
+    assert_eq!(input_buffer.as_str(), "beta one");
+
+    assert!(cancel_prompt_history_search(
+        &mut interaction_state,
+        &mut input_buffer,
+    ));
+    assert!(interaction_state.prompt_history_search.is_none());
+    assert_eq!(input_buffer.as_str(), "beta one");
 }
 
 #[tokio::test]
@@ -971,6 +1087,7 @@ fn build_repl_ui_state_hides_prompt_in_transcript_mode() {
             active_item: Some(0),
             ..Default::default()
         },
+        prompt_history_search: None,
         message_actions: None,
         prompt_selection: None,
         prompt_mouse_anchor: None,
@@ -1064,8 +1181,8 @@ fn build_repl_ui_state_keeps_prompt_visible_for_message_actions() {
         state
             .message_actions
             .as_ref()
-            .map(|actions| actions.editable),
-        Some(false)
+            .and_then(|actions| actions.enter_label.as_deref()),
+        None
     );
 }
 

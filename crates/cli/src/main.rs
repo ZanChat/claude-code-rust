@@ -48,8 +48,8 @@ use code_agent_ui::{
     transcript_line_from_message, transcript_search_match_items, transcript_search_scroll_for_view,
     transcript_selectable_lines_for_view, transcript_selection_text_for_view,
     transcript_visual_scroll_for_view, ChoiceListItem, ChoiceListState, CommandPaletteEntry,
-    Notification, PaneKind, PanePreview, PermissionPromptState, PromptSelectionState,
-    QuestionUiEntry, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup,
+    Notification, PaneKind, PanePreview, PermissionPromptState, PromptHistorySearchState,
+    PromptSelectionState, QuestionUiEntry, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup,
     TranscriptMessageActionsState, TranscriptSearchState, TranscriptSelectableLine,
     TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction, UiState,
 };
@@ -531,6 +531,8 @@ fn flatten_task_ui_entries(
         let (tree_prefix, detail_prefix) = task_tree_prefixes(depth, ancestor_has_next, has_next);
         let task_id = task.id;
         let is_recent_completion = task_is_recent_completion(&task, now_ms);
+        let owner_label = task_owner_label(&task);
+        let blocker_labels = task_blocker_labels(&task);
 
         entries.push(TaskUiEntry {
             id: task_id.to_string(),
@@ -538,6 +540,8 @@ fn flatten_task_ui_entries(
             title: task.title,
             kind: task.kind,
             status: task.status,
+            owner_label,
+            blocker_labels,
             input: task.input,
             output: task.output,
             tree_prefix,
@@ -566,6 +570,87 @@ fn flatten_task_ui_entries(
             );
         }
     }
+}
+
+fn short_task_reference(value: &str) -> String {
+    let trimmed = value
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\''))
+        .trim_start_matches('@')
+        .trim_start_matches('#');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(uuid) = Uuid::parse_str(trimmed) {
+        return uuid
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or(trimmed)
+            .to_owned();
+    }
+
+    if trimmed.chars().count() > 18 {
+        return shorten_middle(trimmed, 18);
+    }
+
+    trimmed.to_owned()
+}
+
+fn parse_task_metadata_list(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut labels = Vec::new();
+    let mut push_label = |raw: &str| {
+        let label = short_task_reference(raw);
+        if !label.is_empty() && !labels.contains(&label) {
+            labels.push(label);
+        }
+    };
+
+    if let Ok(values) = serde_json::from_str::<Vec<String>>(trimmed) {
+        for value in values {
+            push_label(&value);
+        }
+        return labels;
+    }
+
+    for value in trimmed.split(|ch| matches!(ch, ',' | ';' | '\n')) {
+        push_label(value);
+    }
+
+    labels
+}
+
+fn task_owner_label(task: &TaskRecord) -> Option<String> {
+    task.metadata
+        .get("owner")
+        .or_else(|| task.metadata.get("agent"))
+        .map(|value| short_task_reference(value))
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            task.agent_id
+                .map(|agent_id| short_task_reference(&agent_id.to_string()))
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn task_blocker_labels(task: &TaskRecord) -> Vec<String> {
+    [
+        "blocked_by",
+        "blockedBy",
+        "blockers",
+        "waiting_for",
+        "waitingFor",
+    ]
+    .into_iter()
+    .find_map(|key| task.metadata.get(key))
+    .map(|value| parse_task_metadata_list(value))
+    .unwrap_or_default()
 }
 
 fn task_entries_for_ui(tasks: Vec<TaskRecord>) -> Vec<TaskUiEntry> {
@@ -640,11 +725,30 @@ fn task_preview_line(task: &TaskUiEntry) -> String {
     let kind_suffix = preview_task_kind(&task.kind)
         .map(|kind| format!("  [{kind}]"))
         .unwrap_or_default();
+    let owner_suffix = task
+        .owner_label
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|owner| format!(" (@{owner})"))
+        .unwrap_or_default();
+    let blocker_suffix = if task.blocker_labels.is_empty() {
+        String::new()
+    } else {
+        let blockers = task
+            .blocker_labels
+            .iter()
+            .map(|label| format!("#{label}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("  -> blocked by {blockers}")
+    };
     format!(
-        "{}{} {}{}",
+        "{}{} {}{}{}{}",
         task.tree_prefix,
         preview_task_icon(&task.status),
         task.title,
+        owner_suffix,
+        blocker_suffix,
         kind_suffix
     )
 }
@@ -1350,6 +1454,28 @@ impl ReplTranscriptSearchState {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReplPromptHistorySearchState {
+    input_buffer: code_agent_ui::InputBuffer,
+    original_input_buffer: code_agent_ui::InputBuffer,
+    active_history_index: Option<usize>,
+    active_match_position: Option<usize>,
+    match_count: usize,
+    failed_match: bool,
+    last_query: String,
+}
+
+impl ReplPromptHistorySearchState {
+    fn ui_state(&self) -> PromptHistorySearchState {
+        PromptHistorySearchState {
+            input_buffer: self.input_buffer.clone(),
+            active_match: self.active_match_position.map(|position| position + 1),
+            match_count: self.match_count,
+            failed_match: self.failed_match,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReplMessageActionState {
     selected_item: usize,
@@ -1381,6 +1507,7 @@ struct ToolPrimaryInput {
 struct ReplInteractionState {
     transcript_mode: bool,
     transcript_search: ReplTranscriptSearchState,
+    prompt_history_search: Option<ReplPromptHistorySearchState>,
     message_actions: Option<ReplMessageActionState>,
     prompt_selection: Option<PromptSelectionState>,
     prompt_mouse_anchor: Option<usize>,
@@ -1400,6 +1527,7 @@ enum ReplShortcutAction {
     CopySelection,
     ContextCtrlC,
     ToggleTranscriptMode,
+    PromptHistorySearch,
     EnterMessageActions,
     SelectPane(PaneKind),
     RotatePaneForward,
@@ -1430,9 +1558,18 @@ fn repl_shortcut_action_for_key(
         return Some(ReplShortcutAction::ToggleTranscriptMode);
     }
 
+    if !interaction_state.transcript_mode
+        && interaction_state.message_actions.is_none()
+        && interaction_state.transcript_selection.is_none()
+        && is_plain_ctrl_char(key, 'r')
+    {
+        return Some(ReplShortcutAction::PromptHistorySearch);
+    }
+
     if matches!(key.code, KeyCode::Up)
         && key.modifiers == KeyModifiers::SHIFT
         && interaction_state.message_actions.is_none()
+        && interaction_state.prompt_history_search.is_none()
         && interaction_state.transcript_selection.is_none()
         && !interaction_state.transcript_search.open
     {
@@ -1456,6 +1593,7 @@ fn repl_shortcut_action_for_key(
 
 fn enter_transcript_mode(interaction_state: &mut ReplInteractionState, active_pane: &mut PaneKind) {
     interaction_state.transcript_mode = true;
+    interaction_state.prompt_history_search = None;
     interaction_state.prompt_selection = None;
     interaction_state.prompt_mouse_anchor = None;
     *active_pane = PaneKind::Transcript;
@@ -1464,10 +1602,155 @@ fn enter_transcript_mode(interaction_state: &mut ReplInteractionState, active_pa
 fn exit_transcript_mode(interaction_state: &mut ReplInteractionState) {
     interaction_state.transcript_mode = false;
     interaction_state.transcript_search.reset();
+    interaction_state.prompt_history_search = None;
     interaction_state.message_actions = None;
     interaction_state.prompt_selection = None;
     interaction_state.prompt_mouse_anchor = None;
     interaction_state.transcript_selection = None;
+}
+
+fn open_prompt_history_search(
+    interaction_state: &mut ReplInteractionState,
+    input_buffer: &code_agent_ui::InputBuffer,
+) {
+    let search_state = interaction_state
+        .prompt_history_search
+        .get_or_insert_with(|| ReplPromptHistorySearchState {
+            original_input_buffer: input_buffer.clone(),
+            ..ReplPromptHistorySearchState::default()
+        });
+    search_state.input_buffer.cursor = search_state.input_buffer.chars.len();
+    interaction_state.message_actions = None;
+    interaction_state.prompt_selection = None;
+    interaction_state.prompt_mouse_anchor = None;
+    interaction_state.transcript_selection = None;
+}
+
+fn cancel_prompt_history_search(
+    interaction_state: &mut ReplInteractionState,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+) -> bool {
+    let Some(search_state) = interaction_state.prompt_history_search.take() else {
+        return false;
+    };
+    *input_buffer = search_state.original_input_buffer;
+    true
+}
+
+fn accept_prompt_history_search(interaction_state: &mut ReplInteractionState) -> bool {
+    interaction_state.prompt_history_search.take().is_some()
+}
+
+fn prompt_history_match_cursor(entry: &str, query: &str) -> Option<usize> {
+    let byte_index = entry.rfind(query)?;
+    Some(entry[..byte_index].chars().count())
+}
+
+fn preview_prompt_history_match(
+    history: &[String],
+    history_index: usize,
+    query: &str,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+) {
+    let Some(entry) = history.get(history_index) else {
+        return;
+    };
+
+    input_buffer.replace(entry.clone());
+    if let Some(cursor) = prompt_history_match_cursor(entry, query) {
+        input_buffer.cursor = cursor.min(input_buffer.chars.len());
+    }
+}
+
+fn sync_prompt_history_search_preview(
+    history: &[String],
+    search_state: &mut ReplPromptHistorySearchState,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+) {
+    let query = search_state.input_buffer.as_str();
+    if query.is_empty() {
+        *input_buffer = search_state.original_input_buffer.clone();
+        search_state.active_history_index = None;
+        search_state.active_match_position = None;
+        search_state.match_count = 0;
+        search_state.failed_match = false;
+        search_state.last_query.clear();
+        return;
+    }
+
+    if search_state.last_query != query {
+        search_state.active_history_index = None;
+        search_state.active_match_position = None;
+        search_state.failed_match = false;
+    }
+
+    let matches = prompt_history_search_matches(history, &query);
+    search_state.match_count = matches.len();
+    search_state.last_query = query.clone();
+
+    let Some(&history_index) = matches.first() else {
+        search_state.active_history_index = None;
+        search_state.active_match_position = None;
+        search_state.failed_match = true;
+        return;
+    };
+
+    search_state.active_history_index = Some(history_index);
+    search_state.active_match_position = Some(0);
+    search_state.failed_match = false;
+    preview_prompt_history_match(history, history_index, &query, input_buffer);
+}
+
+fn step_prompt_history_search_match(
+    history: &[String],
+    search_state: &mut ReplPromptHistorySearchState,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+) -> bool {
+    let query = search_state.input_buffer.as_str();
+    if query.is_empty() {
+        *input_buffer = search_state.original_input_buffer.clone();
+        search_state.active_history_index = None;
+        search_state.active_match_position = None;
+        search_state.match_count = 0;
+        search_state.failed_match = false;
+        search_state.last_query.clear();
+        return false;
+    }
+
+    let matches = prompt_history_search_matches(history, &query);
+    search_state.match_count = matches.len();
+    search_state.last_query = query.clone();
+
+    let Some(current_position) = search_state.active_history_index.and_then(|current_index| {
+        matches
+            .iter()
+            .position(|candidate| *candidate == current_index)
+    }) else {
+        return if let Some(&history_index) = matches.first() {
+            search_state.active_history_index = Some(history_index);
+            search_state.active_match_position = Some(0);
+            search_state.failed_match = false;
+            preview_prompt_history_match(history, history_index, &query, input_buffer);
+            true
+        } else {
+            search_state.active_history_index = None;
+            search_state.active_match_position = None;
+            search_state.failed_match = true;
+            false
+        };
+    };
+
+    let Some(&history_index) = matches.get(current_position + 1) else {
+        search_state.active_match_position = Some(current_position);
+        search_state.failed_match = true;
+        return false;
+    };
+
+    search_state.active_history_index = Some(history_index);
+    search_state.active_match_position = Some(current_position + 1);
+    search_state.failed_match = false;
+    preview_prompt_history_match(history, history_index, &query, input_buffer);
+    true
 }
 
 fn open_transcript_search(search_state: &mut ReplTranscriptSearchState, transcript_scroll: u16) {
@@ -1637,6 +1920,7 @@ fn enter_message_actions(
     };
 
     interaction_state.transcript_search.reset();
+    interaction_state.prompt_history_search = None;
     interaction_state.prompt_selection = None;
     interaction_state.prompt_mouse_anchor = None;
     interaction_state.transcript_selection = None;
@@ -2281,7 +2565,7 @@ fn message_actions_ui_state(
 
     Some(TranscriptMessageActionsState {
         active_item: selected_item,
-        editable: item.message.role == MessageRole::User,
+        enter_label: (item.message.role == MessageRole::User).then(|| "edit".to_owned()),
         primary_input_label: message_primary_input(&item.message)
             .map(|input| input.label.to_owned()),
     })
@@ -2403,10 +2687,19 @@ fn build_repl_ui_state(
         .transcript_mode
         .then(|| interaction_state.transcript_search.ui_state());
     state.message_actions = message_actions_ui_state(interaction_state, &message_action_items);
+    state.prompt_history_search = interaction_state
+        .prompt_history_search
+        .as_ref()
+        .map(ReplPromptHistorySearchState::ui_state);
     state.prompt_selection = interaction_state.prompt_selection.clone();
     state.transcript_selection = interaction_state.transcript_selection.clone();
     state.choice_list = choice_list;
     state.compact_banner = compact_banner;
+    let command_suggestions = if interaction_state.prompt_history_search.is_some() {
+        Vec::new()
+    } else {
+        command_suggestions
+    };
     state.command_suggestions = command_suggestions;
     state.selected_command_suggestion = if state.command_suggestions.is_empty() {
         None
@@ -2847,7 +3140,14 @@ where
                 },
                 Event::Paste(text) => {
                     clear_prompt_mouse_anchor(interaction_state);
-                    if interaction_state.transcript_search.open {
+                    if let Some(search_state) = interaction_state.prompt_history_search.as_mut() {
+                        let _ = insert_buffer_text(&mut search_state.input_buffer, &text);
+                        sync_prompt_history_search_preview(
+                            &prompt_history_from_messages(&pending_snapshot.messages),
+                            search_state,
+                            input_buffer,
+                        );
+                    } else if interaction_state.transcript_search.open {
                         let input = &mut interaction_state.transcript_search.input_buffer;
                         let _ = insert_buffer_text(input, &text);
                         let app = RatatuiApp::new(format!("{provider}  {active_model}"));
@@ -2893,6 +3193,19 @@ where
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     clear_prompt_mouse_anchor(interaction_state);
                     if is_paste_shortcut(&key) {
+                        if let Some(search_state) = interaction_state.prompt_history_search.as_mut()
+                        {
+                            if let Some(text) = read_text_from_clipboard() {
+                                let _ = insert_buffer_text(&mut search_state.input_buffer, &text);
+                                sync_prompt_history_search_preview(
+                                    &prompt_history_from_messages(&pending_snapshot.messages),
+                                    search_state,
+                                    input_buffer,
+                                );
+                            }
+                            continue;
+                        }
+
                         if interaction_state.transcript_search.open {
                             if let Some(text) = read_text_from_clipboard() {
                                 let input = &mut interaction_state.transcript_search.input_buffer;
@@ -2991,6 +3304,9 @@ where
                                 interaction_state.transcript_selection = None;
                             }
                             ReplShortcutAction::ContextCtrlC => {
+                                if cancel_prompt_history_search(interaction_state, input_buffer) {
+                                    continue;
+                                }
                                 if interaction_state.transcript_search.open {
                                     cancel_transcript_search(
                                         &mut interaction_state.transcript_search,
@@ -3061,6 +3377,19 @@ where
                                     exit_transcript_mode(interaction_state);
                                 } else {
                                     enter_transcript_mode(interaction_state, active_pane);
+                                }
+                            }
+                            ReplShortcutAction::PromptHistorySearch => {
+                                if let Some(search_state) =
+                                    interaction_state.prompt_history_search.as_mut()
+                                {
+                                    let _ = step_prompt_history_search_match(
+                                        &prompt_history_from_messages(&pending_snapshot.messages),
+                                        search_state,
+                                        input_buffer,
+                                    );
+                                } else {
+                                    open_prompt_history_search(interaction_state, input_buffer);
                                 }
                             }
                             ReplShortcutAction::EnterMessageActions => {
@@ -3292,6 +3621,92 @@ where
                         continue;
                     }
 
+                    if interaction_state.prompt_history_search.is_some() {
+                        match key.code {
+                            KeyCode::Esc => {
+                                let _ =
+                                    cancel_prompt_history_search(interaction_state, input_buffer);
+                            }
+                            KeyCode::Enter => {
+                                let _ = accept_prompt_history_search(interaction_state);
+                            }
+                            KeyCode::Left => {
+                                let search_state = interaction_state
+                                    .prompt_history_search
+                                    .as_mut()
+                                    .expect("prompt history search state should exist");
+                                search_state.input_buffer.cursor =
+                                    search_state.input_buffer.cursor.saturating_sub(1);
+                            }
+                            KeyCode::Right => {
+                                let search_state = interaction_state
+                                    .prompt_history_search
+                                    .as_mut()
+                                    .expect("prompt history search state should exist");
+                                search_state.input_buffer.cursor =
+                                    (search_state.input_buffer.cursor + 1)
+                                        .min(search_state.input_buffer.chars.len());
+                            }
+                            KeyCode::Home => {
+                                let search_state = interaction_state
+                                    .prompt_history_search
+                                    .as_mut()
+                                    .expect("prompt history search state should exist");
+                                search_state.input_buffer.cursor = 0;
+                            }
+                            KeyCode::End => {
+                                let search_state = interaction_state
+                                    .prompt_history_search
+                                    .as_mut()
+                                    .expect("prompt history search state should exist");
+                                search_state.input_buffer.cursor =
+                                    search_state.input_buffer.chars.len();
+                            }
+                            KeyCode::Backspace => {
+                                let should_cancel = interaction_state
+                                    .prompt_history_search
+                                    .as_ref()
+                                    .is_some_and(|search_state| {
+                                        search_state.input_buffer.is_empty()
+                                    });
+                                if should_cancel {
+                                    let _ = cancel_prompt_history_search(
+                                        interaction_state,
+                                        input_buffer,
+                                    );
+                                } else {
+                                    let search_state = interaction_state
+                                        .prompt_history_search
+                                        .as_mut()
+                                        .expect("prompt history search state should exist");
+                                    search_state.input_buffer.pop();
+                                    sync_prompt_history_search_preview(
+                                        &prompt_history_from_messages(&pending_snapshot.messages),
+                                        search_state,
+                                        input_buffer,
+                                    );
+                                }
+                            }
+                            KeyCode::Char(ch)
+                                if key.modifiers.is_empty()
+                                    || key.modifiers == KeyModifiers::SHIFT =>
+                            {
+                                let search_state = interaction_state
+                                    .prompt_history_search
+                                    .as_mut()
+                                    .expect("prompt history search state should exist");
+                                search_state.input_buffer.push(ch);
+                                sync_prompt_history_search_preview(
+                                    &prompt_history_from_messages(&pending_snapshot.messages),
+                                    search_state,
+                                    input_buffer,
+                                );
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     if interaction_state.transcript_mode {
                         if interaction_state.transcript_search.open {
                             match key.code {
@@ -3391,6 +3806,85 @@ where
                                         size.height,
                                         &mut interaction_state.transcript_search,
                                         transcript_scroll,
+                                    );
+                                }
+                                KeyCode::Char('n') if key.modifiers.is_empty() => {
+                                    let app =
+                                        RatatuiApp::new(format!("{provider}  {active_model}"));
+                                    let state = build_repl_ui_state(
+                                        &app,
+                                        registry,
+                                        &pending_snapshot.messages,
+                                        Some(&pending_snapshot),
+                                        cwd,
+                                        provider,
+                                        active_model,
+                                        session_id,
+                                        input_buffer,
+                                        status_line,
+                                        Some(format!(
+                                            "{} {}",
+                                            pending_spinner_frame(tick),
+                                            pending_snapshot.progress_label
+                                        )),
+                                        *active_pane,
+                                        compact_banner.clone(),
+                                        *transcript_scroll,
+                                        None,
+                                        command_suggestions(registry, input_buffer),
+                                        *selected_command_suggestion,
+                                        tick,
+                                        interaction_state,
+                                    );
+                                    let size = terminal.size()?;
+                                    let _ = step_transcript_search_match(
+                                        &state,
+                                        size.width,
+                                        size.height,
+                                        &mut interaction_state.transcript_search,
+                                        transcript_scroll,
+                                        false,
+                                    );
+                                }
+                                KeyCode::Char('N')
+                                    if key.modifiers.is_empty()
+                                        || key.modifiers == KeyModifiers::SHIFT =>
+                                {
+                                    let app =
+                                        RatatuiApp::new(format!("{provider}  {active_model}"));
+                                    let state = build_repl_ui_state(
+                                        &app,
+                                        registry,
+                                        &pending_snapshot.messages,
+                                        Some(&pending_snapshot),
+                                        cwd,
+                                        provider,
+                                        active_model,
+                                        session_id,
+                                        input_buffer,
+                                        status_line,
+                                        Some(format!(
+                                            "{} {}",
+                                            pending_spinner_frame(tick),
+                                            pending_snapshot.progress_label
+                                        )),
+                                        *active_pane,
+                                        compact_banner.clone(),
+                                        *transcript_scroll,
+                                        None,
+                                        command_suggestions(registry, input_buffer),
+                                        *selected_command_suggestion,
+                                        tick,
+                                        interaction_state,
+                                    );
+                                    let size = terminal.size()?;
+                                    let _ = step_transcript_search_match(
+                                        &state,
+                                        size.width,
+                                        size.height,
+                                        &mut interaction_state.transcript_search,
+                                        transcript_scroll,
+                                        true,
                                     );
                                 }
                                 KeyCode::Char(ch)
