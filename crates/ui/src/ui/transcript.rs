@@ -838,7 +838,7 @@ fn single_item_group_header_lines(group: &TranscriptGroup, width: u16) -> Vec<Li
             .filter(|value| !value.trim().is_empty())
         {
             for (index, segment) in
-                wrap_plain_text(&subtitle, width.saturating_sub(5).max(1) as usize)
+                wrap_plain_text(subtitle, width.saturating_sub(5).max(1) as usize)
                     .into_iter()
                     .enumerate()
             {

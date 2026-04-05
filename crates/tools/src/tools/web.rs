@@ -164,8 +164,8 @@ fn load_browser_session(cwd: &Path, session_id: &str) -> Result<BrowserSessionSt
     }
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(serde_json::from_str(&raw)
-        .with_context(|| format!("failed to decode {}", path.display()))?)
+    serde_json::from_str(&raw)
+        .with_context(|| format!("failed to decode {}", path.display()))
 }
 
 fn save_browser_session(cwd: &Path, state: &BrowserSessionState) -> Result<PathBuf> {

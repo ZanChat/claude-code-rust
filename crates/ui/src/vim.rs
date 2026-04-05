@@ -65,16 +65,13 @@ pub enum CommandState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum VimMode {
+    #[default]
     Insert,
     Normal(CommandState),
 }
 
-impl Default for VimMode {
-    fn default() -> Self {
-        Self::Insert
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VimState {

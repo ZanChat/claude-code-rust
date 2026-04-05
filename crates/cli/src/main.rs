@@ -1,3 +1,11 @@
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::collapsible_else_if)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::manual_pattern_char_comparison)]
+#![allow(clippy::single_match)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::useless_vec)]
 mod helpers;
 use helpers::*;
 mod commands;

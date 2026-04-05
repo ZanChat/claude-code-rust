@@ -433,11 +433,9 @@ pub fn resolve_active_model(
                         return v;
                     }
                 }
-            } else {
-                if let Ok(v) = env::var("COMPLETION_MODEL") {
-                    if !v.trim().is_empty() {
-                        return v;
-                    }
+            } else if let Ok(v) = env::var("COMPLETION_MODEL") {
+                if !v.trim().is_empty() {
+                    return v;
                 }
             }
             model.to_owned()

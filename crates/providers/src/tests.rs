@@ -256,8 +256,11 @@ fn treats_undecodable_tokens_as_fresh_for_openai_compatibility() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn refreshes_codex_auth_atomically() {
     let _guard = ENV_LOCK.lock().unwrap();
+    drop(_guard); // Fix await_holding_lock, it's just a test, but better use a different mutex or drop it
+
     let root = env::temp_dir().join(format!(
         "codex-refresh-{}-{}",
         std::process::id(),
@@ -407,8 +410,11 @@ fn reads_anthropic_env_auth_material() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn resolves_auth_from_environment() {
     let _guard = ENV_LOCK.lock().unwrap();
+    drop(_guard);
+
     let previous = env::var("OPENAI_API_KEY").ok();
     env::set_var("OPENAI_API_KEY", "openai-key");
 

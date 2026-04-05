@@ -118,7 +118,9 @@ pub enum BoundaryKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub enum TaskStatus {
+    #[default]
     Pending,
     Running,
     WaitingForInput,
@@ -127,11 +129,6 @@ pub enum TaskStatus {
     Cancelled,
 }
 
-impl Default for TaskStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskRecord {
@@ -273,8 +270,8 @@ impl LocalTaskStore {
         }
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read task store {}", path.display()))?;
-        Ok(serde_json::from_str(&raw)
-            .with_context(|| format!("failed to decode task store {}", path.display()))?)
+        serde_json::from_str(&raw)
+            .with_context(|| format!("failed to decode task store {}", path.display()))
     }
 
     fn write_snapshot(&self, snapshot: &TaskStoreSnapshot) -> Result<()> {
@@ -603,45 +600,36 @@ pub enum AppEvent {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CommandKind {
+    #[default]
     Local,
     Prompt,
 }
 
-impl Default for CommandKind {
-    fn default() -> Self {
-        Self::Local
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CommandCategory {
     Session,
     Auth,
+    #[default]
     Config,
     Tooling,
     Advanced,
 }
 
-impl Default for CommandCategory {
-    fn default() -> Self {
-        Self::Config
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CommandSource {
+    #[default]
     BuiltIn,
     Plugin,
     Skill,
     Workflow,
 }
 
-impl Default for CommandSource {
-    fn default() -> Self {
-        Self::BuiltIn
-    }
-}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -798,6 +786,7 @@ impl CommandRegistry {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn builtin_command(
     name: &str,
     description: &str,

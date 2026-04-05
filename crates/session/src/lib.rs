@@ -280,16 +280,14 @@ fn should_skip_first_prompt(value: &str) -> bool {
 }
 
 fn truncate_prompt(value: &str) -> String {
-    let mut count = 0usize;
     let mut truncated = String::new();
 
-    for ch in value.chars() {
+    for (count, ch) in value.chars().enumerate() {
         if count == 200 {
             truncated.push_str("...");
             return truncated.trim().to_owned();
         }
         truncated.push(ch);
-        count += 1;
     }
 
     truncated.trim().to_owned()
@@ -299,21 +297,21 @@ fn message_text(message: &Message) -> String {
     message
         .blocks
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.clone()),
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.clone(),
             ContentBlock::ToolCall { call } => {
-                Some(format!("tool call {} {}", call.name, call.input_json))
+                format!("tool call {} {}", call.name, call.input_json)
             }
-            ContentBlock::ToolResult { result } => Some(result.output_text.clone()),
+            ContentBlock::ToolResult { result } => result.output_text.clone(),
             ContentBlock::Attachment { attachment } => {
-                Some(format!("attachment {}", attachment.name))
+                format!("attachment {}", attachment.name)
             }
-            ContentBlock::Boundary { boundary } => Some(match boundary.kind {
+            ContentBlock::Boundary { boundary } => match boundary.kind {
                 BoundaryKind::Compact => "[compact boundary]".to_owned(),
                 BoundaryKind::MicroCompact => "[micro-compact boundary]".to_owned(),
                 BoundaryKind::SessionMemory => "[session-memory boundary]".to_owned(),
                 BoundaryKind::Resume => "[resume boundary]".to_owned(),
-            }),
+            },
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -520,9 +518,7 @@ pub fn compact_messages(
         .max(1);
     let mut preserved_tokens = 0u64;
     let mut split_index = runtime_messages.len();
-    let mut preserved = 0usize;
-
-    for (index, message) in runtime_messages.iter().enumerate().rev() {
+    for (preserved, (index, message)) in runtime_messages.iter().enumerate().rev().enumerate() {
         let message_tokens = estimate_message_tokens(std::slice::from_ref(message));
         let must_keep = preserved < config.min_preserved_messages;
         if !must_keep && preserved_tokens + message_tokens > tail_budget {
@@ -530,7 +526,6 @@ pub fn compact_messages(
             break;
         }
         preserved_tokens += message_tokens;
-        preserved += 1;
         split_index = index;
     }
 

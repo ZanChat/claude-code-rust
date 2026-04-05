@@ -814,6 +814,7 @@ pub(crate) fn hmac_sha256(key: &[u8], message: &str) -> Result<Vec<u8>> {
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sign_bedrock_request(
     method: &str,
     host: &str,

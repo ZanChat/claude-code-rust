@@ -1,6 +1,8 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum ApiProvider {
     #[serde(rename = "firstParty")]
+    #[default]
     FirstParty,
     #[serde(rename = "bedrock")]
     Bedrock,
@@ -16,11 +18,6 @@ pub enum ApiProvider {
     OpenAICompatible,
 }
 
-impl Default for ApiProvider {
-    fn default() -> Self {
-        Self::FirstParty
-    }
-}
 
 impl ApiProvider {
     pub const ALL: [Self; 7] = [
@@ -133,20 +130,17 @@ pub struct ModelMetadata {
 /// - Claude: `adaptive` or `enabled` with a token budget
 /// - OpenAI: `reasoning_effort` string level (low/medium/high/xhigh)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ThinkingConfig {
     /// Model decides how much thinking to use (Claude 4.6+ models).
     Adaptive,
     /// Explicit thinking token budget (older Claude models).
     Enabled { budget_tokens: u64 },
     /// Thinking is disabled.
+    #[default]
     Disabled,
 }
 
-impl Default for ThinkingConfig {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProviderRequest {

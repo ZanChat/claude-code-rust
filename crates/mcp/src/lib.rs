@@ -1116,7 +1116,6 @@ pub fn parse_mcp_server_config(name: &str, value: &Value) -> Option<McpServerCon
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
-                ..McpServerConfig::default()
             })
         }
         Value::String(url) => Some(McpServerConfig {

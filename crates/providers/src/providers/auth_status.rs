@@ -111,7 +111,7 @@ fn openai_auth_url() -> String {
 
 fn decode_base64_url(input: &str) -> Option<Vec<u8>> {
     let mut sanitized = input.replace('-', "+").replace('_', "/");
-    while sanitized.len() % 4 != 0 {
+    while !sanitized.len().is_multiple_of(4) {
         sanitized.push('=');
     }
 
