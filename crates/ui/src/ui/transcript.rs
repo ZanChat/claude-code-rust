@@ -469,51 +469,16 @@ fn append_wrapped_transcript_line(
         .author_label
         .as_deref()
         .unwrap_or(role_label(&transcript_line.role));
-    let label_prefix = format!("{label}  ");
     let label_style = role_style(&transcript_line.role);
 
     if transcript_line.text.trim().is_empty() {
-        lines.push(Line::from(Span::styled(label_prefix, label_style)));
-        return;
-    }
-
-    let inline_label = line_width(&label_prefix) + 6 < width;
-    if inline_label {
-        let continuation_prefix = " ".repeat(line_width(&label_prefix));
-        let mut wrapped = wrap_plain_text(
-            &transcript_line.text,
-            width.saturating_sub(line_width(&label_prefix)).max(1),
-        )
-        .into_iter();
-
-        if let Some(first) = wrapped.next() {
-            lines.push(Line::from(vec![
-                Span::styled(label_prefix.clone(), label_style),
-                Span::raw(first),
-            ]));
-        }
-
-        for segment in wrapped {
-            lines.push(Line::from(vec![
-                Span::raw(continuation_prefix.clone()),
-                Span::raw(segment),
-            ]));
-        }
+        lines.push(Line::from(Span::styled(label.to_owned(), label_style)));
         return;
     }
 
     lines.push(Line::from(Span::styled(label.to_owned(), label_style)));
-    let continuation_prefix = "  ".to_owned();
-    for segment in wrap_plain_text(
-        &transcript_line.text,
-        width
-            .saturating_sub(line_width(&continuation_prefix))
-            .max(1),
-    ) {
-        lines.push(Line::from(vec![
-            Span::raw(continuation_prefix.clone()),
-            Span::raw(segment),
-        ]));
+    for segment in wrap_plain_text(&transcript_line.text, width) {
+        lines.push(Line::from(vec![Span::raw(segment)]));
     }
 }
 

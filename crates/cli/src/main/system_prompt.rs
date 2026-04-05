@@ -124,14 +124,14 @@ fn using_your_tools_section(enabled_tools: &BTreeSet<String>) -> Option<String> 
     }
     if enabled_tools.contains("file_write") {
         items.push(
-            "To create or replace files use file_write instead of shell redirection or here-docs.",
+            "To create or replace files use file_write instead of shell redirection or here-docs. For tmp files, you should write to a designated temporary directory, for example .tmp dir.",
         );
     }
     if enabled_tools.contains("glob") {
         items.push("To search for files use glob instead of find or ls.");
     }
     if enabled_tools.contains("grep") {
-        items.push("To search file contents use grep instead of running grep or rg via bash.");
+        items.push("To search file contents use grep instead of running grep or rg via bash. Never grep too wildly, you should skip tmp dirs/files and private data explicitly.");
     }
     if enabled_tools.contains("web_fetch") {
         items.push("Use web_fetch for specific URLs or remote documents.");
