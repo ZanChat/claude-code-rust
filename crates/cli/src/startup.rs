@@ -7,7 +7,7 @@ use crate::{apply_repl_header, repl_status, shorten_path, status_with_detail};
 use crate::{scroll_down, scroll_up};
 use code_agent_ui::{draw_terminal as draw_tui, PaneKind, RatatuiApp, TranscriptLine};
 use crossterm::event::{Event, KeyEventKind, MouseEventKind};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};

@@ -1,8 +1,6 @@
 use super::*;
 
-use std::collections::{BTreeMap, HashMap};
-
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
 
 use std::env;
 
@@ -12,22 +10,21 @@ use tokio::time::sleep;
 
 use tokio::process::Command;
 
-use code_agent_core::{ContentBlock, Message, MessageRole, SessionId};
+use code_agent_core::{ContentBlock, Message, MessageRole};
 
 use async_trait::async_trait;
 
-use reqwest::{
-    header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
-    Client, Method, RequestBuilder,
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
 };
 
 use serde_json::{json, Value};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 
 use time::OffsetDateTime;
 
-use hmac::{Hmac, Mac};
+use hmac::Mac;
 
 use sha2::{Digest, Sha256};
 
