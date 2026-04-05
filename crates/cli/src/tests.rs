@@ -24,14 +24,16 @@ use code_agent_bridge::{
 };
 use code_agent_core::{
     compatibility_command_registry, CommandInvocation, ContentBlock, SessionId, TaskRecord,
-    TaskStatus,
+    TaskStatus, ToolCall,
 };
 use code_agent_providers::{
     ApiProvider, DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
 };
 use code_agent_session::{materialize_runtime_messages, LocalSessionStore, SessionSummary};
 use code_agent_tools::compatibility_tool_registry;
-use code_agent_ui::{PromptSelectionState, TranscriptSelectionPoint, TranscriptSelectionState};
+use code_agent_ui::{
+    PromptSelectionState, TranscriptItem, TranscriptSelectionPoint, TranscriptSelectionState,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 
 fn repl_session_state(session_id: SessionId) -> ReplSessionState {
@@ -39,6 +41,29 @@ fn repl_session_state(session_id: SessionId) -> ReplSessionState {
         session_id,
         transcript_path: None,
     }
+}
+
+fn build_tool_call_message(
+    session_id: SessionId,
+    tool_call_id: &str,
+    tool_name: &str,
+    input_json: &str,
+    parent_id: Option<uuid::Uuid>,
+) -> Message {
+    let mut message = Message::new(
+        MessageRole::Assistant,
+        vec![ContentBlock::ToolCall {
+            call: ToolCall {
+                id: tool_call_id.to_owned(),
+                name: tool_name.to_owned(),
+                input_json: input_json.to_owned(),
+                thought_signature: None,
+            },
+        }],
+    );
+    message.session_id = Some(session_id);
+    message.parent_id = parent_id;
+    message
 }
 use serde::Deserialize;
 use serde_json::json;
@@ -1009,6 +1034,152 @@ fn build_repl_ui_state_groups_pending_steps() {
 }
 
 #[test]
+fn build_repl_ui_state_collapses_history_tool_runs_into_single_group() {
+    let app = code_agent_ui::RatatuiApp::new("repl");
+    let registry = compatibility_command_registry();
+    let session_id = SessionId::new_v4();
+    let user = build_text_message(
+        session_id,
+        MessageRole::User,
+        "inspect repo".to_owned(),
+        None,
+    );
+    let read_call = build_tool_call_message(
+        session_id,
+        "tool-call-read",
+        "read_file",
+        r#"{"file_path":"src/main.rs"}"#,
+        Some(user.id),
+    );
+    let read_result = build_tool_result_message(
+        session_id,
+        "tool-call-read".to_owned(),
+        "fn main() {}".to_owned(),
+        false,
+        Some(read_call.id),
+    );
+    let search_call = build_tool_call_message(
+        session_id,
+        "tool-call-search",
+        "grep_search",
+        r#"{"pattern":"build_repl_ui_state"}"#,
+        Some(read_result.id),
+    );
+    let search_result = build_tool_result_message(
+        session_id,
+        "tool-call-search".to_owned(),
+        "crates/cli/src/main.rs: build_repl_ui_state".to_owned(),
+        false,
+        Some(search_call.id),
+    );
+    let assistant = build_text_message(
+        session_id,
+        MessageRole::Assistant,
+        "Found the relevant flow.".to_owned(),
+        Some(search_result.id),
+    );
+    let messages = vec![
+        user,
+        read_call,
+        read_result,
+        search_call,
+        search_result,
+        assistant,
+    ];
+
+    let state = build_repl_ui_state(
+        &app,
+        &registry,
+        &messages,
+        None,
+        Path::new("."),
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        session_id,
+        &code_agent_ui::InputBuffer::new(),
+        "status",
+        None,
+        code_agent_ui::PaneKind::Transcript,
+        None,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        &ReplInteractionState::default(),
+    );
+
+    assert_eq!(state.transcript_items.len(), 3);
+    let TranscriptItem::Group(group) = &state.transcript_items[1] else {
+        panic!("expected grouped history item");
+    };
+    assert!(group.single_item);
+    assert!(!group.expanded);
+    assert!(group.title.contains("Read 1 file"));
+    assert!(group.title.contains("Searched 1 query"));
+}
+
+#[test]
+fn build_repl_ui_state_keeps_message_action_indices_for_grouped_history() {
+    let app = code_agent_ui::RatatuiApp::new("repl");
+    let registry = compatibility_command_registry();
+    let session_id = SessionId::new_v4();
+    let user = build_text_message(
+        session_id,
+        MessageRole::User,
+        "inspect repo".to_owned(),
+        None,
+    );
+    let read_call = build_tool_call_message(
+        session_id,
+        "tool-call-read",
+        "read_file",
+        r#"{"file_path":"src/main.rs"}"#,
+        Some(user.id),
+    );
+    let read_result = build_tool_result_message(
+        session_id,
+        "tool-call-read".to_owned(),
+        "fn main() {}".to_owned(),
+        false,
+        Some(read_call.id),
+    );
+    let messages = vec![user, read_call, read_result];
+    let mut interaction_state = ReplInteractionState::default();
+    interaction_state.message_actions = Some(super::ReplMessageActionState { selected_item: 1 });
+
+    let state = build_repl_ui_state(
+        &app,
+        &registry,
+        &messages,
+        None,
+        Path::new("."),
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        session_id,
+        &code_agent_ui::InputBuffer::new(),
+        "status",
+        None,
+        code_agent_ui::PaneKind::Transcript,
+        None,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        &interaction_state,
+    );
+
+    assert_eq!(
+        state
+            .message_actions
+            .as_ref()
+            .and_then(|actions| actions.primary_input_label.as_deref()),
+        Some("path")
+    );
+}
+
+#[test]
 fn pending_interrupt_messages_preserve_partial_preview_before_marker() {
     let session_id = SessionId::new_v4();
     let user = build_text_message(session_id, MessageRole::User, "inspect".to_owned(), None);
@@ -1088,6 +1259,7 @@ fn build_repl_ui_state_hides_prompt_in_transcript_mode() {
     search_input.replace("error");
     let interaction_state = ReplInteractionState {
         transcript_mode: true,
+        expanded_history_groups: BTreeSet::new(),
         transcript_search: super::ReplTranscriptSearchState {
             input_buffer: search_input,
             open: true,

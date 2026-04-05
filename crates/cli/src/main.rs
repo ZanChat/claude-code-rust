@@ -50,7 +50,7 @@ use code_agent_ui::{
     transcript_visual_scroll_for_view, ChoiceListItem, ChoiceListState, CommandPaletteEntry,
     Notification, PaneKind, PanePreview, PermissionPromptState, PromptHistorySearchState,
     PromptSelectionState, QuestionUiEntry, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup,
-    TranscriptMessageActionsState, TranscriptSearchState, TranscriptSelectableLine,
+    TranscriptItem, TranscriptMessageActionsState, TranscriptSearchState, TranscriptSelectableLine,
     TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction, UiState,
 };
 use crossterm::cursor::{Hide, Show};
@@ -86,6 +86,7 @@ const UI_ROLE_ATTRIBUTE: &str = "ui_role";
 const UI_AUTHOR_ATTRIBUTE: &str = "ui_author";
 const REQUEST_INTERRUPTED_MESSAGE: &str = "[Request interrupted by user]";
 const RECENT_COMPLETED_TTL_MS: i64 = 30_000;
+const HISTORY_TRANSCRIPT_GROUP_PREFIX: &str = "history-group-";
 
 fn should_exit_repl(prompt_text: &str) -> bool {
     matches!(prompt_text.trim(), "quit" | "exit" | "/quit" | "/exit")
@@ -1561,6 +1562,7 @@ struct ToolPrimaryInput {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ReplInteractionState {
     transcript_mode: bool,
+    expanded_history_groups: BTreeSet<String>,
     transcript_search: ReplTranscriptSearchState,
     prompt_history_search: Option<ReplPromptHistorySearchState>,
     message_actions: Option<ReplMessageActionState>,
@@ -1662,6 +1664,41 @@ fn exit_transcript_mode(interaction_state: &mut ReplInteractionState) {
     interaction_state.prompt_selection = None;
     interaction_state.prompt_mouse_anchor = None;
     interaction_state.transcript_selection = None;
+}
+
+fn toggle_history_transcript_group(interaction_state: &mut ReplInteractionState, group_id: &str) {
+    if interaction_state.expanded_history_groups.contains(group_id) {
+        interaction_state.expanded_history_groups.remove(group_id);
+    } else {
+        interaction_state
+            .expanded_history_groups
+            .insert(group_id.to_owned());
+    }
+}
+
+fn toggle_all_history_transcript_groups(
+    interaction_state: &mut ReplInteractionState,
+    group_ids: &[String],
+) -> bool {
+    if group_ids.is_empty() {
+        return false;
+    }
+
+    let all_expanded = group_ids
+        .iter()
+        .all(|group_id| interaction_state.expanded_history_groups.contains(group_id));
+
+    if all_expanded {
+        for group_id in group_ids {
+            interaction_state.expanded_history_groups.remove(group_id);
+        }
+    } else {
+        interaction_state
+            .expanded_history_groups
+            .extend(group_ids.iter().cloned());
+    }
+
+    true
 }
 
 fn open_prompt_history_search(
@@ -1922,9 +1959,9 @@ fn push_message_action_items(
 fn message_action_items_from_runtime(
     runtime_messages: &[Message],
     pending_view: Option<&PendingReplView>,
+    interaction_state: &ReplInteractionState,
 ) -> Vec<ReplMessageActionItem> {
     let mut items = Vec::new();
-    let mut item_index = 0usize;
 
     if let Some(pending_view) = pending_view.filter(|view| !view.steps.is_empty()) {
         let first_step_start = pending_view
@@ -1932,11 +1969,12 @@ fn message_action_items_from_runtime(
             .first()
             .map(|step| step.start_index.min(runtime_messages.len()))
             .unwrap_or(runtime_messages.len());
-        push_message_action_items(
-            &mut items,
+        let history = build_history_transcript_presentation(
             &runtime_messages[..first_step_start],
-            &mut item_index,
+            &interaction_state.expanded_history_groups,
         );
+        items.extend(history.action_items);
+        let mut item_index = history.item_count;
 
         if !pending_view.show_transcript_details {
             return items;
@@ -1966,7 +2004,13 @@ fn message_action_items_from_runtime(
         return items;
     }
 
-    push_message_action_items(&mut items, runtime_messages, &mut item_index);
+    items.extend(
+        build_history_transcript_presentation(
+            runtime_messages,
+            &interaction_state.expanded_history_groups,
+        )
+        .action_items,
+    );
     items
 }
 
@@ -2594,6 +2638,13 @@ fn message_tool_call(message: &Message) -> Option<&code_agent_core::ToolCall> {
     })
 }
 
+fn message_tool_result(message: &Message) -> Option<&code_agent_core::ToolResult> {
+    message.blocks.iter().find_map(|block| match block {
+        ContentBlock::ToolResult { result } => Some(result),
+        _ => None,
+    })
+}
+
 fn message_primary_input(message: &Message) -> Option<ToolPrimaryInput> {
     message_tool_call(message).and_then(tool_primary_input)
 }
@@ -2610,6 +2661,299 @@ fn message_action_copy_text(message: &Message) -> Option<String> {
 
     let transcript_line = transcript_line_from_message(message);
     (!transcript_line.text.trim().is_empty()).then_some(transcript_line.text)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryTranscriptToolKind {
+    Read,
+    Search,
+    List,
+    Bash,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HistoryTranscriptPresentation {
+    items: Vec<TranscriptItem>,
+    action_items: Vec<ReplMessageActionItem>,
+    group_ids: Vec<String>,
+    item_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryTranscriptGroupAccumulator {
+    first_message: Message,
+    messages: Vec<Message>,
+    tracked_call_ids: BTreeSet<String>,
+    read_count: usize,
+    search_count: usize,
+    list_count: usize,
+    bash_count: usize,
+    hints: Vec<String>,
+}
+
+impl HistoryTranscriptGroupAccumulator {
+    fn new(
+        message: &Message,
+        call: &code_agent_core::ToolCall,
+        kind: HistoryTranscriptToolKind,
+    ) -> Self {
+        let mut accumulator = Self {
+            first_message: message.clone(),
+            messages: Vec::new(),
+            tracked_call_ids: BTreeSet::new(),
+            read_count: 0,
+            search_count: 0,
+            list_count: 0,
+            bash_count: 0,
+            hints: Vec::new(),
+        };
+        accumulator.push_call(message, call, kind);
+        accumulator
+    }
+
+    fn push_call(
+        &mut self,
+        message: &Message,
+        call: &code_agent_core::ToolCall,
+        kind: HistoryTranscriptToolKind,
+    ) {
+        self.messages.push(message.clone());
+        self.tracked_call_ids.insert(call.id.clone());
+        match kind {
+            HistoryTranscriptToolKind::Read => self.read_count += 1,
+            HistoryTranscriptToolKind::Search => self.search_count += 1,
+            HistoryTranscriptToolKind::List => self.list_count += 1,
+            HistoryTranscriptToolKind::Bash => self.bash_count += 1,
+        }
+        if let Some(hint) = history_transcript_hint(call) {
+            self.hints.push(hint);
+        }
+    }
+
+    fn push_result(&mut self, message: &Message) {
+        self.messages.push(message.clone());
+    }
+
+    fn matches_result(&self, result: &code_agent_core::ToolResult) -> bool {
+        self.tracked_call_ids.contains(&result.tool_call_id)
+    }
+
+    fn representative_message(&self) -> Message {
+        self.first_message.clone()
+    }
+
+    fn into_group(self, expanded_history_groups: &BTreeSet<String>) -> TranscriptGroup {
+        let group_id = history_transcript_group_id(&self.first_message);
+        let mut subtitle_parts = vec![format!(
+            "{} {}",
+            self.messages.len(),
+            if self.messages.len() == 1 {
+                "message"
+            } else {
+                "messages"
+            }
+        )];
+
+        let mut unique_hints = Vec::new();
+        for hint in self.hints.iter().rev() {
+            if unique_hints
+                .iter()
+                .any(|existing: &String| existing == hint)
+            {
+                continue;
+            }
+            unique_hints.push(hint.clone());
+            if unique_hints.len() == 2 {
+                break;
+            }
+        }
+        unique_hints.reverse();
+        subtitle_parts.extend(unique_hints);
+
+        TranscriptGroup {
+            id: group_id.clone(),
+            title: history_transcript_group_title(&self),
+            subtitle: Some(subtitle_parts.join(" · ")),
+            expanded: expanded_history_groups.contains(&group_id),
+            single_item: true,
+            lines: UiState::from_messages(self.messages).transcript_lines,
+        }
+    }
+}
+
+fn history_transcript_group_id(message: &Message) -> String {
+    format!("{HISTORY_TRANSCRIPT_GROUP_PREFIX}{}", message.id)
+}
+
+fn is_history_transcript_group_id(group_id: &str) -> bool {
+    group_id.starts_with(HISTORY_TRANSCRIPT_GROUP_PREFIX)
+}
+
+fn history_transcript_group_title(group: &HistoryTranscriptGroupAccumulator) -> String {
+    let mut parts = Vec::new();
+
+    if group.read_count > 0 {
+        parts.push(format!(
+            "Read {} {}",
+            group.read_count,
+            if group.read_count == 1 {
+                "file"
+            } else {
+                "files"
+            }
+        ));
+    }
+    if group.search_count > 0 {
+        parts.push(format!(
+            "Searched {} {}",
+            group.search_count,
+            if group.search_count == 1 {
+                "query"
+            } else {
+                "queries"
+            }
+        ));
+    }
+    if group.list_count > 0 {
+        parts.push(format!(
+            "Listed {} {}",
+            group.list_count,
+            if group.list_count == 1 {
+                "directory"
+            } else {
+                "directories"
+            }
+        ));
+    }
+    if group.bash_count > 0 {
+        parts.push(format!(
+            "Ran {} {}",
+            group.bash_count,
+            if group.bash_count == 1 {
+                "command"
+            } else {
+                "commands"
+            }
+        ));
+    }
+
+    if parts.is_empty() {
+        "Tool activity".to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn history_transcript_tool_kind(tool_name: &str) -> Option<HistoryTranscriptToolKind> {
+    match tool_name {
+        "Read" | "read" | "read_file" | "view_image" | "fetch_webpage" => {
+            Some(HistoryTranscriptToolKind::Read)
+        }
+        "Grep" | "grep" | "grep_search" | "semantic_search" | "WebSearch" | "web_search"
+        | "file_search" => Some(HistoryTranscriptToolKind::Search),
+        "Glob" | "glob" | "list_dir" => Some(HistoryTranscriptToolKind::List),
+        "Bash" | "bash" | "powershell" | "terminal_capture" | "run_in_terminal" => {
+            Some(HistoryTranscriptToolKind::Bash)
+        }
+        _ => None,
+    }
+}
+
+fn history_transcript_hint(call: &code_agent_core::ToolCall) -> Option<String> {
+    let primary = tool_primary_input(call)?;
+    let condensed = primary
+        .value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if condensed.is_empty() {
+        return None;
+    }
+
+    Some(preview_lines_from_text(condensed, 1, 56).join(" "))
+}
+
+fn push_history_transcript_line_item(
+    presentation: &mut HistoryTranscriptPresentation,
+    message: &Message,
+) {
+    let transcript_line = transcript_line_from_message(message);
+    presentation
+        .items
+        .push(TranscriptItem::Line(transcript_line.clone()));
+    if !transcript_line.text.trim().is_empty() {
+        presentation.action_items.push(ReplMessageActionItem {
+            item_index: presentation.item_count,
+            message: message.clone(),
+        });
+    }
+    presentation.item_count += 1;
+}
+
+fn push_history_transcript_group_item(
+    presentation: &mut HistoryTranscriptPresentation,
+    accumulator: HistoryTranscriptGroupAccumulator,
+    expanded_history_groups: &BTreeSet<String>,
+) {
+    let representative_message = accumulator.representative_message();
+    let group = accumulator.into_group(expanded_history_groups);
+    presentation.group_ids.push(group.id.clone());
+    presentation.items.push(TranscriptItem::Group(group));
+    presentation.action_items.push(ReplMessageActionItem {
+        item_index: presentation.item_count,
+        message: representative_message,
+    });
+    presentation.item_count += 1;
+}
+
+fn build_history_transcript_presentation(
+    messages: &[Message],
+    expanded_history_groups: &BTreeSet<String>,
+) -> HistoryTranscriptPresentation {
+    let mut presentation = HistoryTranscriptPresentation::default();
+    let mut current_group: Option<HistoryTranscriptGroupAccumulator> = None;
+
+    for message in messages {
+        if let Some(call) = message_tool_call(message) {
+            if let Some(kind) = history_transcript_tool_kind(&call.name) {
+                match current_group.as_mut() {
+                    Some(group) => group.push_call(message, call, kind),
+                    None => {
+                        current_group =
+                            Some(HistoryTranscriptGroupAccumulator::new(message, call, kind));
+                    }
+                }
+                continue;
+            }
+        }
+
+        if let Some(result) = message_tool_result(message) {
+            if current_group
+                .as_ref()
+                .is_some_and(|group| group.matches_result(result))
+            {
+                if let Some(group) = current_group.as_mut() {
+                    group.push_result(message);
+                }
+                continue;
+            }
+        }
+
+        if let Some(group) = current_group.take() {
+            push_history_transcript_group_item(&mut presentation, group, expanded_history_groups);
+        }
+        push_history_transcript_line_item(&mut presentation, message);
+    }
+
+    if let Some(group) = current_group.take() {
+        push_history_transcript_group_item(&mut presentation, group, expanded_history_groups);
+    }
+
+    presentation
+}
+
+fn history_transcript_group_ids(messages: &[Message]) -> Vec<String> {
+    build_history_transcript_presentation(messages, &BTreeSet::new()).group_ids
 }
 
 fn message_actions_ui_state(
@@ -2652,7 +2996,8 @@ fn build_repl_ui_state(
     interaction_state: &ReplInteractionState,
 ) -> code_agent_ui::UiState {
     let runtime_messages = materialize_runtime_messages(raw_messages);
-    let message_action_items = message_action_items_from_runtime(&runtime_messages, pending_view);
+    let message_action_items =
+        message_action_items_from_runtime(&runtime_messages, pending_view, interaction_state);
     let mut state = app.state_from_messages(runtime_messages.clone(), &registry.all());
     if let Some(pending_view) = pending_view {
         state.queued_inputs = pending_view
@@ -2668,9 +3013,14 @@ fn build_repl_ui_state(
             .first()
             .map(|step| step.start_index.min(runtime_messages.len()))
             .unwrap_or(runtime_messages.len());
+        let visible_history = build_history_transcript_presentation(
+            &runtime_messages[..first_step_start],
+            &interaction_state.expanded_history_groups,
+        );
         let visible_transcript =
             UiState::from_messages(runtime_messages[..first_step_start].to_vec());
         state.transcript_lines = visible_transcript.transcript_lines;
+        state.transcript_items = visible_history.items;
         state.transcript_preview = visible_transcript.transcript_preview;
         state.pending_step_count = pending_view.steps.len();
         state.pending_transcript_details = pending_view.show_transcript_details;
@@ -2723,11 +3073,25 @@ fn build_repl_ui_state(
                         title: pending_step_title(step),
                         subtitle: Some(detail_parts.join(" · ")),
                         expanded: step.expanded,
+                        single_item: false,
                         lines: UiState::from_messages(slice.to_vec()).transcript_lines,
                     }
                 })
                 .collect();
+            state.transcript_items.extend(
+                state
+                    .transcript_groups
+                    .iter()
+                    .cloned()
+                    .map(TranscriptItem::Group),
+            );
         }
+    } else {
+        state.transcript_items = build_history_transcript_presentation(
+            &runtime_messages,
+            &interaction_state.expanded_history_groups,
+        )
+        .items;
     }
     apply_repl_header(&mut state, provider, active_model, cwd, session_id);
     let (mut task_items, question_items) = load_task_ui_data(cwd);
@@ -3196,7 +3560,14 @@ where
                                     ) =>
                                 {
                                     clear_prompt_mouse_anchor(interaction_state);
-                                    toggle_pending_repl_group(&pending_view, &group_id);
+                                    if is_history_transcript_group_id(&group_id) {
+                                        toggle_history_transcript_group(
+                                            interaction_state,
+                                            &group_id,
+                                        );
+                                    } else {
+                                        toggle_pending_repl_group(&pending_view, &group_id);
+                                    }
                                 }
                                 UiMouseAction::SetPromptCursor(cursor) => {
                                     let _ = handle_prompt_mouse_action(
@@ -3472,6 +3843,7 @@ where
                                 let message_action_items = message_action_items_from_runtime(
                                     &pending_snapshot.messages,
                                     Some(&pending_snapshot),
+                                    interaction_state,
                                 );
                                 if enter_message_actions(interaction_state, &message_action_items) {
                                     let app =
@@ -3528,6 +3900,7 @@ where
                         let message_action_items = message_action_items_from_runtime(
                             &pending_snapshot.messages,
                             Some(&pending_snapshot),
+                            interaction_state,
                         );
                         if selected_message_action_item(interaction_state, &message_action_items)
                             .is_none()

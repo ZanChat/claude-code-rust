@@ -138,7 +138,14 @@ pub struct TranscriptGroup {
     pub title: String,
     pub subtitle: Option<String>,
     pub expanded: bool,
+    pub single_item: bool,
     pub lines: Vec<TranscriptLine>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TranscriptItem {
+    Line(TranscriptLine),
+    Group(TranscriptGroup),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,6 +264,7 @@ pub struct TranscriptSelectableLine {
 #[derive(Clone, Debug, Default)]
 pub struct UiState {
     pub messages: Vec<Message>,
+    pub transcript_items: Vec<TranscriptItem>,
     pub transcript_lines: Vec<TranscriptLine>,
     pub transcript_groups: Vec<TranscriptGroup>,
     pub queued_inputs: Vec<String>,
@@ -303,9 +311,15 @@ impl UiState {
             .iter()
             .map(transcript_line_from_message)
             .collect::<Vec<_>>();
+        let transcript_items = transcript_lines
+            .iter()
+            .cloned()
+            .map(TranscriptItem::Line)
+            .collect::<Vec<_>>();
 
         let mut state = Self {
             messages,
+            transcript_items,
             transcript_lines,
             active_pane: Some(PaneKind::Transcript),
             ..Self::default()
@@ -592,6 +606,32 @@ fn pending_details_toggle_label(state: &UiState) -> Option<&'static str> {
     } else {
         "Ctrl+E show details"
     })
+}
+
+fn history_group_toggle_label(state: &UiState) -> Option<&'static str> {
+    let mut has_history_groups = false;
+    let mut all_expanded = true;
+
+    for item in resolved_transcript_items(state) {
+        let TranscriptItem::Group(group) = item else {
+            continue;
+        };
+        if !group.single_item {
+            continue;
+        }
+        has_history_groups = true;
+        all_expanded &= group.expanded;
+    }
+
+    has_history_groups.then_some(if all_expanded {
+        "Ctrl+E collapse history"
+    } else {
+        "Ctrl+E expand history"
+    })
+}
+
+fn transcript_details_toggle_label(state: &UiState) -> Option<&'static str> {
+    pending_details_toggle_label(state).or_else(|| history_group_toggle_label(state))
 }
 
 fn truncate_middle(text: &str, max_chars: usize) -> String {
@@ -1057,6 +1097,27 @@ fn wrapped_transcript_lines(transcript_line: &TranscriptLine, width: u16) -> Vec
     lines
 }
 
+fn resolved_transcript_items(state: &UiState) -> Vec<TranscriptItem> {
+    if !state.transcript_items.is_empty() {
+        return state.transcript_items.clone();
+    }
+
+    let mut items = state
+        .transcript_lines
+        .iter()
+        .cloned()
+        .map(TranscriptItem::Line)
+        .collect::<Vec<_>>();
+    items.extend(
+        state
+            .transcript_groups
+            .iter()
+            .cloned()
+            .map(TranscriptItem::Group),
+    );
+    items
+}
+
 fn group_header_lines(group: &TranscriptGroup, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let icon = if group.expanded { "▼" } else { "▶" };
@@ -1137,52 +1198,85 @@ fn empty_transcript_render_lines(state: &UiState, width: u16) -> Vec<TranscriptR
 }
 
 fn transcript_visual_lines(state: &UiState, width: u16) -> Vec<TranscriptRenderLine> {
-    if state.transcript_lines.is_empty() && state.transcript_groups.is_empty() {
+    let items = resolved_transcript_items(state);
+    if items.is_empty() {
         return empty_transcript_render_lines(state, width);
     }
 
     let mut lines = Vec::new();
     let mut item_index = 0usize;
 
-    for (index, transcript_line) in state.transcript_lines.iter().enumerate() {
-        for line in wrapped_transcript_lines(transcript_line, width) {
-            let plain_text = line_text(&line);
-            lines.push(regular_render_line(line, Some(item_index), plain_text));
-        }
-        item_index += 1;
-        if index + 1 < state.transcript_lines.len() || !state.transcript_groups.is_empty() {
-            lines.push(regular_render_line(Line::from(""), None, ""));
-        }
-    }
-
-    for (group_index, group) in state.transcript_groups.iter().enumerate() {
-        for line in group_header_lines(group, width) {
-            let plain_text = line_text(&line);
-            lines.push(group_header_render_line(
-                &group.id,
-                line,
-                Some(item_index),
-                plain_text,
-            ));
-        }
-        item_index += 1;
-
-        if group.expanded && !group.lines.is_empty() {
-            lines.push(regular_render_line(Line::from(""), None, ""));
-            for (line_index, transcript_line) in group.lines.iter().enumerate() {
-                for line in wrapped_transcript_lines(transcript_line, width.saturating_sub(2)) {
-                    let line = indent_line(line, "  ");
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            TranscriptItem::Line(transcript_line) => {
+                for line in wrapped_transcript_lines(transcript_line, width) {
                     let plain_text = line_text(&line);
                     lines.push(regular_render_line(line, Some(item_index), plain_text));
                 }
                 item_index += 1;
-                if line_index + 1 < group.lines.len() {
-                    lines.push(regular_render_line(Line::from(""), None, ""));
+            }
+            TranscriptItem::Group(group) => {
+                let group_item_index = item_index;
+                for line in group_header_lines(group, width) {
+                    let plain_text = line_text(&line);
+                    lines.push(group_header_render_line(
+                        &group.id,
+                        line,
+                        Some(group_item_index),
+                        plain_text,
+                    ));
+                }
+                item_index += 1;
+
+                if group.expanded && !group.lines.is_empty() {
+                    if group.single_item {
+                        for (line_index, transcript_line) in group.lines.iter().enumerate() {
+                            let is_last = line_index + 1 == group.lines.len();
+                            let first_prefix = if is_last { "  └ " } else { "  ├ " };
+                            let continuation_prefix = if is_last { "    " } else { "  │ " };
+
+                            for (wrapped_index, line) in
+                                wrapped_transcript_lines(transcript_line, width.saturating_sub(4))
+                                    .into_iter()
+                                    .enumerate()
+                            {
+                                let line = indent_line(
+                                    line,
+                                    if wrapped_index == 0 {
+                                        first_prefix
+                                    } else {
+                                        continuation_prefix
+                                    },
+                                );
+                                let plain_text = line_text(&line);
+                                lines.push(regular_render_line(
+                                    line,
+                                    Some(group_item_index),
+                                    plain_text,
+                                ));
+                            }
+                        }
+                    } else {
+                        lines.push(regular_render_line(Line::from(""), None, ""));
+                        for (line_index, transcript_line) in group.lines.iter().enumerate() {
+                            for line in
+                                wrapped_transcript_lines(transcript_line, width.saturating_sub(2))
+                            {
+                                let line = indent_line(line, "  ");
+                                let plain_text = line_text(&line);
+                                lines.push(regular_render_line(line, Some(item_index), plain_text));
+                            }
+                            item_index += 1;
+                            if line_index + 1 < group.lines.len() {
+                                lines.push(regular_render_line(Line::from(""), None, ""));
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        if group_index + 1 < state.transcript_groups.len() {
+        if index + 1 < items.len() {
             lines.push(regular_render_line(Line::from(""), None, ""));
         }
     }
@@ -1198,28 +1292,43 @@ fn transcript_searchable_items(state: &UiState) -> Vec<(usize, String)> {
     let mut items = Vec::new();
     let mut item_index = 0usize;
 
-    for transcript_line in &state.transcript_lines {
-        items.push((item_index, transcript_line.text.clone()));
-        item_index += 1;
-    }
-
-    for group in &state.transcript_groups {
-        let mut header_text = group.title.clone();
-        if let Some(subtitle) = group
-            .subtitle
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-        {
-            header_text.push('\n');
-            header_text.push_str(subtitle);
-        }
-        items.push((item_index, header_text));
-        item_index += 1;
-
-        if group.expanded {
-            for transcript_line in &group.lines {
-                items.push((item_index, transcript_line.text.clone()));
+    for item in resolved_transcript_items(state) {
+        match item {
+            TranscriptItem::Line(transcript_line) => {
+                items.push((item_index, transcript_line.text));
                 item_index += 1;
+            }
+            TranscriptItem::Group(group) => {
+                let mut header_text = group.title.clone();
+                if let Some(subtitle) = group
+                    .subtitle
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    header_text.push('\n');
+                    header_text.push_str(subtitle);
+                }
+
+                if group.single_item {
+                    for transcript_line in &group.lines {
+                        if !transcript_line.text.trim().is_empty() {
+                            header_text.push('\n');
+                            header_text.push_str(&transcript_line.text);
+                        }
+                    }
+                    items.push((item_index, header_text));
+                    item_index += 1;
+                } else {
+                    items.push((item_index, header_text));
+                    item_index += 1;
+
+                    if group.expanded {
+                        for transcript_line in &group.lines {
+                            items.push((item_index, transcript_line.text.clone()));
+                            item_index += 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1506,12 +1615,27 @@ fn last_user_prompt_excerpt(state: &UiState, width: u16, transcript_scroll: u16)
         return None;
     }
 
-    state
-        .transcript_lines
-        .iter()
-        .rev()
-        .find(|line| line.role == "user")
-        .map(|line| truncate_middle(&line.text, width.saturating_sub(4) as usize))
+    for item in resolved_transcript_items(state).into_iter().rev() {
+        match item {
+            TranscriptItem::Line(line) if line.role == "user" => {
+                return Some(truncate_middle(
+                    &line.text,
+                    width.saturating_sub(4) as usize,
+                ));
+            }
+            TranscriptItem::Group(group) => {
+                if let Some(line) = group.lines.iter().rev().find(|line| line.role == "user") {
+                    return Some(truncate_middle(
+                        &line.text,
+                        width.saturating_sub(4) as usize,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn sticky_prompt_widget(
@@ -2162,7 +2286,7 @@ fn navigation_hint(
     } else {
         format!("{} open", active_pane.title())
     };
-    let pending_hint = pending_details_toggle_label(state)
+    let pending_hint = transcript_details_toggle_label(state)
         .map(|hint| format!("  {hint}"))
         .unwrap_or_default();
 
@@ -2295,7 +2419,10 @@ fn footer_primary_text(state: &UiState, suggestions_visible: bool) -> String {
         }
     }
     if state.transcript_mode {
-        return "Transcript mode · / search · q or Esc exit".to_owned();
+        let toggle_hint = history_group_toggle_label(state)
+            .map(|hint| format!(" · {hint}"))
+            .unwrap_or_default();
+        return format!("Transcript mode · / search · q or Esc exit{toggle_hint}");
     }
     if state.vim_state.is_insert() {
         return "-- INSERT --".to_owned();
@@ -2307,7 +2434,7 @@ fn footer_primary_text(state: &UiState, suggestions_visible: bool) -> String {
         return "Waiting for permission".to_owned();
     }
     if !state.queued_inputs.is_empty() {
-        let pending_hint = pending_details_toggle_label(state)
+        let pending_hint = transcript_details_toggle_label(state)
             .map(|hint| format!(" · {hint}"))
             .unwrap_or_default();
         return format!(
@@ -2316,7 +2443,7 @@ fn footer_primary_text(state: &UiState, suggestions_visible: bool) -> String {
         );
     }
     if state.progress_message.is_some() || state.pending_step_count > 0 {
-        if let Some(hint) = pending_details_toggle_label(state) {
+        if let Some(hint) = transcript_details_toggle_label(state) {
             return format!("Working · Ctrl+C to interrupt · {hint}");
         }
         return "Working · Ctrl+C to interrupt".to_owned();
@@ -3258,8 +3385,8 @@ mod tests {
         transcript_selection_text_for_view, transcript_visual_lines, ChoiceListItem,
         ChoiceListState, InputBuffer, Notification, PaneKind, PermissionPromptState,
         PromptHistorySearchState, PromptSelectionState, RatatuiApp, StatusLevel, TaskUiEntry,
-        TranscriptGroup, TranscriptLine, TranscriptMessageActionsState, TranscriptSearchState,
-        TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
+        TranscriptGroup, TranscriptItem, TranscriptLine, TranscriptMessageActionsState,
+        TranscriptSearchState, TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
     };
     use code_agent_core::{
         compatibility_command_registry, ContentBlock, Message, MessageRole, TaskStatus,
@@ -3755,6 +3882,7 @@ mod tests {
             title: "Step 1 · running list_dir".to_owned(),
             subtitle: Some("2 messages".to_owned()),
             expanded: false,
+            single_item: false,
             lines: vec![TranscriptLine {
                 role: "assistant".to_owned(),
                 text: "Tool call: list_dir".to_owned(),
@@ -3886,6 +4014,7 @@ mod tests {
             title: "Step 1".to_owned(),
             subtitle: Some("error detail".to_owned()),
             expanded: true,
+            single_item: false,
             lines: vec![TranscriptLine {
                 role: "assistant".to_owned(),
                 text: "resolved".to_owned(),
@@ -3894,6 +4023,53 @@ mod tests {
         }];
 
         assert_eq!(transcript_search_match_items(&state, "error"), vec![1, 2]);
+    }
+
+    #[test]
+    fn single_item_transcript_groups_search_hidden_children() {
+        let mut state = RatatuiApp::new("search-grouped-history").initial_state();
+        state.transcript_items = vec![TranscriptItem::Group(TranscriptGroup {
+            id: "history-group-1".to_owned(),
+            title: "Read 2 files".to_owned(),
+            subtitle: Some("3 messages · src/lib.rs".to_owned()),
+            expanded: false,
+            single_item: true,
+            lines: vec![TranscriptLine {
+                role: "assistant".to_owned(),
+                text: "needle inside collapsed child".to_owned(),
+                author_label: None,
+            }],
+        })];
+
+        assert_eq!(transcript_search_match_items(&state, "needle"), vec![0]);
+    }
+
+    #[test]
+    fn single_item_transcript_groups_render_tree_connectors_when_expanded() {
+        let mut state = RatatuiApp::new("history-tree").initial_state();
+        state.transcript_items = vec![TranscriptItem::Group(TranscriptGroup {
+            id: "history-group-1".to_owned(),
+            title: "Read 2 files".to_owned(),
+            subtitle: Some("4 messages".to_owned()),
+            expanded: true,
+            single_item: true,
+            lines: vec![
+                TranscriptLine {
+                    role: "assistant".to_owned(),
+                    text: "Tool call: read_file".to_owned(),
+                    author_label: None,
+                },
+                TranscriptLine {
+                    role: "tool".to_owned(),
+                    text: "src/lib.rs".to_owned(),
+                    author_label: None,
+                },
+            ],
+        })];
+
+        let rendered = render_to_string(&state, 80, 24).unwrap();
+
+        assert!(rendered.contains("├") || rendered.contains("└"));
     }
 
     #[test]

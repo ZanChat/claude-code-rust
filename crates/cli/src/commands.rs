@@ -1992,13 +1992,19 @@ pub(crate) async fn run_interactive_repl(
                                     clear_prompt_mouse_anchor(&mut interaction_state);
                                     transcript_scroll = 0;
                                 }
-                                UiMouseAction::ToggleTranscriptGroup(_)
+                                UiMouseAction::ToggleTranscriptGroup(group_id)
                                     if matches!(
                                         mouse.kind,
                                         MouseEventKind::Down(MouseButton::Left)
                                     ) =>
                                 {
                                     clear_prompt_mouse_anchor(&mut interaction_state);
+                                    if is_history_transcript_group_id(&group_id) {
+                                        toggle_history_transcript_group(
+                                            &mut interaction_state,
+                                            &group_id,
+                                        );
+                                    }
                                 }
                                 UiMouseAction::SetPromptCursor(cursor) => {
                                     let _ = handle_prompt_mouse_action(
@@ -2371,8 +2377,11 @@ pub(crate) async fn run_interactive_repl(
                     }
                     ReplShortcutAction::EnterMessageActions => {
                         let runtime_messages = materialize_runtime_messages(raw_messages);
-                        let message_action_items =
-                            message_action_items_from_runtime(&runtime_messages, None);
+                        let message_action_items = message_action_items_from_runtime(
+                            &runtime_messages,
+                            None,
+                            &interaction_state,
+                        );
                         if enter_message_actions(&mut interaction_state, &message_action_items) {
                             let app = RatatuiApp::new(format!("{provider}  {active_model}"));
                             let state = build_repl_ui_state(
@@ -2426,7 +2435,7 @@ pub(crate) async fn run_interactive_repl(
             if interaction_state.message_actions.is_some() {
                 let runtime_messages = materialize_runtime_messages(raw_messages);
                 let message_action_items =
-                    message_action_items_from_runtime(&runtime_messages, None);
+                    message_action_items_from_runtime(&runtime_messages, None, &interaction_state);
                 if selected_message_action_item(&mut interaction_state, &message_action_items)
                     .is_none()
                 {
@@ -3269,6 +3278,17 @@ pub(crate) async fn run_interactive_repl(
                                 }
                                 code_agent_ui::vim::VimTransition::None => {}
                             }
+                        }
+                    }
+
+                    if is_plain_ctrl_char(&key, 'e') {
+                        let group_ids = history_transcript_group_ids(
+                            &materialize_runtime_messages(raw_messages),
+                        );
+                        if toggle_all_history_transcript_groups(&mut interaction_state, &group_ids)
+                        {
+                            dirty = true;
+                            continue;
                         }
                     }
                 }
