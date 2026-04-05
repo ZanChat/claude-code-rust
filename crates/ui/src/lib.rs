@@ -284,6 +284,8 @@ pub struct UiState {
     pub permission_prompt: Option<PermissionPromptState>,
     pub progress_message: Option<String>,
     pub progress_verb: Option<String>,
+    pub pending_step_count: usize,
+    pub pending_transcript_details: bool,
     pub task_items: Vec<TaskUiEntry>,
     pub question_items: Vec<QuestionUiEntry>,
     pub vim_state: vim::VimState,
@@ -584,16 +586,12 @@ fn pane_shortcut_label() -> &'static str {
     pane_shortcut_label_for_terminal(std::env::var("TERM_PROGRAM").ok().as_deref())
 }
 
-fn transcript_toggle_label(state: &UiState, active_pane: PaneKind) -> Option<&'static str> {
-    if !matches!(active_pane, PaneKind::Transcript) || state.transcript_groups.is_empty() {
-        return None;
-    }
-
-    if state.transcript_groups.iter().all(|group| group.expanded) {
-        Some("Ctrl+O collapse")
+fn pending_details_toggle_label(state: &UiState) -> Option<&'static str> {
+    (state.pending_step_count > 0).then_some(if state.pending_transcript_details {
+        "Ctrl+E hide details"
     } else {
-        Some("Ctrl+O show all")
-    }
+        "Ctrl+E show details"
+    })
 }
 
 fn truncate_middle(text: &str, max_chars: usize) -> String {
@@ -2164,18 +2162,18 @@ fn navigation_hint(
     } else {
         format!("{} open", active_pane.title())
     };
-    let transcript_hint = transcript_toggle_label(state, active_pane)
+    let pending_hint = pending_details_toggle_label(state)
         .map(|hint| format!("  {hint}"))
         .unwrap_or_default();
 
     if matches!(layout, LayoutMode::Compact) {
         format!(
-            "{focus_label}  {} panes  {suggestion_hint}{transcript_hint}",
+            "{focus_label}  {} panes  {suggestion_hint}{pending_hint}",
             pane_shortcut_label()
         )
     } else {
         format!(
-            "{focus_label}  Tab cycle  {} panes  {suggestion_hint}{transcript_hint}  Ctrl-C exit",
+            "{focus_label}  Tab cycle  {} panes  {suggestion_hint}{pending_hint}  Ctrl-C exit",
             pane_shortcut_label()
         )
     }
@@ -2309,12 +2307,18 @@ fn footer_primary_text(state: &UiState, suggestions_visible: bool) -> String {
         return "Waiting for permission".to_owned();
     }
     if !state.queued_inputs.is_empty() {
+        let pending_hint = pending_details_toggle_label(state)
+            .map(|hint| format!(" · {hint}"))
+            .unwrap_or_default();
         return format!(
-            "Working · Ctrl+C to interrupt · {} queued",
-            state.queued_inputs.len()
+            "Working · Ctrl+C to interrupt · {} queued{pending_hint}",
+            state.queued_inputs.len(),
         );
     }
-    if state.progress_message.is_some() {
+    if state.progress_message.is_some() || state.pending_step_count > 0 {
+        if let Some(hint) = pending_details_toggle_label(state) {
+            return format!("Working · Ctrl+C to interrupt · {hint}");
+        }
         return "Working · Ctrl+C to interrupt".to_owned();
     }
     if let Some(helper) = state.prompt_helper.as_deref() {
@@ -3248,13 +3252,13 @@ pub fn render_to_string(state: &UiState, width: u16, height: u16) -> Result<Stri
 mod tests {
     use super::{
         footer_primary_text, input_prompt_line, mouse_action_for_position,
-        pane_shortcut_label_for_terminal, progress_line, render_to_string, task_lines,
-        transcript_search_match_items, transcript_search_scroll_for_view,
-        transcript_selectable_lines_for_view, transcript_selection_text_for_view,
-        transcript_toggle_label, transcript_visual_lines, ChoiceListItem, ChoiceListState,
-        InputBuffer, Notification, PaneKind, PermissionPromptState, PromptHistorySearchState,
-        PromptSelectionState, RatatuiApp, StatusLevel, TaskUiEntry, TranscriptGroup,
-        TranscriptLine, TranscriptMessageActionsState, TranscriptSearchState,
+        pane_shortcut_label_for_terminal, pending_details_toggle_label, progress_line,
+        render_to_string, task_lines, transcript_search_match_items,
+        transcript_search_scroll_for_view, transcript_selectable_lines_for_view,
+        transcript_selection_text_for_view, transcript_visual_lines, ChoiceListItem,
+        ChoiceListState, InputBuffer, Notification, PaneKind, PermissionPromptState,
+        PromptHistorySearchState, PromptSelectionState, RatatuiApp, StatusLevel, TaskUiEntry,
+        TranscriptGroup, TranscriptLine, TranscriptMessageActionsState, TranscriptSearchState,
         TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
     };
     use code_agent_core::{
@@ -3380,31 +3384,23 @@ mod tests {
     }
 
     #[test]
-    fn transcript_toggle_label_tracks_group_visibility() {
+    fn pending_details_toggle_label_tracks_visibility() {
         let mut state = RatatuiApp::new("toggle").initial_state();
-        state.transcript_groups = vec![TranscriptGroup {
-            id: "pending-step-1".to_owned(),
-            title: "Step 1".to_owned(),
-            subtitle: None,
-            expanded: false,
-            lines: vec![TranscriptLine {
-                role: "assistant".to_owned(),
-                text: "details".to_owned(),
-                author_label: None,
-            }],
-        }];
+        state.pending_step_count = 1;
 
         assert_eq!(
-            transcript_toggle_label(&state, PaneKind::Transcript),
-            Some("Ctrl+O show all")
+            pending_details_toggle_label(&state),
+            Some("Ctrl+E show details")
         );
 
-        state.transcript_groups[0].expanded = true;
+        state.pending_transcript_details = true;
         assert_eq!(
-            transcript_toggle_label(&state, PaneKind::Transcript),
-            Some("Ctrl+O collapse")
+            pending_details_toggle_label(&state),
+            Some("Ctrl+E hide details")
         );
-        assert_eq!(transcript_toggle_label(&state, PaneKind::Tasks), None);
+
+        state.pending_step_count = 0;
+        assert_eq!(pending_details_toggle_label(&state), None);
     }
 
     #[test]
@@ -3476,6 +3472,27 @@ mod tests {
         assert!(rendered.contains("queue"));
         assert!(rendered.contains("follow up with the failing test details"));
         assert!(rendered.contains("/tasks"));
+    }
+
+    #[test]
+    fn footer_advertises_pending_detail_toggle_while_working() {
+        let mut state = RatatuiApp::new("pending-details").initial_state();
+        state.show_input = true;
+        state.vim_state.enabled = true;
+        state.vim_state.enter_normal();
+        state.progress_message = Some("/ Waiting for response".to_owned());
+        state.pending_step_count = 2;
+
+        assert_eq!(
+            footer_primary_text(&state, false),
+            "Working · Ctrl+C to interrupt · Ctrl+E show details"
+        );
+
+        state.pending_transcript_details = true;
+        assert_eq!(
+            footer_primary_text(&state, false),
+            "Working · Ctrl+C to interrupt · Ctrl+E hide details"
+        );
     }
 
     #[test]

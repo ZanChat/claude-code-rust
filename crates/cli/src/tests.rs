@@ -12,10 +12,10 @@ use super::{
     render_remote_control_command, repl_shortcut_action_for_key, resolve_continue_target,
     resolved_command_registry, resumable_sessions, resume_hint_text,
     should_echo_command_result_in_footer, should_exit_repl, step_prompt_history_search_match,
-    sync_prompt_history_search_preview, task_entries_for_ui, toggle_all_pending_repl_groups,
-    ActiveSessionStore, Cli, LocalBridgeHandler, Message, MessageRole, PendingReplStep,
-    PendingReplView, PromptSelectionMove, ReplInteractionState, ReplSessionState,
-    ReplShortcutAction, ResumePickerState, ResumeTargetHint, StartupPreferences,
+    sync_prompt_history_search_preview, task_entries_for_ui,
+    toggle_pending_repl_transcript_details, ActiveSessionStore, Cli, LocalBridgeHandler, Message,
+    MessageRole, PendingReplStep, PendingReplView, PromptSelectionMove, ReplInteractionState,
+    ReplSessionState, ReplShortcutAction, ResumePickerState, ResumeTargetHint, StartupPreferences,
 };
 use code_agent_bridge::{
     base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
@@ -966,10 +966,12 @@ fn build_repl_ui_state_groups_pending_steps() {
             start_index: 1,
             status_label: "running list_dir".to_owned(),
             status_detail: Some("src/main.rs".to_owned()),
+            task_status: TaskStatus::Running,
             expanded: false,
             touched: false,
         }],
         queued_inputs: vec!["follow up after this".to_owned()],
+        show_transcript_details: false,
     };
 
     let state = build_repl_ui_state(
@@ -995,13 +997,14 @@ fn build_repl_ui_state_groups_pending_steps() {
     );
 
     assert_eq!(state.transcript_lines.len(), 1);
-    assert_eq!(state.transcript_groups.len(), 1);
-    assert!(state.transcript_groups[0].title.contains("Step 1"));
-    assert!(state.transcript_groups[0]
-        .subtitle
-        .as_deref()
-        .is_some_and(|subtitle| subtitle.contains("src/main.rs")));
-    assert!(!state.transcript_groups[0].expanded);
+    assert!(state.transcript_groups.is_empty());
+    assert_eq!(state.pending_step_count, 1);
+    assert!(!state.pending_transcript_details);
+    assert!(!state.task_items.is_empty());
+    assert_eq!(state.task_items[0].status, TaskStatus::Running);
+    assert!(state.task_items[0]
+        .title
+        .contains("Step 1 · running list_dir"));
     assert_eq!(state.queued_inputs, vec!["follow up after this".to_owned()]);
 }
 
@@ -1021,6 +1024,7 @@ fn pending_interrupt_messages_preserve_partial_preview_before_marker() {
         progress_label: "Working".to_owned(),
         steps: Vec::new(),
         queued_inputs: Vec::new(),
+        show_transcript_details: false,
     };
 
     let interrupt_messages = pending_interrupt_messages(session_id, &[user], &pending_view);
@@ -1035,7 +1039,7 @@ fn pending_interrupt_messages_preserve_partial_preview_before_marker() {
 }
 
 #[test]
-fn toggle_all_pending_repl_groups_switches_between_expanded_and_collapsed() {
+fn toggle_pending_repl_transcript_details_switches_visibility() {
     let pending_view = Arc::new(Mutex::new(PendingReplView {
         messages: Vec::new(),
         spinner_verb: "Working".to_owned(),
@@ -1046,6 +1050,7 @@ fn toggle_all_pending_repl_groups_switches_between_expanded_and_collapsed() {
                 start_index: 0,
                 status_label: "working".to_owned(),
                 status_detail: None,
+                task_status: TaskStatus::Running,
                 expanded: false,
                 touched: false,
             },
@@ -1054,23 +1059,25 @@ fn toggle_all_pending_repl_groups_switches_between_expanded_and_collapsed() {
                 start_index: 0,
                 status_label: "working".to_owned(),
                 status_detail: None,
+                task_status: TaskStatus::Completed,
                 expanded: true,
                 touched: false,
             },
         ],
         queued_inputs: Vec::new(),
+        show_transcript_details: false,
     }));
 
-    toggle_all_pending_repl_groups(&pending_view);
+    toggle_pending_repl_transcript_details(&pending_view);
     {
         let state = pending_view.lock().unwrap();
-        assert!(state.steps.iter().all(|entry| entry.expanded));
-        assert!(state.steps.iter().all(|entry| entry.touched));
+        assert!(state.show_transcript_details);
+        assert!(state.steps.iter().all(|entry| !entry.touched));
     }
 
-    toggle_all_pending_repl_groups(&pending_view);
+    toggle_pending_repl_transcript_details(&pending_view);
     let state = pending_view.lock().unwrap();
-    assert!(state.steps.iter().all(|entry| !entry.expanded));
+    assert!(!state.show_transcript_details);
 }
 
 #[test]

@@ -753,6 +753,61 @@ fn task_preview_line(task: &TaskUiEntry) -> String {
     )
 }
 
+fn pending_step_title(step: &PendingReplStep) -> String {
+    let status_label = step.status_label.trim();
+    let step_suffix = format!("· step {}", step.step);
+    let normalized_label = status_label
+        .strip_suffix(&step_suffix)
+        .map(str::trim)
+        .unwrap_or(status_label);
+    let completed_label = format!("Completed step {}", step.step);
+    let normalized_label = if normalized_label.eq_ignore_ascii_case(&completed_label) {
+        "Completed"
+    } else {
+        normalized_label
+    };
+    let summary = compose_pending_progress_label(normalized_label, step.status_detail.as_deref());
+
+    if summary.trim().is_empty() {
+        format!("Step {}", step.step)
+    } else {
+        format!("Step {} · {summary}", step.step)
+    }
+}
+
+fn pending_step_task_entries_for_ui(pending_view: &PendingReplView) -> Vec<TaskUiEntry> {
+    pending_view
+        .steps
+        .iter()
+        .map(|step| TaskUiEntry {
+            id: step.id(),
+            parent_id: None,
+            title: pending_step_title(step),
+            kind: "workflow_step".to_owned(),
+            status: step.task_status.clone(),
+            owner_label: None,
+            blocker_labels: Vec::new(),
+            input: None,
+            output: None,
+            tree_prefix: String::new(),
+            detail_prefix: "  ".to_owned(),
+            is_recent_completion: matches!(step.task_status, TaskStatus::Completed),
+        })
+        .collect()
+}
+
+fn pending_task_preview(pending_view: Option<&PendingReplView>) -> Option<PanePreview> {
+    let pending_view = pending_view.filter(|view| !view.steps.is_empty())?;
+    Some(PanePreview {
+        title: "Tasks".to_owned(),
+        lines: pending_step_task_entries_for_ui(pending_view)
+            .into_iter()
+            .take(6)
+            .map(|task| task_preview_line(&task))
+            .collect(),
+    })
+}
+
 fn summarize_task_ui_event(task: &TaskRecord) -> String {
     let mut lines = vec![format!(
         "{} {} [{}]",
@@ -1883,6 +1938,10 @@ fn message_action_items_from_runtime(
             &mut item_index,
         );
 
+        if !pending_view.show_transcript_details {
+            return items;
+        }
+
         for (index, step) in pending_view.steps.iter().enumerate() {
             item_index += 1;
 
@@ -2609,63 +2668,76 @@ fn build_repl_ui_state(
             .first()
             .map(|step| step.start_index.min(runtime_messages.len()))
             .unwrap_or(runtime_messages.len());
-        state.transcript_lines =
-            UiState::from_messages(runtime_messages[..first_step_start].to_vec()).transcript_lines;
-        state.transcript_groups = pending_view
-            .steps
-            .iter()
-            .enumerate()
-            .map(|(index, step)| {
-                let end_index = pending_view
-                    .steps
-                    .get(index + 1)
-                    .map(|next| next.start_index)
-                    .unwrap_or(runtime_messages.len())
-                    .min(runtime_messages.len());
-                let start_index = step.start_index.min(end_index);
-                let slice = &runtime_messages[start_index..end_index];
-                let assistant_count = slice
-                    .iter()
-                    .filter(|message| message.role == MessageRole::Assistant)
-                    .count();
-                let tool_count = slice
-                    .iter()
-                    .filter(|message| message.role == MessageRole::Tool)
-                    .count();
-                let mut detail_parts = vec![format!(
-                    "{} {}",
-                    slice.len(),
-                    if slice.len() == 1 {
-                        "message"
-                    } else {
-                        "messages"
+        let visible_transcript =
+            UiState::from_messages(runtime_messages[..first_step_start].to_vec());
+        state.transcript_lines = visible_transcript.transcript_lines;
+        state.transcript_preview = visible_transcript.transcript_preview;
+        state.pending_step_count = pending_view.steps.len();
+        state.pending_transcript_details = pending_view.show_transcript_details;
+        if pending_view.show_transcript_details {
+            state.transcript_groups = pending_view
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(index, step)| {
+                    let end_index = pending_view
+                        .steps
+                        .get(index + 1)
+                        .map(|next| next.start_index)
+                        .unwrap_or(runtime_messages.len())
+                        .min(runtime_messages.len());
+                    let start_index = step.start_index.min(end_index);
+                    let slice = &runtime_messages[start_index..end_index];
+                    let assistant_count = slice
+                        .iter()
+                        .filter(|message| message.role == MessageRole::Assistant)
+                        .count();
+                    let tool_count = slice
+                        .iter()
+                        .filter(|message| message.role == MessageRole::Tool)
+                        .count();
+                    let mut detail_parts = vec![format!(
+                        "{} {}",
+                        slice.len(),
+                        if slice.len() == 1 {
+                            "message"
+                        } else {
+                            "messages"
+                        }
+                    )];
+                    if assistant_count > 0 {
+                        detail_parts.push(format!("{} assistant", assistant_count));
                     }
-                )];
-                if assistant_count > 0 {
-                    detail_parts.push(format!("{} assistant", assistant_count));
-                }
-                if tool_count > 0 {
-                    detail_parts.push(format!("{} tool", tool_count));
-                }
-                if let Some(detail) = step
-                    .status_detail
-                    .as_deref()
-                    .filter(|detail| !detail.trim().is_empty())
-                {
-                    detail_parts.insert(0, detail.to_owned());
-                }
-                TranscriptGroup {
-                    id: step.id(),
-                    title: format!("Step {} · {}", step.step, step.status_label),
-                    subtitle: Some(detail_parts.join(" · ")),
-                    expanded: step.expanded,
-                    lines: UiState::from_messages(slice.to_vec()).transcript_lines,
-                }
-            })
-            .collect();
+                    if tool_count > 0 {
+                        detail_parts.push(format!("{} tool", tool_count));
+                    }
+                    if let Some(detail) = step
+                        .status_detail
+                        .as_deref()
+                        .filter(|detail| !detail.trim().is_empty())
+                    {
+                        detail_parts.insert(0, detail.to_owned());
+                    }
+                    TranscriptGroup {
+                        id: step.id(),
+                        title: pending_step_title(step),
+                        subtitle: Some(detail_parts.join(" · ")),
+                        expanded: step.expanded,
+                        lines: UiState::from_messages(slice.to_vec()).transcript_lines,
+                    }
+                })
+                .collect();
+        }
     }
     apply_repl_header(&mut state, provider, active_model, cwd, session_id);
-    let (task_items, question_items) = load_task_ui_data(cwd);
+    let (mut task_items, question_items) = load_task_ui_data(cwd);
+    let pending_task_items = pending_view
+        .filter(|view| !view.steps.is_empty())
+        .map(pending_step_task_entries_for_ui)
+        .unwrap_or_default();
+    if !pending_task_items.is_empty() {
+        task_items.splice(0..0, pending_task_items);
+    }
     state.show_input = !interaction_state.transcript_mode;
     state.input_buffer = input_buffer.clone();
     state.transcript_scroll = transcript_scroll;
@@ -2709,7 +2781,8 @@ fn build_repl_ui_state(
     state.status_marquee_tick = status_marquee_tick;
     state.task_items = task_items;
     state.question_items = question_items;
-    state.task_preview = recent_task_preview(cwd);
+    state.task_preview =
+        pending_task_preview(pending_view).unwrap_or_else(|| recent_task_preview(cwd));
     state.file_preview =
         preview_for_last_file_message(&runtime_messages, cwd).unwrap_or(PanePreview {
             title: "File preview".to_owned(),
@@ -2857,6 +2930,7 @@ struct PendingReplStep {
     start_index: usize,
     status_label: String,
     status_detail: Option<String>,
+    task_status: TaskStatus,
     expanded: bool,
     touched: bool,
 }
@@ -2874,6 +2948,7 @@ struct PendingReplView {
     progress_label: String,
     steps: Vec<PendingReplStep>,
     queued_inputs: Vec<String>,
+    show_transcript_details: bool,
 }
 
 impl PendingReplView {
@@ -2885,6 +2960,7 @@ impl PendingReplView {
             progress_label,
             steps: Vec::new(),
             queued_inputs: Vec::new(),
+            show_transcript_details: false,
         }
     }
 }
@@ -2910,6 +2986,7 @@ fn update_pending_repl_step_view(
     messages: &[Message],
     progress_label: impl Into<String>,
     status_detail: Option<String>,
+    task_status: TaskStatus,
 ) {
     let Some(pending_view) = pending_view else {
         return;
@@ -2917,6 +2994,7 @@ fn update_pending_repl_step_view(
     if let Ok(mut state) = pending_view.lock() {
         let runtime_messages = materialize_runtime_messages(messages);
         let runtime_start_index = step_start_index.min(runtime_messages.len());
+        let progress_label = progress_label.into();
         if !state.steps.iter().any(|entry| entry.step == step) {
             if let Some(previous) = state.steps.last_mut() {
                 if !previous.touched {
@@ -2926,16 +3004,18 @@ fn update_pending_repl_step_view(
             state.steps.push(PendingReplStep {
                 step,
                 start_index: runtime_start_index,
-                status_label: String::new(),
+                status_label: progress_label.clone(),
                 status_detail: None,
+                task_status: task_status.clone(),
                 expanded: true,
                 touched: false,
             });
         }
         if let Some(entry) = state.steps.iter_mut().find(|entry| entry.step == step) {
             entry.start_index = runtime_start_index.min(runtime_messages.len());
-            entry.status_label = progress_label.into();
+            entry.status_label = progress_label;
             entry.status_detail = status_detail;
+            entry.task_status = task_status;
         }
         state.messages = runtime_messages;
         state.progress_label = state
@@ -2971,13 +3051,9 @@ fn toggle_pending_repl_group(pending_view: &Arc<Mutex<PendingReplView>>, group_i
     }
 }
 
-fn toggle_all_pending_repl_groups(pending_view: &Arc<Mutex<PendingReplView>>) {
+fn toggle_pending_repl_transcript_details(pending_view: &Arc<Mutex<PendingReplView>>) {
     if let Ok(mut state) = pending_view.lock() {
-        let should_expand = state.steps.iter().any(|entry| !entry.expanded);
-        for entry in &mut state.steps {
-            entry.expanded = should_expand;
-            entry.touched = true;
-        }
+        state.show_transcript_details = !state.show_transcript_details;
     }
 }
 
@@ -3617,7 +3693,7 @@ where
                         continue;
                     }
                     if is_plain_ctrl_char(&key, 'e') {
-                        toggle_all_pending_repl_groups(&pending_view);
+                        toggle_pending_repl_transcript_details(&pending_view);
                         continue;
                     }
 
@@ -5010,6 +5086,7 @@ async fn run_agent_turns(
             messages,
             format!("Waiting for response · step {step}"),
             None,
+            TaskStatus::Running,
         );
         let provider_client = resolve_provider_client(provider, auth_configured).await?;
         let parent_id = messages.last().map(|message| message.id);
@@ -5048,6 +5125,7 @@ async fn run_agent_turns(
                         &preview_messages,
                         format!("Receiving response · step {step}"),
                         preview_detail(&response_text, 1, 96),
+                        TaskStatus::Running,
                     );
                 }
                 ProviderEvent::ToolCall { call } => {
@@ -5074,6 +5152,7 @@ async fn run_agent_turns(
                         current_call
                             .as_ref()
                             .and_then(pending_tool_detail_from_call),
+                        TaskStatus::Running,
                     );
                 }
                 ProviderEvent::ToolCallBoundary { .. } => {}
@@ -5115,6 +5194,11 @@ async fn run_agent_turns(
             response_tool_calls
                 .first()
                 .and_then(pending_tool_detail_from_call),
+            if response_tool_calls.is_empty() {
+                TaskStatus::Completed
+            } else {
+                TaskStatus::Running
+            },
         );
 
         if response_tool_calls.is_empty() {
@@ -5129,6 +5213,7 @@ async fn run_agent_turns(
                 messages,
                 format!("Running {}", tool_display_name(&call.name)),
                 pending_tool_detail_from_call(&call),
+                TaskStatus::Running,
             );
             let input = serde_json::from_str(&call.input_json).unwrap_or_else(|_| json!({}));
             let output = tool_registry
@@ -5171,6 +5256,11 @@ async fn run_agent_turns(
                 },
                 pending_tool_detail_from_metadata(&call.name, &output_metadata)
                     .or_else(|| pending_tool_detail_from_call(&call)),
+                if output_is_error {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Completed
+                },
             );
         }
     }
