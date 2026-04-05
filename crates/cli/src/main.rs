@@ -88,6 +88,8 @@ const UI_AUTHOR_ATTRIBUTE: &str = "ui_author";
 const REQUEST_INTERRUPTED_MESSAGE: &str = "[Request interrupted by user]";
 const RECENT_COMPLETED_TTL_MS: i64 = 30_000;
 const HISTORY_TRANSCRIPT_GROUP_PREFIX: &str = "history-group-";
+const FILE_PICKER_MAX_INDEXED_FILES: usize = 5_000;
+const FILE_PICKER_MAX_RESULTS: usize = 12;
 
 fn should_exit_repl(prompt_text: &str) -> bool {
     matches!(prompt_text.trim(), "quit" | "exit" | "/quit" | "/exit")
@@ -1538,6 +1540,29 @@ struct ReplMessageActionState {
     selected_item: usize,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReplFilePickerState {
+    indexed_root: Option<PathBuf>,
+    indexed_paths: Vec<String>,
+    truncated: bool,
+    selected: usize,
+    last_query: Option<String>,
+    hidden_query: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplFilePickerToken {
+    start: usize,
+    end: usize,
+    query: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplFilePickerMatchSet {
+    token: ReplFilePickerToken,
+    paths: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 struct ReplMessageActionItem {
     item_index: usize,
@@ -1570,6 +1595,7 @@ struct ReplInteractionState {
     prompt_selection: Option<PromptSelectionState>,
     prompt_mouse_anchor: Option<usize>,
     transcript_selection: Option<TranscriptSelectionState>,
+    file_picker: ReplFilePickerState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1585,6 +1611,7 @@ enum ReplShortcutAction {
     CopySelection,
     ContextCtrlC,
     ToggleTranscriptMode,
+    ToggleTranscriptDetails,
     PromptHistorySearch,
     EnterMessageActions,
     SelectPane(PaneKind),
@@ -1622,6 +1649,10 @@ fn repl_shortcut_action_for_key(
         && is_plain_ctrl_char(key, 'r')
     {
         return Some(ReplShortcutAction::PromptHistorySearch);
+    }
+
+    if is_plain_ctrl_char(key, 'e') {
+        return Some(ReplShortcutAction::ToggleTranscriptDetails);
     }
 
     if matches!(key.code, KeyCode::Up)
@@ -1700,6 +1731,377 @@ fn toggle_all_history_transcript_groups(
     }
 
     true
+}
+
+fn should_show_prompt_file_picker(interaction_state: &ReplInteractionState) -> bool {
+    !interaction_state.transcript_mode
+        && interaction_state.prompt_history_search.is_none()
+        && interaction_state.message_actions.is_none()
+        && interaction_state.transcript_selection.is_none()
+        && !interaction_state.transcript_search.open
+}
+
+fn should_skip_file_picker_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".hg"
+            | ".jj"
+            | ".next"
+            | ".nuxt"
+            | ".svn"
+            | ".turbo"
+            | ".yarn"
+            | "build"
+            | "coverage"
+            | "dist"
+            | "node_modules"
+            | "target"
+    )
+}
+
+fn normalize_file_picker_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn active_prompt_file_picker_token(
+    input_buffer: &code_agent_ui::InputBuffer,
+) -> Option<ReplFilePickerToken> {
+    let chars = &input_buffer.chars;
+    let cursor = input_buffer.cursor.min(chars.len());
+
+    if chars.is_empty() || cursor > chars.len() {
+        return None;
+    }
+
+    let mut start = cursor;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+
+    let mut end = cursor;
+    while end < chars.len() && !chars[end].is_whitespace() {
+        end += 1;
+    }
+
+    if start >= chars.len() || chars[start] != '@' {
+        return None;
+    }
+
+    let query = chars[start + 1..cursor].iter().collect::<String>();
+    if query.contains(':') {
+        return None;
+    }
+
+    Some(ReplFilePickerToken {
+        start,
+        end,
+        query: query
+            .trim_matches('"')
+            .trim_start_matches("./")
+            .replace('\\', "/"),
+    })
+}
+
+fn rebuild_prompt_file_picker_index(cwd: &Path, file_picker: &mut ReplFilePickerState) {
+    let root = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    if file_picker.indexed_root.as_ref() == Some(&root) {
+        return;
+    }
+
+    let mut indexed_paths = Vec::new();
+    let mut stack = vec![root.clone()];
+    let mut truncated = false;
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry_result in entries {
+            if indexed_paths.len() >= FILE_PICKER_MAX_INDEXED_FILES {
+                truncated = true;
+                break;
+            }
+
+            let Ok(entry) = entry_result else {
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+
+            if file_type.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if should_skip_file_picker_dir(&name) {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let relative = path.strip_prefix(&root).unwrap_or(&path);
+            let display = normalize_file_picker_path(relative);
+            if !display.is_empty() {
+                indexed_paths.push(display);
+            }
+        }
+
+        if truncated {
+            break;
+        }
+    }
+
+    indexed_paths.sort();
+    file_picker.indexed_root = Some(root);
+    file_picker.indexed_paths = indexed_paths;
+    file_picker.truncated = truncated;
+}
+
+fn sync_prompt_file_picker_state(
+    cwd: &Path,
+    input_buffer: &code_agent_ui::InputBuffer,
+    interaction_state: &mut ReplInteractionState,
+) {
+    if !should_show_prompt_file_picker(interaction_state) {
+        interaction_state.file_picker.last_query = None;
+        interaction_state.file_picker.hidden_query = None;
+        interaction_state.file_picker.selected = 0;
+        return;
+    }
+
+    let Some(token) = active_prompt_file_picker_token(input_buffer) else {
+        interaction_state.file_picker.last_query = None;
+        interaction_state.file_picker.hidden_query = None;
+        interaction_state.file_picker.selected = 0;
+        return;
+    };
+
+    rebuild_prompt_file_picker_index(cwd, &mut interaction_state.file_picker);
+
+    if interaction_state.file_picker.last_query.as_deref() != Some(token.query.as_str()) {
+        interaction_state.file_picker.selected = 0;
+        if interaction_state.file_picker.hidden_query.as_deref() != Some(token.query.as_str()) {
+            interaction_state.file_picker.hidden_query = None;
+        }
+        interaction_state.file_picker.last_query = Some(token.query);
+    }
+}
+
+fn file_picker_match_rank(path: &str, query: &str) -> Option<(u8, usize, usize)> {
+    if query.is_empty() {
+        return Some((0, path.chars().count(), path.matches('/').count()));
+    }
+
+    let normalized_path = path.to_lowercase();
+    let normalized_query = query.to_lowercase();
+    let file_name = normalized_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(normalized_path.as_str());
+
+    if file_name == normalized_query {
+        return Some((
+            0,
+            file_name.chars().count(),
+            normalized_path.matches('/').count(),
+        ));
+    }
+    if file_name.starts_with(&normalized_query) {
+        return Some((
+            1,
+            file_name.chars().count(),
+            normalized_path.matches('/').count(),
+        ));
+    }
+    if normalized_path.starts_with(&normalized_query) {
+        return Some((
+            2,
+            normalized_path.chars().count(),
+            normalized_path.matches('/').count(),
+        ));
+    }
+    if normalized_path
+        .split('/')
+        .any(|segment| segment.starts_with(&normalized_query))
+    {
+        return Some((
+            3,
+            normalized_path.chars().count(),
+            normalized_path.matches('/').count(),
+        ));
+    }
+    if normalized_path.contains(&normalized_query) {
+        return Some((
+            4,
+            normalized_path.chars().count(),
+            normalized_path.matches('/').count(),
+        ));
+    }
+
+    None
+}
+
+fn prompt_file_picker_matches(
+    cwd: &Path,
+    input_buffer: &code_agent_ui::InputBuffer,
+    interaction_state: &mut ReplInteractionState,
+) -> Option<ReplFilePickerMatchSet> {
+    sync_prompt_file_picker_state(cwd, input_buffer, interaction_state);
+    if !should_show_prompt_file_picker(interaction_state) {
+        return None;
+    }
+
+    let token = active_prompt_file_picker_token(input_buffer)?;
+    if interaction_state.file_picker.hidden_query.as_deref() == Some(token.query.as_str()) {
+        return None;
+    }
+
+    let mut ranked = interaction_state
+        .file_picker
+        .indexed_paths
+        .iter()
+        .filter_map(|path| {
+            file_picker_match_rank(path, &token.query).map(|rank| (rank, path.clone()))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(left_rank, left_path), (right_rank, right_path)| {
+        left_rank
+            .cmp(right_rank)
+            .then_with(|| left_path.cmp(right_path))
+    });
+
+    Some(ReplFilePickerMatchSet {
+        token,
+        paths: ranked
+            .into_iter()
+            .take(FILE_PICKER_MAX_RESULTS)
+            .map(|(_, path)| path)
+            .collect(),
+    })
+}
+
+fn prompt_file_picker_choice_list(
+    cwd: &Path,
+    input_buffer: &code_agent_ui::InputBuffer,
+    interaction_state: &mut ReplInteractionState,
+) -> Option<ChoiceListState> {
+    let matches = prompt_file_picker_matches(cwd, input_buffer, interaction_state)?;
+    let selected = interaction_state
+        .file_picker
+        .selected
+        .min(matches.paths.len().saturating_sub(1));
+    let mut subtitle = "Type to filter · Enter/Tab to insert · Esc to close".to_owned();
+    if interaction_state.file_picker.truncated {
+        subtitle.push_str(" · indexed first 5000 files");
+    }
+
+    Some(ChoiceListState {
+        title: "File picker".to_owned(),
+        subtitle: Some(subtitle),
+        items: matches
+            .paths
+            .iter()
+            .map(|path| ChoiceListItem {
+                label: path.clone(),
+                detail: Some(format!("Insert @{path}")),
+                secondary: None,
+            })
+            .collect(),
+        selected,
+        empty_message: Some(if matches.token.query.is_empty() {
+            "No files indexed for this workspace.".to_owned()
+        } else {
+            format!("No files match @{}.", matches.token.query)
+        }),
+    })
+}
+
+fn active_repl_choice_list(
+    cwd: &Path,
+    input_buffer: &code_agent_ui::InputBuffer,
+    explicit_choice_list: Option<ChoiceListState>,
+    interaction_state: &mut ReplInteractionState,
+) -> Option<ChoiceListState> {
+    explicit_choice_list
+        .or_else(|| prompt_file_picker_choice_list(cwd, input_buffer, interaction_state))
+}
+
+fn handle_prompt_file_picker_key(
+    cwd: &Path,
+    key: &KeyEvent,
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    interaction_state: &mut ReplInteractionState,
+) -> bool {
+    let Some(matches) = prompt_file_picker_matches(cwd, input_buffer, interaction_state) else {
+        return false;
+    };
+
+    let max_index = matches.paths.len().saturating_sub(1);
+    interaction_state.file_picker.selected = interaction_state.file_picker.selected.min(max_index);
+
+    match key.code {
+        KeyCode::Esc => {
+            interaction_state.file_picker.hidden_query = Some(matches.token.query);
+            true
+        }
+        KeyCode::Up => {
+            interaction_state.file_picker.selected =
+                interaction_state.file_picker.selected.saturating_sub(1);
+            true
+        }
+        KeyCode::Down => {
+            if interaction_state.file_picker.selected < max_index {
+                interaction_state.file_picker.selected += 1;
+            }
+            true
+        }
+        KeyCode::PageUp => {
+            interaction_state.file_picker.selected =
+                interaction_state.file_picker.selected.saturating_sub(5);
+            true
+        }
+        KeyCode::PageDown => {
+            interaction_state.file_picker.selected =
+                (interaction_state.file_picker.selected + 5).min(max_index);
+            true
+        }
+        KeyCode::Home => {
+            interaction_state.file_picker.selected = 0;
+            true
+        }
+        KeyCode::End => {
+            interaction_state.file_picker.selected = max_index;
+            true
+        }
+        KeyCode::Enter | KeyCode::Tab => {
+            let Some(selected_path) = matches
+                .paths
+                .get(interaction_state.file_picker.selected)
+                .or_else(|| matches.paths.first())
+            else {
+                return false;
+            };
+
+            let replacement = format!("@{selected_path} ");
+            input_buffer
+                .chars
+                .splice(matches.token.start..matches.token.end, replacement.chars());
+            input_buffer.cursor = matches.token.start + replacement.chars().count();
+            interaction_state.prompt_selection = None;
+            interaction_state.file_picker.selected = 0;
+            interaction_state.file_picker.last_query = None;
+            interaction_state.file_picker.hidden_query = None;
+            true
+        }
+        _ => false,
+    }
 }
 
 fn open_prompt_history_search(
@@ -3339,6 +3741,10 @@ fn repl_mouse_action(
     mouse: &MouseEvent,
     interaction_state: &ReplInteractionState,
 ) -> Result<Option<UiMouseAction>> {
+    if choice_list.is_some() {
+        return Ok(None);
+    }
+
     let app = RatatuiApp::new(format!("{provider}  {active_model}"));
     let state = build_repl_ui_state(
         &app,
@@ -3636,7 +4042,7 @@ where
                             *active_pane,
                             compact_banner.clone(),
                             *transcript_scroll,
-                            None,
+                            active_repl_choice_list(cwd, input_buffer, None, interaction_state),
                             *selected_command_suggestion,
                             tick,
                             &mouse,
@@ -3925,6 +4331,18 @@ where
                                     enter_transcript_mode(interaction_state, active_pane);
                                 }
                             }
+                            ReplShortcutAction::ToggleTranscriptDetails => {
+                                if !pending_snapshot.steps.is_empty() {
+                                    toggle_pending_repl_transcript_details(&pending_view);
+                                } else {
+                                    let group_ids =
+                                        history_transcript_group_ids(&pending_snapshot.messages);
+                                    let _ = toggle_all_history_transcript_groups(
+                                        interaction_state,
+                                        &group_ids,
+                                    );
+                                }
+                            }
                             ReplShortcutAction::PromptHistorySearch => {
                                 if let Some(search_state) =
                                     interaction_state.prompt_history_search.as_mut()
@@ -4164,11 +4582,6 @@ where
 
                         continue;
                     }
-                    if is_plain_ctrl_char(&key, 'e') {
-                        toggle_pending_repl_transcript_details(&pending_view);
-                        continue;
-                    }
-
                     if interaction_state.prompt_history_search.is_some() {
                         match key.code {
                             KeyCode::Esc => {
@@ -4644,6 +5057,12 @@ where
                         continue;
                     }
 
+                    if vim_state.is_insert()
+                        && handle_prompt_file_picker_key(cwd, &key, input_buffer, interaction_state)
+                    {
+                        continue;
+                    }
+
                     if vim_state.is_insert() {
                         if let Some(selection_move) = prompt_selection_move_for_key(&key) {
                             let _ = move_prompt_selection(
@@ -4814,7 +5233,7 @@ where
             *active_pane,
             compact_banner.clone(),
             *transcript_scroll,
-            None,
+            active_repl_choice_list(cwd, input_buffer, None, interaction_state),
             selected_command_suggestion,
             vim_state,
             tick,

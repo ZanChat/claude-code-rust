@@ -3,16 +3,17 @@ use super::{
     build_repl_command_output_message, build_repl_ui_state, build_resume_choice_list,
     build_startup_screens, build_startup_ui_state, build_text_message, build_tool_result_message,
     cancel_prompt_history_search, choose_active_session, command_suggestions, current_time_ms,
-    delete_prompt_selection, handle_prompt_mouse_action, handle_repl_slash_command,
-    insert_prompt_text, is_paste_shortcut, is_selection_copy_shortcut, message_action_copy_text,
-    message_primary_input, message_text, move_prompt_selection, navigate_prompt_history_down,
-    navigate_prompt_history_up, open_prompt_history_search, pane_from_shortcut,
-    pane_from_shortcut_for_terminal, pending_interrupt_messages, prompt_history_from_messages,
-    prompt_history_search_matches, prompt_selection_text, render_auth_command_with_resume,
+    delete_prompt_selection, handle_prompt_file_picker_key, handle_prompt_mouse_action,
+    handle_repl_slash_command, insert_prompt_text, is_paste_shortcut, is_selection_copy_shortcut,
+    message_action_copy_text, message_primary_input, message_text, move_prompt_selection,
+    navigate_prompt_history_down, navigate_prompt_history_up, open_prompt_history_search,
+    pane_from_shortcut, pane_from_shortcut_for_terminal, pending_interrupt_messages,
+    prompt_file_picker_choice_list, prompt_history_from_messages, prompt_history_search_matches,
+    prompt_selection_text, render_auth_command_with_resume, render_ide_command_with_home,
     render_remote_control_command, repl_shortcut_action_for_key, resolve_continue_target,
     resolved_command_registry, resumable_sessions, resume_hint_text,
     should_echo_command_result_in_footer, should_exit_repl, step_prompt_history_search_match,
-    sync_prompt_history_search_preview, task_entries_for_ui,
+    sync_prompt_history_search_preview, task_entries_for_ui, toggle_all_history_transcript_groups,
     toggle_pending_repl_transcript_details, ActiveSessionStore, Cli, LocalBridgeHandler, Message,
     MessageRole, PendingReplStep, PendingReplView, PromptSelectionMove, ReplInteractionState,
     ReplSessionState, ReplShortcutAction, ResumePickerState, ResumeTargetHint, StartupPreferences,
@@ -529,6 +530,12 @@ fn repl_shortcut_routing_is_modifier_specific() {
     assert_eq!(
         repl_shortcut_action_for_key(&ctrl_o, &interaction_state),
         Some(ReplShortcutAction::ToggleTranscriptMode)
+    );
+
+    let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+    assert_eq!(
+        repl_shortcut_action_for_key(&ctrl_e, &interaction_state),
+        Some(ReplShortcutAction::ToggleTranscriptDetails)
     );
 }
 
@@ -1252,6 +1259,63 @@ fn toggle_pending_repl_transcript_details_switches_visibility() {
 }
 
 #[test]
+fn toggle_all_history_transcript_groups_expands_and_collapses() {
+    let group_ids = vec!["history-group-a".to_owned(), "history-group-b".to_owned()];
+    let mut interaction_state = ReplInteractionState::default();
+
+    assert!(toggle_all_history_transcript_groups(
+        &mut interaction_state,
+        &group_ids,
+    ));
+    assert_eq!(
+        interaction_state.expanded_history_groups,
+        group_ids.iter().cloned().collect()
+    );
+
+    assert!(toggle_all_history_transcript_groups(
+        &mut interaction_state,
+        &group_ids,
+    ));
+    assert!(interaction_state.expanded_history_groups.is_empty());
+}
+
+#[test]
+fn prompt_file_picker_lists_matching_workspace_files() {
+    let root = temp_session_root("file-picker-list");
+    write_test_file(&root.join("src/main.rs"), "fn main() {}\n");
+    write_test_file(&root.join("src/lib.rs"), "pub fn helper() {}\n");
+
+    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    input_buffer.replace("inspect @src/ma");
+    let mut interaction_state = ReplInteractionState::default();
+
+    let choice_list =
+        prompt_file_picker_choice_list(&root, &input_buffer, &mut interaction_state).unwrap();
+
+    assert_eq!(choice_list.title, "File picker");
+    assert_eq!(choice_list.selected, 0);
+    assert_eq!(choice_list.items[0].label, "src/main.rs");
+}
+
+#[test]
+fn prompt_file_picker_inserts_selected_match_into_prompt() {
+    let root = temp_session_root("file-picker-apply");
+    write_test_file(&root.join("src/main.rs"), "fn main() {}\n");
+
+    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    input_buffer.replace("inspect @src/ma");
+    let mut interaction_state = ReplInteractionState::default();
+
+    assert!(handle_prompt_file_picker_key(
+        &root,
+        &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &mut input_buffer,
+        &mut interaction_state,
+    ));
+    assert_eq!(input_buffer.as_str(), "inspect @src/main.rs ");
+}
+
+#[test]
 fn build_repl_ui_state_hides_prompt_in_transcript_mode() {
     let app = code_agent_ui::RatatuiApp::new("repl-transcript");
     let registry = compatibility_command_registry();
@@ -1271,6 +1335,7 @@ fn build_repl_ui_state_hides_prompt_in_transcript_mode() {
         prompt_selection: None,
         prompt_mouse_anchor: None,
         transcript_selection: None,
+        ..Default::default()
     };
 
     let state = build_repl_ui_state(
@@ -1583,8 +1648,106 @@ async fn repl_ide_command_reports_bridge_state() {
     .await
     .unwrap();
 
-    assert!(disconnected.contains("\"status\": \"not_connected\""));
+    assert!(!disconnected.contains("\"status\": \"connected\""));
     assert!(connected.contains("\"status\": \"connected\""));
+}
+
+#[test]
+fn render_ide_command_detects_matching_lockfile() {
+    let home = temp_session_root("ide-lockfile-home");
+    let workspace = home.join("workspace");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    write_test_file(
+        &home.join(".claude/ide/48123.lock"),
+        &json!({
+            "workspaceFolders": [workspace.display().to_string()],
+            "ideName": "VS Code",
+            "transport": "ws"
+        })
+        .to_string(),
+    );
+
+    let report = render_ide_command_with_home(&workspace, false, None, Some(&home)).unwrap();
+
+    assert!(report.contains("\"status\": \"available\""));
+    assert!(report.contains("\"name\": \"VS Code\""));
+    assert!(report.contains("ide://127.0.0.1:48123"));
+}
+
+#[tokio::test]
+async fn lightweight_repl_commands_return_output() {
+    let root = temp_session_root("repl-lightweight-commands");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut raw_messages = vec![
+        build_text_message(session_id, MessageRole::User, "hello".to_owned(), None),
+        build_text_message(session_id, MessageRole::Assistant, "world".to_owned(), None),
+    ];
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let cases = vec![
+        ("help", vec![], "/help".to_owned()),
+        ("version", vec![], "/version".to_owned()),
+        ("status", vec![], "/status".to_owned()),
+        ("statusline", vec![], "/statusline".to_owned()),
+        ("theme", vec![], "/theme".to_owned()),
+        ("vim", vec![], "/vim".to_owned()),
+        ("plan", vec![], "/plan".to_owned()),
+        ("fast", vec![], "/fast".to_owned()),
+        ("passes", vec![], "/passes".to_owned()),
+        ("effort", vec![], "/effort".to_owned()),
+        ("session", vec![], "/session".to_owned()),
+        ("permissions", vec![], "/permissions".to_owned()),
+        ("compact", vec![], "/compact".to_owned()),
+        ("files", vec![], "/files".to_owned()),
+        ("diff", vec![], "/diff".to_owned()),
+        ("usage", vec![], "/usage".to_owned()),
+        ("remote-env", vec![], "/remote-env".to_owned()),
+        ("export", vec![], "/export".to_owned()),
+        ("tasks", vec![], "/tasks".to_owned()),
+        ("agents", vec![], "/agents".to_owned()),
+        ("skills", vec![], "/skills".to_owned()),
+        ("reload-plugins", vec![], "/reload-plugins".to_owned()),
+        ("hooks", vec![], "/hooks".to_owned()),
+        ("output-style", vec![], "/output-style".to_owned()),
+        ("remote-control", vec![], "/remote-control".to_owned()),
+        ("voice", vec![], "/voice".to_owned()),
+        ("exit", vec![], "/exit".to_owned()),
+    ];
+
+    for (name, args, raw_input) in cases {
+        let output = handle_repl_slash_command(
+            &registry,
+            CommandInvocation {
+                name: name.to_owned(),
+                args,
+                raw_input,
+            },
+            &store,
+            &tool_registry,
+            &root,
+            None,
+            ApiProvider::ChatGPTCodex,
+            &mut active_model,
+            &mut repl_session,
+            &mut raw_messages,
+            false,
+            &mut vim_state,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !output.trim().is_empty(),
+            "expected non-empty output for /{name}"
+        );
+    }
 }
 
 #[tokio::test]

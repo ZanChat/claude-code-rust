@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{stdout, Write as _};
 use std::process::{Command as StdCommand, Stdio};
+use std::time::SystemTime;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -481,20 +482,172 @@ pub(crate) fn render_statusline_command(
     }))?)
 }
 
-pub(crate) fn render_ide_command(
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdeLockfileContent {
+    workspace_folders: Option<Vec<String>>,
+    ide_name: Option<String>,
+    transport: Option<String>,
+}
+
+#[derive(Debug)]
+struct IdeLockfileInfo {
+    workspace_folders: Vec<String>,
+    port: u16,
+    ide_name: Option<String>,
+    use_websocket: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct DetectedIdeCandidate {
+    name: String,
+    port: u16,
+    url: String,
+    suggested_bridge: String,
+    workspace_folders: Vec<String>,
+}
+
+fn ide_lockfiles_dir(home_override: Option<&Path>) -> Option<PathBuf> {
+    let home = home_override
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))?;
+    Some(home.join(".claude/ide"))
+}
+
+fn sorted_ide_lockfiles(home_override: Option<&Path>) -> Vec<PathBuf> {
+    let Some(lockfiles_dir) = ide_lockfiles_dir(home_override) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(lockfiles_dir) else {
+        return Vec::new();
+    };
+
+    let mut paths = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            (path.extension().and_then(|ext| ext.to_str()) == Some("lock")).then_some(path)
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        let left_modified = left
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let right_modified = right
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        right_modified
+            .cmp(&left_modified)
+            .then_with(|| left.cmp(right))
+    });
+    paths
+}
+
+fn read_ide_lockfile(path: &Path) -> Option<IdeLockfileInfo> {
+    let content = fs::read_to_string(path).ok()?;
+    let port = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse::<u16>().ok())?;
+
+    if let Ok(parsed) = serde_json::from_str::<IdeLockfileContent>(&content) {
+        return Some(IdeLockfileInfo {
+            workspace_folders: parsed.workspace_folders.unwrap_or_default(),
+            port,
+            ide_name: parsed.ide_name,
+            use_websocket: parsed.transport.as_deref() == Some("ws"),
+        });
+    }
+
+    Some(IdeLockfileInfo {
+        workspace_folders: content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        port,
+        ide_name: None,
+        use_websocket: false,
+    })
+}
+
+fn workspace_matches_ide(cwd: &Path, workspace_folder: &str) -> bool {
+    let workspace_path = PathBuf::from(workspace_folder);
+    let resolved_workspace = fs::canonicalize(&workspace_path).unwrap_or(workspace_path);
+    cwd == resolved_workspace || cwd.starts_with(&resolved_workspace)
+}
+
+fn detect_workspace_ides(cwd: &Path, home_override: Option<&Path>) -> Vec<DetectedIdeCandidate> {
+    let resolved_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    sorted_ide_lockfiles(home_override)
+        .into_iter()
+        .filter_map(|path| read_ide_lockfile(&path))
+        .filter(|lockfile| {
+            lockfile
+                .workspace_folders
+                .iter()
+                .any(|folder| workspace_matches_ide(&resolved_cwd, folder))
+        })
+        .map(|lockfile| {
+            let url_scheme = if lockfile.use_websocket { "ws" } else { "http" };
+            DetectedIdeCandidate {
+                name: lockfile.ide_name.unwrap_or_else(|| "IDE".to_owned()),
+                port: lockfile.port,
+                url: format!("{url_scheme}://127.0.0.1:{}", lockfile.port),
+                suggested_bridge: format!("ide://127.0.0.1:{}", lockfile.port),
+                workspace_folders: lockfile.workspace_folders,
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn render_ide_command_with_home(
+    cwd: &Path,
     ide_bridge_active: bool,
     ide_address: Option<&str>,
+    home_override: Option<&Path>,
 ) -> Result<String> {
+    let detected = detect_workspace_ides(cwd, home_override);
+    let (status, message) = if ide_bridge_active {
+        (
+            "connected",
+            "IDE bridge is active for this session.".to_owned(),
+        )
+    } else if let Some(candidate) = detected.first() {
+        (
+            "available",
+            format!(
+                "Detected {} for this workspace. Connect with {}.",
+                candidate.name, candidate.suggested_bridge
+            ),
+        )
+    } else {
+        (
+            "not_connected",
+            "No IDE bridge detected for this workspace. Start a supported IDE with the Claude extension, or connect explicitly with --bridge-connect ide://HOST[:PORT] or --bridge-server ide://HOST[:PORT].".to_owned(),
+        )
+    };
+
     Ok(serde_json::to_string_pretty(&json!({
         "connected": ide_bridge_active,
         "bridge_address": ide_address,
-        "status": if ide_bridge_active { "connected" } else { "not_connected" },
-        "message": if ide_bridge_active {
-            "IDE bridge is active for this session."
-        } else {
-            "IDE auto-detection is not implemented yet in the Rust runtime. Connect an IDE bridge explicitly with --bridge-connect ide://HOST[:PORT] or --bridge-server ide://HOST[:PORT]."
-        },
+        "status": status,
+        "workspace": cwd.display().to_string(),
+        "message": message,
+        "detected": detected,
     }))?)
+}
+
+pub(crate) fn render_ide_command(
+    cwd: &Path,
+    ide_bridge_active: bool,
+    ide_address: Option<&str>,
+) -> Result<String> {
+    render_ide_command_with_home(cwd, ide_bridge_active, ide_address, None)
 }
 
 pub(crate) fn render_theme_command() -> Result<String> {
@@ -1304,7 +1457,7 @@ pub(crate) async fn handle_repl_slash_command(
                 ))
             }
         }
-        "ide" => render_ide_command(ide_bridge_active, None),
+        "ide" => render_ide_command(cwd, ide_bridge_active, None),
         "model" => {
             let Some(model) = invocation.args.first() else {
                 return Ok(format!("current model={active_model}"));
@@ -1877,7 +2030,12 @@ pub(crate) async fn run_interactive_repl(
                     active_pane,
                     compact_banner.clone(),
                     transcript_scroll,
-                    resume_picker.as_ref().map(build_resume_choice_list),
+                    active_repl_choice_list(
+                        &cwd,
+                        &input_buffer,
+                        resume_picker.as_ref().map(build_resume_choice_list),
+                        &mut interaction_state,
+                    ),
                     &mut selected_command_suggestion,
                     &vim_state,
                     status_marquee_tick,
@@ -1976,7 +2134,12 @@ pub(crate) async fn run_interactive_repl(
                             active_pane,
                             compact_banner.clone(),
                             transcript_scroll,
-                            resume_picker.as_ref().map(build_resume_choice_list),
+                            active_repl_choice_list(
+                                &cwd,
+                                &input_buffer,
+                                resume_picker.as_ref().map(build_resume_choice_list),
+                                &mut interaction_state,
+                            ),
                             selected_command_suggestion,
                             status_marquee_tick,
                             &mouse,
@@ -2362,6 +2525,15 @@ pub(crate) async fn run_interactive_repl(
                         }
                         dirty = true;
                     }
+                    ReplShortcutAction::ToggleTranscriptDetails => {
+                        let group_ids = history_transcript_group_ids(
+                            &materialize_runtime_messages(raw_messages),
+                        );
+                        if toggle_all_history_transcript_groups(&mut interaction_state, &group_ids)
+                        {
+                            dirty = true;
+                        }
+                    }
                     ReplShortcutAction::PromptHistorySearch => {
                         if let Some(search_state) = interaction_state.prompt_history_search.as_mut()
                         {
@@ -2429,6 +2601,18 @@ pub(crate) async fn run_interactive_repl(
                         dirty = true;
                     }
                 }
+                continue;
+            }
+
+            if vim_state.is_insert()
+                && handle_prompt_file_picker_key(
+                    &cwd,
+                    &key,
+                    &mut input_buffer,
+                    &mut interaction_state,
+                )
+            {
+                dirty = true;
                 continue;
             }
 
@@ -3280,17 +3464,6 @@ pub(crate) async fn run_interactive_repl(
                             }
                         }
                     }
-
-                    if is_plain_ctrl_char(&key, 'e') {
-                        let group_ids = history_transcript_group_ids(
-                            &materialize_runtime_messages(raw_messages),
-                        );
-                        if toggle_all_history_transcript_groups(&mut interaction_state, &group_ids)
-                        {
-                            dirty = true;
-                            continue;
-                        }
-                    }
                 }
                 KeyCode::Enter => {
                     let suggestions = sync_command_selection(
@@ -3425,7 +3598,7 @@ pub(crate) async fn handle_slash_command(
         "session" => println!("{}", render_session_command(store, session_id).await?),
         "permissions" => println!("{}", render_permissions_command(cwd).await?),
         "status" => println!("{}", render_status_command(provider, active_model, session_id, live_runtime, cwd)?),
-        "ide" => println!("{}", render_ide_command(ide_bridge_enabled(cli), ide_bridge_address(cli))?),
+        "ide" => println!("{}", render_ide_command(cwd, ide_bridge_enabled(cli), ide_bridge_address(cli))?),
         "statusline" => println!("{}", render_statusline_command(provider, active_model, session_id)?),
         "theme" => println!("{}", render_theme_command()?),
         "vim" => println!("{}", render_vim_command(false)?),
