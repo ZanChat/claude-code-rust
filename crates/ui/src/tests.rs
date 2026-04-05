@@ -581,6 +581,37 @@ fn transcript_item_history_group_arrow_has_click_target() {
 }
 
 #[test]
+fn history_group_toggle_hit_testing_covers_visible_header_text() {
+    let mut state = RatatuiApp::new("history-arrow-scope").initial_state();
+    state.transcript_items = vec![TranscriptItem::Group(TranscriptGroup {
+        id: "history-group-1".to_owned(),
+        title: "Ran 6 commands".to_owned(),
+        subtitle: Some("12 messages · src/lib.rs".to_owned()),
+        expanded: false,
+        single_item: true,
+        lines: vec![TranscriptLine {
+            role: "history_tool_call".to_owned(),
+            text: "Read src/lib.rs".to_owned(),
+            author_label: None,
+        }],
+    })];
+
+    assert_eq!(
+        mouse_action_for_position(&state, 80, 24, 0, 0),
+        Some(UiMouseAction::ToggleTranscriptGroup(
+            "history-group-1".to_owned()
+        ))
+    );
+    assert_eq!(
+        mouse_action_for_position(&state, 80, 24, 4, 0),
+        Some(UiMouseAction::ToggleTranscriptGroup(
+            "history-group-1".to_owned()
+        ))
+    );
+    assert_eq!(mouse_action_for_position(&state, 80, 24, 40, 0), None);
+}
+
+#[test]
 fn choice_list_renders_label_and_detail_inline() {
     let mut state = RatatuiApp::new("choice-list-inline").initial_state();
     state.choice_list = Some(ChoiceListState {

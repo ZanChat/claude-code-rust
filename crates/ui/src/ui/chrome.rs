@@ -765,6 +765,30 @@ fn point_in_rect(column: u16, row: u16, rect: Rect) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
+fn group_header_toggle_action(
+    render_line: &TranscriptRenderLine,
+    transcript_area: Rect,
+    column: u16,
+) -> Option<UiMouseAction> {
+    let TranscriptRenderLineKind::GroupHeader(id) = &render_line.kind else {
+        return None;
+    };
+
+    let clickable_text = render_line.plain_text.trim_end_matches(char::is_whitespace);
+    if clickable_text.is_empty() {
+        return None;
+    }
+
+    let leading_spaces = clickable_text
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .count();
+    let clickable_width = clickable_text.chars().count();
+    let local_column = column.saturating_sub(transcript_area.x) as usize;
+    (local_column >= leading_spaces && local_column < clickable_width)
+        .then(|| UiMouseAction::ToggleTranscriptGroup(id.clone()))
+}
+
 fn prompt_cursor_action_for_position(
     state: &UiState,
     prompt_area: Rect,
@@ -954,15 +978,8 @@ pub fn mouse_action_for_position(
     }
 
     let line_index = row.saturating_sub(body_layout.transcript_area.y) as usize;
-    match body_layout
+    body_layout
         .visible_lines
         .get(line_index)
-        .map(|line| &line.kind)
-    {
-        Some(TranscriptRenderLineKind::GroupHeader(id)) => {
-            Some(UiMouseAction::ToggleTranscriptGroup(id.clone()))
-        }
-        _ => None,
-    }
+        .and_then(|line| group_header_toggle_action(line, body_layout.transcript_area, column))
 }
-

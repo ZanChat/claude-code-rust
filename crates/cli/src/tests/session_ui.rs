@@ -306,6 +306,105 @@ fn build_repl_ui_state_collapses_history_tool_runs_into_single_group() {
 }
 
 #[test]
+fn build_repl_ui_state_allows_clicking_history_group_title_text() {
+    let app = code_agent_ui::RatatuiApp::new("repl");
+    let registry = compatibility_command_registry();
+    let session_id = SessionId::new_v4();
+    let user = build_text_message(
+        session_id,
+        MessageRole::User,
+        "inspect repo".to_owned(),
+        None,
+    );
+    let read_call = build_tool_call_message(
+        session_id,
+        "tool-call-read",
+        "read_file",
+        r#"{"file_path":"src/main.rs"}"#,
+        Some(user.id),
+    );
+    let read_result = build_tool_result_message(
+        session_id,
+        "tool-call-read".to_owned(),
+        "fn main() {}".to_owned(),
+        false,
+        Some(read_call.id),
+    );
+    let search_call = build_tool_call_message(
+        session_id,
+        "tool-call-search",
+        "grep_search",
+        r#"{"pattern":"build_repl_ui_state"}"#,
+        Some(read_result.id),
+    );
+    let search_result = build_tool_result_message(
+        session_id,
+        "tool-call-search".to_owned(),
+        "crates/cli/src/main.rs: build_repl_ui_state".to_owned(),
+        false,
+        Some(search_call.id),
+    );
+    let assistant = build_text_message(
+        session_id,
+        MessageRole::Assistant,
+        "Found the relevant flow.".to_owned(),
+        Some(search_result.id),
+    );
+    let messages = vec![
+        user,
+        read_call,
+        read_result,
+        search_call,
+        search_result,
+        assistant,
+    ];
+
+    let state = build_repl_ui_state(
+        &app,
+        &registry,
+        &messages,
+        None,
+        Path::new("."),
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        session_id,
+        &code_agent_ui::InputBuffer::new(),
+        "status",
+        None,
+        code_agent_ui::PaneKind::Transcript,
+        None,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        &ReplInteractionState::default(),
+    );
+
+    let TranscriptItem::Group(group) = &state.transcript_items[1] else {
+        panic!("expected grouped history item");
+    };
+    let expected_action = code_agent_ui::UiMouseAction::ToggleTranscriptGroup(group.id.clone());
+
+    let mut saw_title_hit = false;
+    for row in 0..24 {
+        for column in 4..100 {
+            if code_agent_ui::mouse_action_for_position(&state, 100, 24, column, row)
+                == Some(expected_action.clone())
+            {
+                saw_title_hit = true;
+                break;
+            }
+        }
+        if saw_title_hit {
+            break;
+        }
+    }
+
+    assert!(saw_title_hit);
+}
+
+#[test]
 fn build_repl_ui_state_keeps_message_action_indices_for_grouped_history() {
     let app = code_agent_ui::RatatuiApp::new("repl");
     let registry = compatibility_command_registry();

@@ -84,7 +84,7 @@ where
                                 UiMouseAction::ToggleTranscriptGroup(group_id)
                                     if matches!(
                                         mouse.kind,
-                                        MouseEventKind::Up(MouseButton::Left)
+                                        MouseEventKind::Down(MouseButton::Left)
                                     ) =>
                                 {
                                     clear_prompt_mouse_anchor(interaction_state);

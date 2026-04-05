@@ -249,7 +249,7 @@ pub(crate) async fn run_interactive_repl(
                                 UiMouseAction::ToggleTranscriptGroup(group_id)
                                     if matches!(
                                         mouse.kind,
-                                        MouseEventKind::Up(MouseButton::Left)
+                                        MouseEventKind::Down(MouseButton::Left)
                                     ) =>
                                 {
                                     clear_prompt_mouse_anchor(&mut interaction_state);

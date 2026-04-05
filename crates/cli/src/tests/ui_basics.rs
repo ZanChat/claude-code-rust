@@ -88,6 +88,27 @@ fn startup_screens_skip_completed_workspace() {
 }
 
 #[test]
+fn startup_screens_skip_resumed_sessions() {
+    let root = temp_session_root("startup-resume");
+    let session_root = root.join(".sessions");
+    fs::create_dir_all(&session_root).unwrap();
+
+    let screens = build_startup_screens(
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        SessionId::new_v4(),
+        &root,
+        &session_root,
+        Some(&session_root.join("existing.jsonl")),
+        true,
+        Some("codex_auth_token"),
+        &StartupPreferences::default(),
+    );
+
+    assert!(screens.is_empty());
+}
+
+#[test]
 fn startup_ui_state_shows_prompt_and_scroll_state() {
     let app = code_agent_ui::RatatuiApp::new("startup");
     let screens = vec![super::StartupScreen {

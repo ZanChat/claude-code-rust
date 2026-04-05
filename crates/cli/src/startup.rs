@@ -90,6 +90,10 @@ pub(crate) fn build_startup_screens(
     auth_source: Option<&str>,
     preferences: &StartupPreferences,
 ) -> Vec<StartupScreen> {
+    if transcript_path.is_some() {
+        return Vec::new();
+    }
+
     let mut screens = Vec::new();
     let auth_summary = if live_runtime {
         format!("ready via {}", friendly_auth_source(auth_source))
