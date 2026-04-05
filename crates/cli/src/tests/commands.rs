@@ -640,14 +640,52 @@ fn runtime_system_prompt_loads_instruction_and_mcp_sections() {
         &root,
         &compatibility_tool_registry(),
         ApiProvider::OpenAICompatible,
+        "gemini-3.1-pro-preview",
         None,
     );
 
     assert!(prompt.contains("You are Claude Code"));
     assert!(prompt.contains("Do NOT use bash when a relevant dedicated tool exists"));
     assert!(prompt.contains("To read files use file_read"));
+    assert!(prompt.contains("Model: gemini-3.1-pro-preview"));
     assert!(prompt.contains("Use bun."));
     assert!(prompt.contains("Read the docs resources before falling back to shell commands."));
+}
+
+#[test]
+fn resolved_command_registry_loads_user_home_skill_commands() {
+    let root = temp_session_root("registry-project-skills");
+    write_test_file(
+        &root.join(".claude/commands/review.md"),
+        "# Project review\n",
+    );
+    let home = temp_session_root("registry-user-skills");
+    write_test_file(&home.join("commands/review.md"), "# User review\n");
+    write_test_file(&home.join("commands/triage.md"), "# User triage\n");
+    let home_path = home.display().to_string();
+
+    with_env_var("CLAUDE_CONFIG_DIR", Some(&home_path), || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let registry = runtime.block_on(resolved_command_registry(&root, None));
+        let review = registry.resolve("review").unwrap();
+        let triage = registry.resolve("triage").unwrap();
+
+        assert_eq!(review.source, CommandSource::Skill);
+        assert!(review
+            .origin
+            .as_deref()
+            .unwrap()
+            .contains(&home.display().to_string()));
+        assert_eq!(triage.source, CommandSource::Skill);
+        assert!(triage
+            .origin
+            .as_deref()
+            .unwrap()
+            .contains(&home.display().to_string()));
+    });
 }
 
 #[tokio::test]

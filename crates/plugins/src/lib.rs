@@ -433,7 +433,7 @@ fn plugin_command_specs(root: &Path, manifest: &PluginManifest) -> Vec<CommandSp
     }
 }
 
-fn skill_command_specs(entries: &[SkillEntry]) -> Vec<CommandSpec> {
+pub fn skill_command_specs(entries: &[SkillEntry]) -> Vec<CommandSpec> {
     entries
         .iter()
         .map(|entry| {
@@ -452,6 +452,22 @@ fn skill_command_specs(entries: &[SkillEntry]) -> Vec<CommandSpec> {
             )
         })
         .collect()
+}
+
+pub fn discover_legacy_skill_entries(
+    root: &Path,
+    skills_dir: &str,
+    commands_dir: &str,
+) -> Result<Vec<SkillEntry>> {
+    let mut skills = collect_legacy_skill_entries(root, skills_dir, SkillSource::LegacySkillsDir)?;
+    skills.extend(collect_legacy_skill_entries(
+        root,
+        commands_dir,
+        SkillSource::LegacyCommandsDir,
+    )?);
+    skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
+    skills.dedup_by(|left, right| left.path == right.path);
+    Ok(skills)
 }
 
 fn collect_legacy_skill_entries(
@@ -525,15 +541,10 @@ impl PluginRuntime for OutOfProcessPluginRuntime {
             Vec::new()
         };
 
-        skills.extend(collect_legacy_skill_entries(
+        skills.extend(discover_legacy_skill_entries(
             root,
             LEGACY_SKILLS_DIR,
-            SkillSource::LegacySkillsDir,
-        )?);
-        skills.extend(collect_legacy_skill_entries(
-            root,
             LEGACY_COMMANDS_DIR,
-            SkillSource::LegacyCommandsDir,
         )?);
         skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
         skills.dedup_by(|left, right| left.path == right.path);
@@ -670,8 +681,8 @@ impl PluginRuntime for OutOfProcessPluginRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        BridgeLaunchRequest, OutOfProcessPluginRuntime, PluginRuntime, LEGACY_SKILLS_DIR,
-        PLUGIN_MANIFEST_PATH, SKILL_FILE_NAME,
+        discover_legacy_skill_entries, BridgeLaunchRequest, OutOfProcessPluginRuntime,
+        PluginRuntime, LEGACY_SKILLS_DIR, PLUGIN_MANIFEST_PATH, SKILL_FILE_NAME,
     };
     use code_agent_core::CommandSource;
     use std::fs;
@@ -783,6 +794,24 @@ mod tests {
             .map(|entry| entry.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["release", "review", "triage"]);
+    }
+
+    #[test]
+    fn discovers_legacy_skill_entries_from_user_layout() {
+        let root = make_temp_dir("user-skill-discovery");
+        write_file(
+            &root.join("skills/review").join(SKILL_FILE_NAME),
+            "# Review\n",
+        );
+        write_file(&root.join("commands/triage.md"), "# Triage\n");
+
+        let skills = discover_legacy_skill_entries(&root, "skills", "commands").unwrap();
+        let names = skills
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["review", "triage"]);
     }
 
     #[tokio::test]

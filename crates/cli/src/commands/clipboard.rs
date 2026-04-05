@@ -140,10 +140,9 @@ pub(crate) async fn render_skills_command(
     cwd: &Path,
     plugin_root: Option<&PathBuf>,
 ) -> Result<String> {
-    let runtime = OutOfProcessPluginRuntime;
     let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
-    let skills = runtime.discover_skills(&root).await?;
-    let commands = runtime.discover_commands(&root).await?;
+    let skills = resolved_skill_entries(cwd, plugin_root).await?;
+    let commands = resolved_dynamic_commands(cwd, plugin_root).await;
     Ok(serde_json::to_string_pretty(&json!({
         "root": root,
         "skills": skills,

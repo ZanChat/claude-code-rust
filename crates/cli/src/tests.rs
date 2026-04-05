@@ -29,8 +29,8 @@ use code_agent_bridge::{
     VoiceFrame,
 };
 use code_agent_core::{
-    compatibility_command_registry, CommandInvocation, ContentBlock, SessionId, TaskRecord,
-    TaskStatus, ToolCall,
+    compatibility_command_registry, CommandInvocation, CommandSource, ContentBlock, SessionId,
+    TaskRecord, TaskStatus, ToolCall,
 };
 use code_agent_providers::{
     ApiProvider, DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
@@ -80,6 +80,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 #[derive(Deserialize)]
 struct SlashCommandFixture {
     cases: Vec<SlashCommandCase>,
@@ -119,6 +121,35 @@ fn write_test_file(path: &Path, content: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, content).unwrap();
+}
+
+fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    struct EnvVarGuard {
+        key: String,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => env::set_var(&self.key, value),
+                None => env::remove_var(&self.key),
+            }
+        }
+    }
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    let restore = EnvVarGuard {
+        key: key.to_owned(),
+        previous: env::var(key).ok(),
+    };
+    match value {
+        Some(value) => env::set_var(key, value),
+        None => env::remove_var(key),
+    }
+    let result = f();
+    drop(restore);
+    result
 }
 
 fn repl_handled_command_names() -> BTreeSet<&'static str> {

@@ -171,12 +171,19 @@ fn using_your_tools_section(enabled_tools: &BTreeSet<String>) -> Option<String> 
     ))
 }
 
-fn runtime_environment_section(cwd: &Path, provider: ApiProvider) -> String {
+fn runtime_environment_section(cwd: &Path, provider: ApiProvider, model: &str) -> String {
     let git_state = if git_repository_present(cwd) { "yes" } else { "no" };
+    let shell = env::var_os("SHELL")
+        .or_else(|| env::var_os("COMSPEC"))
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_owned());
     format!(
-        "# Environment\n- Working directory: {}\n- Provider mode: {}\n- Git repository detected: {}",
+        "# Environment\n- Working directory: {}\n- Provider mode: {}\n- Model: {}\n- Platform: {}\n- Shell: {}\n- Git repository detected: {}",
         cwd.display(),
         provider,
+        model,
+        env::consts::OS,
+        shell,
         git_state
     )
 }
@@ -185,6 +192,7 @@ fn build_runtime_system_prompt(
     cwd: &Path,
     tool_registry: &ToolRegistry,
     provider: ApiProvider,
+    model: &str,
     plugin_root: Option<&PathBuf>,
 ) -> String {
     let enabled_tools = enabled_tool_names(tool_registry);
@@ -194,7 +202,7 @@ fn build_runtime_system_prompt(
         "# Doing tasks\n- Read relevant code before changing it.\n- Make the smallest change that fully solves the task.\n- Do not create files unless they are genuinely needed.\n- Diagnose failures before switching tactics.\n- Verify important work when practical, and report outcomes faithfully.".to_owned(),
         "# Acting carefully\n- Local, reversible actions like reading files, editing code, or running tests are usually fine.\n- Ask before taking destructive or externally visible actions such as deleting work, pushing commits, changing shared infrastructure, or sending messages to external services.".to_owned(),
         "# Tone and style\n- Keep user-facing updates concise and direct.\n- Do not use a colon immediately before a tool call.\n- When you complete the task, summarize what changed and any important verification or remaining risk.".to_owned(),
-        runtime_environment_section(cwd, provider),
+        runtime_environment_section(cwd, provider, model),
     ];
 
     if let Some(using_tools) = using_your_tools_section(&enabled_tools) {

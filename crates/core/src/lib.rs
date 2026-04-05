@@ -117,8 +117,7 @@ pub enum BoundaryKind {
     Resume,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TaskStatus {
     #[default]
     Pending,
@@ -128,7 +127,6 @@ pub enum TaskStatus {
     Failed,
     Cancelled,
 }
-
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskRecord {
@@ -599,17 +597,14 @@ pub enum AppEvent {
     RemoteConnected,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum CommandKind {
     #[default]
     Local,
     Prompt,
 }
 
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum CommandCategory {
     Session,
     Auth,
@@ -619,9 +614,7 @@ pub enum CommandCategory {
     Advanced,
 }
 
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum CommandSource {
     #[default]
     BuiltIn,
@@ -629,7 +622,6 @@ pub enum CommandSource {
     Skill,
     Workflow,
 }
-
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandSpec {

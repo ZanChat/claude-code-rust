@@ -64,14 +64,12 @@ pub enum CommandState {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum VimMode {
     #[default]
     Insert,
     Normal(CommandState),
 }
-
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VimState {

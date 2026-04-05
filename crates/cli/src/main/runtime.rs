@@ -88,7 +88,8 @@ async fn run_agent_turns(
     const MAX_AGENT_STEPS: usize = 100;
 
     let provider_tools = tool_definitions(tool_registry);
-    let system_prompt = build_runtime_system_prompt(&cwd, tool_registry, provider, plugin_root);
+    let system_prompt =
+        build_runtime_system_prompt(&cwd, tool_registry, provider, &model, plugin_root);
     let tool_context = ToolContext {
         session_id: Some(session_id),
         cwd: cwd.clone(),
@@ -463,9 +464,7 @@ async fn main() -> Result<()> {
     }
 
     if cli.list_skills {
-        let runtime = OutOfProcessPluginRuntime;
-        let root = resolve_plugin_root(&cli, None, &cwd);
-        let skills = runtime.discover_skills(&root).await?;
+        let skills = resolved_skill_entries(&cwd, cli.plugin_root.as_ref()).await?;
         println!("{}", serde_json::to_string_pretty(&skills)?);
         return Ok(());
     }

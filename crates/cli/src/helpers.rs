@@ -5,6 +5,52 @@ pub(crate) fn task_store_for(cwd: &Path) -> CoreLocalTaskStore {
     CoreLocalTaskStore::new(cwd.join(".code-agent"))
 }
 
+async fn resolved_root_skill_entries(
+    cwd: &Path,
+    plugin_root: Option<&PathBuf>,
+) -> Result<Vec<code_agent_plugins::SkillEntry>> {
+    let runtime = OutOfProcessPluginRuntime;
+    let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
+    runtime.discover_skills(&root).await
+}
+
+fn resolved_user_skill_entries() -> Vec<code_agent_plugins::SkillEntry> {
+    let home = claude_config_home_dir();
+    code_agent_plugins::discover_legacy_skill_entries(&home, "skills", "commands")
+        .unwrap_or_default()
+}
+
+pub(crate) async fn resolved_skill_entries(
+    cwd: &Path,
+    plugin_root: Option<&PathBuf>,
+) -> Result<Vec<code_agent_plugins::SkillEntry>> {
+    let mut skills = resolved_root_skill_entries(cwd, plugin_root).await?;
+    let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
+    let home = claude_config_home_dir();
+    if home != root {
+        skills.extend(resolved_user_skill_entries());
+    }
+    skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
+    skills.dedup_by(|left, right| left.path == right.path);
+    Ok(skills)
+}
+
+pub(crate) async fn resolved_dynamic_commands(
+    cwd: &Path,
+    plugin_root: Option<&PathBuf>,
+) -> Vec<CommandSpec> {
+    let runtime = OutOfProcessPluginRuntime;
+    let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
+    let mut commands = runtime.discover_commands(&root).await.unwrap_or_default();
+    let home = claude_config_home_dir();
+    if home != root {
+        commands.extend(code_agent_plugins::skill_command_specs(
+            &resolved_user_skill_entries(),
+        ));
+    }
+    commands
+}
+
 pub(crate) fn command_report(spec: &CommandSpec) -> CommandReport {
     CommandReport {
         name: spec.name.clone(),
@@ -31,11 +77,7 @@ pub(crate) async fn resolved_command_registry(
     plugin_root: Option<&PathBuf>,
 ) -> CommandRegistry {
     let mut registry = compatibility_command_registry();
-    let runtime = OutOfProcessPluginRuntime;
-    let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
-    if let Ok(dynamic_commands) = runtime.discover_commands(&root).await {
-        registry.extend(dynamic_commands);
-    }
+    registry.extend(resolved_dynamic_commands(cwd, plugin_root).await);
     registry
 }
 
