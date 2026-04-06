@@ -56,20 +56,6 @@ pub(crate) struct PluginReport {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct CommandReport {
-    pub(crate) name: String,
-    pub(crate) description: String,
-    pub(crate) source: String,
-    pub(crate) category: String,
-    pub(crate) kind: String,
-    pub(crate) aliases: Vec<String>,
-    pub(crate) remote_safe: bool,
-    pub(crate) bridge_safe: bool,
-    pub(crate) requires_provider: bool,
-    pub(crate) origin: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
 pub(crate) struct SessionCommandReport {
     pub(crate) session_id: SessionId,
     pub(crate) session_root: PathBuf,

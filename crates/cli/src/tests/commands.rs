@@ -565,6 +565,180 @@ async fn repl_tasks_command_creates_and_lists_tasks() {
 }
 
 #[tokio::test]
+async fn repl_plan_command_enables_plan_mode_and_shows_plan() {
+    let root = temp_session_root("repl-plan");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let enabled = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "plan".to_owned(),
+            raw_input: "/plan".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(enabled.contains("Enabled plan mode"));
+    assert!(root.join(".claude/plan-mode.json").exists());
+
+    write_test_file(
+        &root.join(".claude/plan.md"),
+        "- Inspect the failing command path\n",
+    );
+
+    let shown = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "plan".to_owned(),
+            raw_input: "/plan".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(shown.contains("Current plan"));
+    assert!(shown.contains("Inspect the failing command path"));
+}
+
+#[tokio::test]
+async fn repl_skills_command_formats_skill_list() {
+    let root = temp_session_root("repl-skills");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+    let tool_registry = compatibility_tool_registry();
+    write_test_file(&root.join(".claude/skills/review/SKILL.md"), "# Review\n");
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let output = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "skills".to_owned(),
+            raw_input: "/skills".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(output.contains("Skills"));
+    assert!(output.contains("/review"));
+    assert!(output.contains("project skill"));
+}
+
+#[tokio::test]
+async fn repl_agents_command_formats_agent_records() {
+    let root = temp_session_root("repl-agents");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let created = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "agents".to_owned(),
+            args: vec!["create".to_owned(), "review docs".to_owned()],
+            raw_input: "/agents create review docs".to_owned(),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let listed = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "agents".to_owned(),
+            raw_input: "/agents".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(created.contains("Created agent task"));
+    assert!(listed.contains("Agents"));
+    assert!(listed.contains("review docs"));
+}
+
+#[tokio::test]
 async fn repl_plugin_command_reports_manifest_details() {
     let root = temp_session_root("repl-plugin");
     let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));

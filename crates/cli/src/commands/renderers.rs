@@ -231,34 +231,283 @@ pub(crate) fn render_ide_command(
     render_ide_command_with_home(cwd, ide_bridge_active, ide_address, None)
 }
 
+fn runtime_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".claude")
+}
+
+fn plan_mode_state_path(cwd: &Path) -> PathBuf {
+    runtime_dir(cwd).join("plan-mode.json")
+}
+
+fn plan_file_path(cwd: &Path) -> PathBuf {
+    runtime_dir(cwd).join("plan.md")
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn plan_mode_is_active(cwd: &Path) -> bool {
+    safe_read_text(&plan_mode_state_path(cwd))
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .and_then(|value| value.get("active").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn activate_plan_mode(cwd: &Path) -> Result<PathBuf> {
+    let path = plan_mode_state_path(cwd);
+    ensure_parent_dir(&path)?;
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "active": true,
+            "cwd": cwd,
+        }))?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+fn open_path_in_editor(path: &Path) -> Result<()> {
+    let editor = std::env::var_os("VISUAL").or_else(|| std::env::var_os("EDITOR"));
+    let status = if let Some(editor) = editor {
+        StdCommand::new(editor)
+            .arg(path)
+            .status()
+            .with_context(|| format!("failed to open {} in editor", path.display()))?
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            StdCommand::new("open")
+                .arg("-t")
+                .arg(path)
+                .status()
+                .with_context(|| format!("failed to open {} with open -t", path.display()))?
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            bail!("set VISUAL or EDITOR to use /plan open")
+        }
+    };
+
+    if !status.success() {
+        bail!("editor exited unsuccessfully while opening {}", path.display());
+    }
+    Ok(())
+}
+
+fn task_status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "pending",
+        TaskStatus::Running => "running",
+        TaskStatus::WaitingForInput => "waiting",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn short_task_id(task_id: uuid::Uuid) -> String {
+    task_id
+        .to_string()
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn is_agent_task_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "agent"
+            | "workflow"
+            | "workflow_step"
+            | "coordinator"
+            | "assistant_worker"
+            | "assistant_synthesis"
+    )
+}
+
+fn render_preview(title: String, lines: Vec<String>) -> String {
+    std::iter::once(title)
+        .chain(lines)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn skill_entry_source_label(entry: &ccrust_plugins::SkillEntry, cwd: &Path) -> String {
+    match entry.source {
+        ccrust_plugins::SkillSource::Manifest => "plugin".to_owned(),
+        ccrust_plugins::SkillSource::LegacyCommandsDir => {
+            if entry.path.starts_with(claude_config_home_dir()) {
+                "user command".to_owned()
+            } else if entry.path.starts_with(cwd) {
+                "project command".to_owned()
+            } else {
+                "command".to_owned()
+            }
+        }
+        ccrust_plugins::SkillSource::LegacySkillsDir => {
+            if entry.path.starts_with(claude_config_home_dir()) {
+                "user skill".to_owned()
+            } else if entry.path.starts_with(cwd) {
+                "project skill".to_owned()
+            } else {
+                "skill".to_owned()
+            }
+        }
+    }
+}
+
+fn hook_summary_lines(root: &Path, hooks: &Value) -> Vec<String> {
+    match hooks {
+        Value::String(path) => vec![format!(
+            "- {} ({})",
+            path.trim_start_matches("./"),
+            root.join(path.trim_start_matches("./")).display()
+        )],
+        Value::Array(entries) => entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| match entry {
+                Value::String(path) => format!(
+                    "- {} ({})",
+                    path.trim_start_matches("./"),
+                    root.join(path.trim_start_matches("./")).display()
+                ),
+                Value::Object(map) => format!(
+                    "- Inline hook config #{} ({})",
+                    index + 1,
+                    map.keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+                other => format!("- Hook entry #{} ({other})", index + 1),
+            })
+            .collect(),
+        Value::Object(map) => vec![format!(
+            "- Inline hook config ({})",
+            map.keys().cloned().collect::<Vec<_>>().join(", ")
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn format_agent_task_record(task: &TaskRecord) -> String {
+    let mut lines = vec![format!(
+        "Agent {}",
+        if task.title.trim().is_empty() {
+            short_task_id(task.id)
+        } else {
+            task.title.clone()
+        }
+    )];
+    lines.push(format!("ID: {}", task.id));
+    lines.push(format!("Status: {}", task_status_label(task.status.clone())));
+    lines.push(format!("Kind: {}", task.kind));
+    if let Some(session_id) = task.session_id {
+        lines.push(format!("Session: {session_id}"));
+    }
+    if let Some(transcript_path) = task.transcript_path.as_ref() {
+        lines.push(format!("Transcript: {}", transcript_path.display()));
+    }
+    if let Some(artifact_path) = task.artifact_path.as_ref() {
+        lines.push(format!("Artifact: {}", artifact_path.display()));
+    }
+    if let Some(output) = task.output.as_ref().filter(|value| !value.trim().is_empty()) {
+        lines.push(String::new());
+        lines.push("Output:".to_owned());
+        lines.extend(preview_lines_from_text(output.clone(), 12, 96));
+    }
+    lines.join("\n")
+}
+
 pub(crate) fn render_theme_command() -> Result<String> {
-    Ok(serde_json::to_string_pretty(&json!({
-        "status": "compatible",
-        "message": "Theme selection is currently terminal-native in the Rust UI.",
-    }))?)
+    Ok([
+        "Theme".to_owned(),
+        "Rust UI currently follows your terminal colors instead of persisting TS theme presets."
+            .to_owned(),
+        "Available TS presets: auto, dark, light, dark-daltonized, light-daltonized, dark-ansi, light-ansi.".to_owned(),
+    ]
+    .join("\n"))
 }
 
 pub(crate) fn render_vim_command(enabled: bool) -> Result<String> {
-    Ok(serde_json::to_string_pretty(&json!({
-        "enabled": enabled,
-        "status": if enabled { "experimental" } else { "disabled" },
-        "message": "Full vim state-machine parity is still in progress.",
-    }))?)
+    Ok(if enabled {
+        "Vim mode enabled. Insert and normal mode are available in the Rust REPL.".to_owned()
+    } else {
+        "Vim mode disabled. The prompt is using standard editing shortcuts.".to_owned()
+    })
 }
 
-pub(crate) fn render_plan_command() -> Result<String> {
-    Ok(serde_json::to_string_pretty(&json!({
-        "status": "compatibility_surface_only",
-        "message": "Plan-mode workflow is tracked outside the Rust runtime core.",
-    }))?)
+pub(crate) fn render_plan_command(cwd: &Path, invocation: &CommandInvocation) -> Result<String> {
+    let plan_path = plan_file_path(cwd);
+
+    if matches!(invocation.args.first().map(String::as_str), Some("open")) {
+        if !plan_path.exists() {
+            ensure_parent_dir(&plan_path)?;
+            if !plan_mode_is_active(cwd) {
+                let _ = activate_plan_mode(cwd)?;
+            }
+            fs::write(&plan_path, b"")
+                .with_context(|| format!("failed to initialize {}", plan_path.display()))?;
+        }
+        open_path_in_editor(&plan_path)?;
+        return Ok(format!("Opened plan in editor: {}", plan_path.display()));
+    }
+
+    if !plan_mode_is_active(cwd) {
+        let state_path = activate_plan_mode(cwd)?;
+        let detail = invocation.args.join(" ");
+        if detail.trim().is_empty() {
+            return Ok(format!(
+                "Enabled plan mode. State is recorded at {}.",
+                state_path.display()
+            ));
+        }
+        return Ok(format!(
+            "Enabled plan mode. Re-run your planning request now that plan mode is active: {}",
+            detail.trim()
+        ));
+    }
+
+    let Some(plan_content) = safe_read_text(&plan_path) else {
+        return Ok("Already in plan mode. No plan written yet.".to_owned());
+    };
+
+    let mut lines = vec!["Current plan".to_owned(), plan_path.display().to_string()];
+    lines.push(String::new());
+    lines.extend(preview_lines_from_text(plan_content, 24, 96));
+    lines.push(String::new());
+    lines.push("Run /plan open to edit the plan in your editor.".to_owned());
+    Ok(lines.join("\n"))
 }
 
 pub(crate) fn render_simple_compat_command(name: &str, message: &str) -> Result<String> {
-    Ok(serde_json::to_string_pretty(&json!({
-        "command": name,
-        "status": "compatibility_surface_only",
-        "message": message,
-    }))?)
+    Ok(format!("/{name}\n{message}"))
+}
+
+pub(crate) fn render_hooks_command(cwd: &Path, plugin_root: Option<&PathBuf>) -> Result<String> {
+    let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
+    let lines = load_plugin_manifest_sync(&root)
+        .and_then(|manifest| manifest.hooks)
+        .map(|hooks| hook_summary_lines(&root, &hooks))
+        .unwrap_or_default();
+
+    if lines.is_empty() {
+        return Ok("Hooks\nNo hook configuration found for this workspace.".to_owned());
+    }
+
+    Ok(std::iter::once("Hooks".to_owned())
+        .chain(lines)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+pub(crate) fn render_output_style_command() -> Result<String> {
+    Ok("/output-style has been deprecated. Use /config to change your output style, or set it in your settings file. Changes take effect on the next session.".to_owned())
 }
 
 pub(crate) fn render_files_command(raw_messages: &[Message], cwd: &Path) -> Result<String> {
@@ -267,7 +516,7 @@ pub(crate) fn render_files_command(raw_messages: &[Message], cwd: &Path) -> Resu
         title: "File preview".to_owned(),
         lines: vec!["No file preview available yet.".to_owned()],
     });
-    Ok(serde_json::to_string_pretty(&preview)?)
+    Ok(render_preview(preview.title, preview.lines))
 }
 
 pub(crate) fn render_diff_command(raw_messages: &[Message]) -> Result<String> {
@@ -276,7 +525,7 @@ pub(crate) fn render_diff_command(raw_messages: &[Message]) -> Result<String> {
         title: "Diff preview".to_owned(),
         lines: vec!["No diff preview available yet.".to_owned()],
     });
-    Ok(serde_json::to_string_pretty(&preview)?)
+    Ok(render_preview(preview.title, preview.lines))
 }
 
 pub(crate) fn render_usage_command(raw_messages: &[Message]) -> Result<String> {
@@ -394,11 +643,10 @@ pub(crate) fn render_export_command(
     store: &ActiveSessionStore,
     session_id: SessionId,
 ) -> Result<String> {
-    Ok(serde_json::to_string_pretty(&json!({
-        "session_id": session_id,
-        "transcript_path": store.root_dir().join(format!("{session_id}.jsonl")),
-        "status": "ready",
-    }))?)
+    Ok(format!(
+        "Transcript export ready\nSession: {session_id}\nPath: {}",
+        store.root_dir().join(format!("{session_id}.jsonl")).display()
+    ))
 }
 
 pub(crate) fn render_tasks_command(invocation: &CommandInvocation, cwd: &Path) -> Result<String> {
@@ -575,7 +823,13 @@ pub(crate) async fn render_agents_command(
                     },
                 )
                 .await?;
-            Ok(serde_json::to_string_pretty(&report.metadata)?)
+            let task = serde_json::from_value::<TaskRecord>(report.metadata.clone())
+                .or_else(|_| serde_json::from_str::<TaskRecord>(&report.content))?;
+            Ok(format!(
+                "Created agent task\n{}\n\nUse /agents get {} to inspect it.",
+                format_agent_task_record(&task),
+                task.id
+            ))
         }
         Some("get" | "resume") => {
             let task_id = invocation
@@ -600,28 +854,35 @@ pub(crate) async fn render_agents_command(
                     },
                 )
                 .await?;
-            Ok(report.content)
+            let task = serde_json::from_value::<TaskRecord>(report.metadata.clone())
+                .or_else(|_| serde_json::from_str::<TaskRecord>(&report.content))?;
+            Ok(format_agent_task_record(&task))
         }
         _ => {
             let tasks = task_store_for(cwd)
                 .list_tasks()?
                 .into_iter()
-                .filter(|task| {
-                    matches!(
-                        task.kind.as_str(),
-                        "agent"
-                            | "workflow"
-                            | "workflow_step"
-                            | "coordinator"
-                            | "assistant_worker"
-                            | "assistant_synthesis"
-                    )
-                })
+                .filter(|task| is_agent_task_kind(task.kind.as_str()))
                 .collect::<Vec<_>>();
-            Ok(serde_json::to_string_pretty(&TaskCommandReport {
-                count: tasks.len(),
-                tasks,
-            })?)
+            if tasks.is_empty() {
+                return Ok("Agents\nNo agents found. Use /agents create <title> to start one.".to_owned());
+            }
+
+            let mut lines = vec![format!("Agents ({})", tasks.len())];
+            lines.push("Use /agents create <title> to start a new delegated task.".to_owned());
+            lines.extend(tasks.into_iter().map(|task| {
+                format!(
+                    "- [{}] {} ({})",
+                    task_status_label(task.status),
+                    if task.title.trim().is_empty() {
+                        "agent task".to_owned()
+                    } else {
+                        task.title
+                    },
+                    short_task_id(task.id)
+                )
+            }));
+            Ok(lines.join("\n"))
         }
     }
 }

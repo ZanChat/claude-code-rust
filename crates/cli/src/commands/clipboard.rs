@@ -144,14 +144,21 @@ pub(crate) async fn render_skills_command(
     cwd: &Path,
     plugin_root: Option<&PathBuf>,
 ) -> Result<String> {
-    let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
     let skills = resolved_skill_entries(cwd, plugin_root).await?;
-    let commands = resolved_dynamic_commands(cwd, plugin_root).await;
-    Ok(serde_json::to_string_pretty(&json!({
-        "root": root,
-        "skills": skills,
-        "commands": commands.into_iter().map(|spec| command_report(&spec)).collect::<Vec<_>>(),
-    }))?)
+    if skills.is_empty() {
+        return Ok("Skills\nNo skills found. Create skills in .claude/skills/ or ~/.claude/skills/.".to_owned());
+    }
+
+    let mut lines = vec![format!("Skills ({})", skills.len())];
+    lines.extend(skills.into_iter().map(|entry| {
+        format!(
+            "- /{} · {} · {}",
+            entry.name,
+            skill_entry_source_label(&entry, cwd),
+            entry.path.display()
+        )
+    }));
+    Ok(lines.join("\n"))
 }
 
 pub(crate) fn render_command_help(registry: &CommandRegistry, remote_only: bool) -> String {

@@ -134,14 +134,8 @@ pub(crate) async fn handle_repl_slash_command(
         "plugin" => render_plugin_command(&invocation, plugin_root, cwd).await,
         "skills" => render_skills_command(cwd, plugin_root).await,
         "reload-plugins" => render_skills_command(cwd, plugin_root).await,
-        "hooks" => render_simple_compat_command(
-            "hooks",
-            "Hook discovery is exposed through plugin manifests in the Rust runtime.",
-        ),
-        "output-style" => render_simple_compat_command(
-            "output-style",
-            "Output styles are discovered from plugin manifests but alternate renderers remain limited.",
-        ),
+        "hooks" => render_hooks_command(cwd, plugin_root),
+        "output-style" => render_output_style_command(),
         "mcp" => {
             render_mcp_command(
                 &invocation,
@@ -177,7 +171,7 @@ pub(crate) async fn handle_repl_slash_command(
             }
             render_vim_command(vim_state.enabled)
         }
-        "plan" => render_plan_command(),
+        "plan" => render_plan_command(cwd, &invocation),
         "fast" => render_simple_compat_command(
             "fast",
             "Fast mode uses the same model family with lower latency-focused behavior.",
@@ -260,6 +254,7 @@ async fn process_repl_submission(
     interaction_state: &mut ReplInteractionState,
     resume_picker: &mut Option<ResumePickerState>,
     ide_picker: &mut Option<ReplIdePickerState>,
+    command_picker: &mut Option<ReplCommandPickerState>,
     connected_ide_bridge: &Option<DetectedIdeCandidate>,
     selected_command_suggestion: &mut usize,
     vim_state: &mut ccrust_ui::vim::VimState,
@@ -315,6 +310,28 @@ async fn process_repl_submission(
             );
             *status_marquee_tick = 0;
             return Ok(ReplSubmissionOutcome::Continue);
+        }
+
+        if invocation.args.is_empty() {
+            let next_picker = match invocation.name.as_str() {
+                "agents" => Some(repl_agents_picker_state(cwd)?),
+                "skills" | "reload-plugins" => Some(repl_skills_picker_state(cwd, plugin_root).await?),
+                "theme" => Some(repl_theme_picker_state()),
+                "hooks" => Some(repl_hooks_picker_state(cwd, plugin_root)),
+                _ => None,
+            };
+
+            if let Some(picker) = next_picker {
+                *command_picker = Some(picker);
+                *status_line = repl_runtime_status(
+                    *provider,
+                    active_model,
+                    repl_session.session_id,
+                    *live_runtime,
+                );
+                *status_marquee_tick = 0;
+                return Ok(ReplSubmissionOutcome::Continue);
+            }
         }
 
         if matches!(invocation.name.as_str(), "login" | "logout") {

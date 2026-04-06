@@ -176,6 +176,7 @@ pub(crate) async fn run_interactive_repl(
         let mut compact_banner = initial_compact_banner.clone();
         let mut resume_picker = None;
         let mut ide_picker = None;
+        let mut command_picker = None;
         let mut connected_ide_bridge = None;
         let mut queued_submissions = VecDeque::new();
         let mut interaction_state = ReplInteractionState::default();
@@ -219,6 +220,11 @@ pub(crate) async fn run_interactive_repl(
                                 ide_picker.as_ref().map(|picker| {
                                     build_ide_choice_list(picker, connected_ide_bridge.as_ref())
                                 })
+                            })
+                            .or_else(|| {
+                                command_picker
+                                    .as_ref()
+                                    .map(build_command_choice_list)
                             }),
                         &mut interaction_state,
                     ),
@@ -230,7 +236,7 @@ pub(crate) async fn run_interactive_repl(
                 dirty = false;
             }
 
-            if resume_picker.is_none() && ide_picker.is_none() {
+            if resume_picker.is_none() && ide_picker.is_none() && command_picker.is_none() {
                 if let Some(prompt_text) = queued_submissions.pop_front() {
                     match process_repl_submission(
                         &mut terminal,
@@ -258,6 +264,7 @@ pub(crate) async fn run_interactive_repl(
                         &mut interaction_state,
                         &mut resume_picker,
                         &mut ide_picker,
+                        &mut command_picker,
                         &connected_ide_bridge,
                         &mut selected_command_suggestion,
                         &mut vim_state,
@@ -295,7 +302,7 @@ pub(crate) async fn run_interactive_repl(
                 continue;
             }
             if let Event::Mouse(mouse) = event {
-                if ide_picker.is_some() {
+                if ide_picker.is_some() || command_picker.is_some() {
                     continue;
                 }
                 match mouse.kind {
@@ -345,6 +352,11 @@ pub(crate) async fn run_interactive_repl(
                                                 connected_ide_bridge.as_ref(),
                                             )
                                         })
+                                    })
+                                    .or_else(|| {
+                                        command_picker
+                                            .as_ref()
+                                            .map(build_command_choice_list)
                                     }),
                                 &mut interaction_state,
                             ),
@@ -398,7 +410,7 @@ pub(crate) async fn run_interactive_repl(
             }
             if let Event::Paste(text) = event {
                 clear_prompt_mouse_anchor(&mut interaction_state);
-                if ide_picker.is_some() {
+                if ide_picker.is_some() || command_picker.is_some() {
                     continue;
                 }
                 if let Some(search_state) = interaction_state.prompt_history_search.as_mut() {
@@ -662,6 +674,134 @@ pub(crate) async fn run_interactive_repl(
                             ),
                             "No IDE bridge detected for this workspace",
                         );
+                        status_marquee_tick = 0;
+                    }
+                    None => {}
+                }
+                continue;
+            }
+
+            if command_picker.is_some() {
+                enum CommandPickerUiAction {
+                    Cancel,
+                    Select(ReplCommandPickerAction),
+                }
+
+                let mut picker_action = None;
+                if let Some(picker) = command_picker.as_mut() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            picker_action = Some(CommandPickerUiAction::Cancel);
+                            dirty = true;
+                        }
+                        KeyCode::Up => {
+                            picker.selected = picker.selected.saturating_sub(1);
+                            dirty = true;
+                        }
+                        KeyCode::Down => {
+                            if picker.selected + 1 < picker.items.len() {
+                                picker.selected += 1;
+                            }
+                            dirty = true;
+                        }
+                        KeyCode::PageUp => {
+                            picker.selected = picker.selected.saturating_sub(5);
+                            dirty = true;
+                        }
+                        KeyCode::PageDown => {
+                            if !picker.items.is_empty() {
+                                picker.selected = (picker.selected + 5).min(picker.items.len() - 1);
+                            }
+                            dirty = true;
+                        }
+                        KeyCode::Home => {
+                            picker.selected = 0;
+                            dirty = true;
+                        }
+                        KeyCode::End => {
+                            if !picker.items.is_empty() {
+                                picker.selected = picker.items.len() - 1;
+                            }
+                            dirty = true;
+                        }
+                        KeyCode::Enter | KeyCode::Tab => {
+                            picker_action = picker
+                                .items
+                                .get(picker.selected)
+                                .or_else(|| picker.items.first())
+                                .map(|entry| CommandPickerUiAction::Select(entry.action.clone()));
+                            dirty = true;
+                        }
+                        _ if is_plain_ctrl_char(&key, 'c') => {
+                            picker_action = Some(CommandPickerUiAction::Cancel);
+                            dirty = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                match picker_action {
+                    Some(CommandPickerUiAction::Cancel) => {
+                        command_picker = None;
+                        status_line = repl_runtime_status(
+                            provider,
+                            &active_model,
+                            repl_session.session_id,
+                            live_runtime,
+                        );
+                        status_marquee_tick = 0;
+                    }
+                    Some(CommandPickerUiAction::Select(action)) => {
+                        command_picker = None;
+                        match action {
+                            ReplCommandPickerAction::Status { status, banner } => {
+                                compact_banner = banner.or_else(|| compact_banner.clone());
+                                status_line = status_with_detail(
+                                    repl_runtime_status(
+                                        provider,
+                                        &active_model,
+                                        repl_session.session_id,
+                                        live_runtime,
+                                    ),
+                                    status,
+                                );
+                            }
+                            ReplCommandPickerAction::PrefillInput {
+                                input,
+                                status,
+                                banner,
+                            } => {
+                                input_buffer.replace(input);
+                                clear_prompt_selection(&mut interaction_state);
+                                interaction_state.transcript_selection = None;
+                                selected_command_suggestion = 0;
+                                compact_banner = banner.or_else(|| compact_banner.clone());
+                                status_line = status_with_detail(
+                                    repl_runtime_status(
+                                        provider,
+                                        &active_model,
+                                        repl_session.session_id,
+                                        live_runtime,
+                                    ),
+                                    status,
+                                );
+                            }
+                            ReplCommandPickerAction::QueueInput { input, status } => {
+                                input_buffer.clear();
+                                clear_prompt_selection(&mut interaction_state);
+                                interaction_state.transcript_selection = None;
+                                queued_submissions.push_back(input);
+                                status_line = status_with_detail(
+                                    repl_runtime_status(
+                                        provider,
+                                        &active_model,
+                                        repl_session.session_id,
+                                        live_runtime,
+                                    ),
+                                    status,
+                                );
+                            }
+                        }
                         status_marquee_tick = 0;
                     }
                     None => {}
@@ -1883,6 +2023,7 @@ pub(crate) async fn run_interactive_repl(
                         &mut interaction_state,
                         &mut resume_picker,
                         &mut ide_picker,
+                        &mut command_picker,
                         &connected_ide_bridge,
                         &mut selected_command_suggestion,
                         &mut vim_state,

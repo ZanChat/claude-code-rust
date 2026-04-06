@@ -674,6 +674,61 @@ fn ide_picker_lists_matching_workspace_bridges() {
     );
 }
 
+#[tokio::test]
+async fn skills_picker_lists_discovered_skills() {
+    let root = temp_session_root("skills-picker");
+    write_test_file(&root.join(".claude/skills/review/SKILL.md"), "# Review\n");
+
+    let picker = repl_skills_picker_state(&root, None).await.unwrap();
+    let choice_list = build_command_choice_list(&picker);
+
+    assert_eq!(choice_list.title, "Skills");
+    assert_eq!(choice_list.items.len(), 1);
+    assert_eq!(choice_list.items[0].label, "/review");
+    match &picker.items[0].action {
+        ReplCommandPickerAction::PrefillInput { input, .. } => {
+            assert_eq!(input, "/review ");
+        }
+        other => panic!("unexpected picker action: {other:?}"),
+    }
+}
+
+#[test]
+fn agents_picker_includes_create_new_option() {
+    let root = temp_session_root("agents-picker");
+    let store = task_store_for(&root);
+    let mut task = TaskRecord::new("agent", "Review auth flow");
+    task.status = TaskStatus::Running;
+    store.create_task(task).unwrap();
+
+    let picker = repl_agents_picker_state(&root).unwrap();
+    let choice_list = build_command_choice_list(&picker);
+
+    assert_eq!(choice_list.title, "Agents");
+    assert_eq!(choice_list.items[0].label, "Create new agent");
+    assert_eq!(choice_list.items[1].label, "Review auth flow");
+}
+
+#[test]
+fn hooks_picker_lists_manifest_entries() {
+    let root = temp_session_root("hooks-picker");
+    write_test_file(
+        &root.join(".claude-plugin/plugin.json"),
+        r#"{
+              "name": "hook-tools",
+              "hooks": ["./hooks/pre_tool.json", { "postToolUse": true }]
+            }"#,
+    );
+
+    let picker = repl_hooks_picker_state(&root, None);
+    let choice_list = build_command_choice_list(&picker);
+
+    assert_eq!(choice_list.title, "Hooks");
+    assert_eq!(choice_list.items.len(), 2);
+    assert_eq!(choice_list.items[0].label, "hooks/pre_tool.json");
+    assert!(choice_list.items[1].label.contains("Inline hook config #2"));
+}
+
 #[test]
 fn message_actions_show_expand_and_collapse_for_history_groups() {
     let session_id = SessionId::new_v4();

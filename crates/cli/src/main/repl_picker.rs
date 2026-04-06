@@ -66,6 +66,38 @@ struct ReplIdePickerState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum ReplCommandPickerAction {
+    Status {
+        status: String,
+        banner: Option<String>,
+    },
+    PrefillInput {
+        input: String,
+        status: String,
+        banner: Option<String>,
+    },
+    QueueInput {
+        input: String,
+        status: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplCommandPickerEntry {
+    item: ChoiceListItem,
+    action: ReplCommandPickerAction,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ReplCommandPickerState {
+    title: String,
+    subtitle: Option<String>,
+    items: Vec<ReplCommandPickerEntry>,
+    selected: usize,
+    empty_message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ReplFilePickerToken {
     start: usize,
     end: usize,
@@ -389,6 +421,310 @@ fn build_ide_choice_list(
             "No IDE bridge detected for this workspace. Start a supported IDE with the Claude extension first."
                 .to_owned(),
         ),
+    }
+}
+
+fn build_command_choice_list(picker: &ReplCommandPickerState) -> ChoiceListState {
+    ChoiceListState {
+        title: picker.title.clone(),
+        subtitle: picker.subtitle.clone(),
+        items: picker.items.iter().map(|entry| entry.item.clone()).collect(),
+        selected: picker.selected.min(picker.items.len().saturating_sub(1)),
+        empty_message: picker.empty_message.clone(),
+    }
+}
+
+fn repl_theme_picker_state() -> ReplCommandPickerState {
+    let rust_theme_note =
+        "Rust UI currently follows your terminal colors instead of persisting TS theme presets."
+            .to_owned();
+    let items = vec![
+        (
+            "Auto (match terminal)",
+            "Follow your terminal palette automatically.",
+        ),
+        ("Dark mode", "Use the default dark Claude Code palette."),
+        ("Light mode", "Use the default light Claude Code palette."),
+        (
+            "Dark mode (colorblind-friendly)",
+            "Dark palette adjusted for colorblind accessibility.",
+        ),
+        (
+            "Light mode (colorblind-friendly)",
+            "Light palette adjusted for colorblind accessibility.",
+        ),
+        (
+            "Dark mode (ANSI colors only)",
+            "Dark palette restricted to ANSI-safe colors.",
+        ),
+        (
+            "Light mode (ANSI colors only)",
+            "Light palette restricted to ANSI-safe colors.",
+        ),
+    ]
+    .into_iter()
+    .map(|(label, detail)| ReplCommandPickerEntry {
+        item: ChoiceListItem {
+            label: label.to_owned(),
+            detail: Some(detail.to_owned()),
+            secondary: Some(rust_theme_note.clone()),
+        },
+        action: ReplCommandPickerAction::Status {
+            status: format!("{label} is not persisted yet; the Rust UI keeps your terminal theme."),
+            banner: Some(rust_theme_note.clone()),
+        },
+    })
+    .collect();
+
+    ReplCommandPickerState {
+        title: "Theme".to_owned(),
+        subtitle: Some("Enter to inspect parity notes · Esc to close".to_owned()),
+        items,
+        selected: 0,
+        empty_message: Some("No theme presets available.".to_owned()),
+    }
+}
+
+fn skill_entry_source_label(entry: &ccrust_plugins::SkillEntry, cwd: &Path) -> String {
+    match entry.source {
+        ccrust_plugins::SkillSource::Manifest => "plugin".to_owned(),
+        ccrust_plugins::SkillSource::LegacyCommandsDir => {
+            if entry.path.starts_with(claude_config_home_dir()) {
+                "user command".to_owned()
+            } else if entry.path.starts_with(cwd) {
+                "project command".to_owned()
+            } else {
+                "command".to_owned()
+            }
+        }
+        ccrust_plugins::SkillSource::LegacySkillsDir => {
+            if entry.path.starts_with(claude_config_home_dir()) {
+                "user skill".to_owned()
+            } else if entry.path.starts_with(cwd) {
+                "project skill".to_owned()
+            } else {
+                "skill".to_owned()
+            }
+        }
+    }
+}
+
+async fn repl_skills_picker_state(
+    cwd: &Path,
+    plugin_root: Option<&PathBuf>,
+) -> Result<ReplCommandPickerState> {
+    let skills = resolved_skill_entries(cwd, plugin_root).await?;
+    let items = skills
+        .into_iter()
+        .map(|entry| {
+            let source = skill_entry_source_label(&entry, cwd);
+            let path = preview_lines_from_text(entry.path.display().to_string(), 1, 72).join(" ");
+            ReplCommandPickerEntry {
+                item: ChoiceListItem {
+                    label: format!("/{}", entry.name),
+                    detail: Some(source.clone()),
+                    secondary: Some(path),
+                },
+                action: ReplCommandPickerAction::PrefillInput {
+                    input: format!("/{} ", entry.name),
+                    status: format!("Inserted /{}", entry.name),
+                    banner: None,
+                },
+            }
+        })
+        .collect();
+
+    Ok(ReplCommandPickerState {
+        title: "Skills".to_owned(),
+        subtitle: Some("Enter to insert · Esc to close".to_owned()),
+        items,
+        selected: 0,
+        empty_message: Some(
+            "No skills found. Create skills in .claude/skills/ or ~/.claude/skills/."
+                .to_owned(),
+        ),
+    })
+}
+
+fn is_agent_task_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "agent"
+            | "workflow"
+            | "workflow_step"
+            | "coordinator"
+            | "assistant_worker"
+            | "assistant_synthesis"
+    )
+}
+
+fn short_task_id(task_id: uuid::Uuid) -> String {
+    task_id
+        .to_string()
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn task_status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "pending",
+        TaskStatus::Running => "running",
+        TaskStatus::WaitingForInput => "waiting",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn repl_agents_picker_state(cwd: &Path) -> Result<ReplCommandPickerState> {
+    let mut tasks = task_store_for(cwd)
+        .list_tasks()?
+        .into_iter()
+        .filter(|task| is_agent_task_kind(task.kind.as_str()))
+        .collect::<Vec<_>>();
+    tasks.sort_by(|left, right| {
+        right
+            .updated_at_unix_ms
+            .cmp(&left.updated_at_unix_ms)
+            .then_with(|| left.title.cmp(&right.title))
+    });
+
+    let mut items = vec![ReplCommandPickerEntry {
+        item: ChoiceListItem {
+            label: "Create new agent".to_owned(),
+            detail: Some("Start a delegated task".to_owned()),
+            secondary: Some("Prefill /agents create".to_owned()),
+        },
+        action: ReplCommandPickerAction::PrefillInput {
+            input: "/agents create ".to_owned(),
+            status: "Enter a title for the new agent task".to_owned(),
+            banner: None,
+        },
+    }];
+
+    items.extend(tasks.into_iter().map(|task| ReplCommandPickerEntry {
+        item: ChoiceListItem {
+            label: if task.title.trim().is_empty() {
+                format!("agent {}", short_task_id(task.id))
+            } else {
+                task.title.clone()
+            },
+            detail: Some(format!(
+                "{} · {} · {}",
+                task_status_label(task.status.clone()),
+                task.kind,
+                short_task_id(task.id)
+            )),
+            secondary: task
+                .output
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| preview_lines_from_text(value.to_owned(), 1, 72).join(" "))
+                .or_else(|| {
+                    task.transcript_path.as_ref().map(|path| {
+                        preview_lines_from_text(path.display().to_string(), 1, 72).join(" ")
+                    })
+                }),
+        },
+        action: ReplCommandPickerAction::QueueInput {
+            input: format!("/agents get {}", task.id),
+            status: format!("Loading agent {}", short_task_id(task.id)),
+        },
+    }));
+
+    Ok(ReplCommandPickerState {
+        title: "Agents".to_owned(),
+        subtitle: Some("Enter to inspect · Esc to close".to_owned()),
+        items,
+        selected: 0,
+        empty_message: Some("No agents found for this workspace yet.".to_owned()),
+    })
+}
+
+fn hook_picker_entries(root: &Path, hooks: &Value) -> Vec<ReplCommandPickerEntry> {
+    match hooks {
+        Value::String(path) => vec![ReplCommandPickerEntry {
+            item: ChoiceListItem {
+                label: path.trim_start_matches("./").to_owned(),
+                detail: Some("Hook config".to_owned()),
+                secondary: Some(root.join(path.trim_start_matches("./")).display().to_string()),
+            },
+            action: ReplCommandPickerAction::Status {
+                status: format!("Hook config: {}", path.trim_start_matches("./")),
+                banner: None,
+            },
+        }],
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .flat_map(|(index, entry)| match entry {
+                Value::String(path) => vec![ReplCommandPickerEntry {
+                    item: ChoiceListItem {
+                        label: path.trim_start_matches("./").to_owned(),
+                        detail: Some(format!("Hook config #{}", index + 1)),
+                        secondary: Some(
+                            root.join(path.trim_start_matches("./")).display().to_string(),
+                        ),
+                    },
+                    action: ReplCommandPickerAction::Status {
+                        status: format!("Hook config: {}", path.trim_start_matches("./")),
+                        banner: None,
+                    },
+                }],
+                Value::Object(map) => vec![ReplCommandPickerEntry {
+                    item: ChoiceListItem {
+                        label: format!("Inline hook config #{}", index + 1),
+                        detail: Some(format!("{} top-level key(s)", map.len())),
+                        secondary: Some(map.keys().cloned().collect::<Vec<_>>().join(", ")),
+                    },
+                    action: ReplCommandPickerAction::Status {
+                        status: format!("Inline hook config #{}", index + 1),
+                        banner: None,
+                    },
+                }],
+                other => vec![ReplCommandPickerEntry {
+                    item: ChoiceListItem {
+                        label: format!("Hook entry #{}", index + 1),
+                        detail: Some("Unsupported hook entry shape".to_owned()),
+                        secondary: Some(preview_lines_from_text(other.to_string(), 1, 72).join(" ")),
+                    },
+                    action: ReplCommandPickerAction::Status {
+                        status: format!("Hook entry #{}", index + 1),
+                        banner: None,
+                    },
+                }],
+            })
+            .collect(),
+        Value::Object(map) => vec![ReplCommandPickerEntry {
+            item: ChoiceListItem {
+                label: "Inline hook config".to_owned(),
+                detail: Some(format!("{} top-level key(s)", map.len())),
+                secondary: Some(map.keys().cloned().collect::<Vec<_>>().join(", ")),
+            },
+            action: ReplCommandPickerAction::Status {
+                status: "Inline hook configuration loaded".to_owned(),
+                banner: None,
+            },
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn repl_hooks_picker_state(cwd: &Path, plugin_root: Option<&PathBuf>) -> ReplCommandPickerState {
+    let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
+    let items = load_plugin_manifest_sync(&root)
+        .and_then(|manifest| manifest.hooks)
+        .map(|hooks| hook_picker_entries(&root, &hooks))
+        .unwrap_or_default();
+
+    ReplCommandPickerState {
+        title: "Hooks".to_owned(),
+        subtitle: Some("Read-only hook configuration overview · Esc to close".to_owned()),
+        items,
+        selected: 0,
+        empty_message: Some("No hook configuration found for this workspace.".to_owned()),
     }
 }
 

@@ -50,27 +50,6 @@ pub(crate) async fn resolved_dynamic_commands(
     commands
 }
 
-pub(crate) fn command_report(spec: &CommandSpec) -> CommandReport {
-    CommandReport {
-        name: spec.name.clone(),
-        description: spec.description.clone(),
-        source: match spec.source {
-            CommandSource::BuiltIn => "builtin",
-            CommandSource::Plugin => "plugin",
-            CommandSource::Skill => "skill",
-            CommandSource::Workflow => "workflow",
-        }
-        .to_owned(),
-        category: format!("{:?}", spec.category),
-        kind: format!("{:?}", spec.kind),
-        aliases: spec.aliases.clone(),
-        remote_safe: spec.remote_safe,
-        bridge_safe: spec.bridge_safe,
-        requires_provider: spec.requires_provider,
-        origin: spec.origin.clone(),
-    }
-}
-
 pub(crate) async fn resolved_command_registry(
     cwd: &Path,
     plugin_root: Option<&PathBuf>,
