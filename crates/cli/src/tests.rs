@@ -13,14 +13,15 @@ use super::{
     prompt_file_picker_choice_list, prompt_history_from_messages, prompt_history_search_matches,
     prompt_selection_text, render_auth_command_with_resume, render_ide_command_with_home,
     render_remote_control_command, repl_ide_picker_state_with_home, repl_shortcut_action_for_key,
-    resolve_continue_target, resolve_prompt_command_prompt, resolved_command_registry,
-    resumable_sessions, resume_hint_text, should_echo_command_result_in_footer, should_exit_repl,
+    resolve_continue_target, resolve_launch_provider, resolve_prompt_command_prompt,
+    resolved_command_registry, resumable_sessions, resume_hint_text,
+    should_echo_command_result_in_footer, should_exit_repl, should_launch_interactive_repl,
     step_prompt_history_search_match, sync_prompt_history_search_preview, task_entries_for_ui,
     toggle_all_history_transcript_groups, toggle_pending_repl_transcript_details,
-    ActiveSessionStore, Cli, LocalBridgeHandler, Message, MessageRole, PendingReplStep,
-    PendingReplView, PromptSelectionMove, ReplInteractionState, ReplMessageActionState,
-    ReplSessionState, ReplShortcutAction, ReplTranscriptSearchState, ResumePickerState,
-    ResumeTargetHint, StartupPreferences, StartupScreen,
+    ActiveSessionStore, Cli, LaunchProviderSource, LocalBridgeHandler, Message, MessageRole,
+    PendingReplStep, PendingReplView, PromptSelectionMove, ReplInteractionState,
+    ReplMessageActionState, ReplSessionState, ReplShortcutAction, ReplTranscriptSearchState,
+    ResumePickerState, ResumeTargetHint, StartupPreferences, StartupScreen,
 };
 use crate::commands::should_enable_mouse_capture;
 use code_agent_bridge::{
@@ -146,6 +147,40 @@ fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
     match value {
         Some(value) => env::set_var(key, value),
         None => env::remove_var(key),
+    }
+    let result = f();
+    drop(restore);
+    result
+}
+
+fn with_env_vars<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+    struct EnvVarsGuard {
+        previous: Vec<(String, Option<String>)>,
+    }
+
+    impl Drop for EnvVarsGuard {
+        fn drop(&mut self) {
+            for (key, previous) in self.previous.iter().rev() {
+                match previous {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    let restore = EnvVarsGuard {
+        previous: vars
+            .iter()
+            .map(|(key, _)| ((*key).to_owned(), env::var(key).ok()))
+            .collect(),
+    };
+    for (key, value) in vars {
+        match value {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
     }
     let result = f();
     drop(restore);

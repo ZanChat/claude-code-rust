@@ -36,7 +36,7 @@ fn builtin_commands_are_wired_for_repl_and_noninteractive_handlers() {
 }
 
 #[test]
-fn startup_screens_cover_first_run_and_project_setup() {
+fn startup_screens_show_provider_onboarding_when_provider_is_missing() {
     let root = temp_session_root("startup-first-run");
     let session_root = root.join(".sessions");
     fs::create_dir_all(&session_root).unwrap();
@@ -49,24 +49,23 @@ fn startup_screens_cover_first_run_and_project_setup() {
         &session_root,
         None,
         true,
+        false,
         Some("codex_auth_token"),
         &StartupPreferences::default(),
     );
 
-    assert_eq!(screens.len(), 2);
-    assert_eq!(screens[0].title, "Welcome");
+    assert_eq!(screens.len(), 1);
+    assert_eq!(screens[0].title, "Onboarding");
+    assert!(screens[0].choice_list.is_some());
+    assert!(!screens[0].show_input);
     assert!(screens[0]
         .body
         .iter()
-        .any(|line| line.contains("ratatui runtime")));
-    assert!(screens[1]
-        .body
-        .iter()
-        .any(|line| line.contains("CLAUDE.md") || line.contains("workspace is empty")));
+        .any(|line| line.contains("Select the provider")));
 }
 
 #[test]
-fn startup_screens_skip_completed_workspace() {
+fn startup_screens_skip_when_provider_is_ready() {
     let root = temp_session_root("startup-complete");
     let session_root = root.join(".sessions");
     fs::create_dir_all(&session_root).unwrap();
@@ -80,8 +79,12 @@ fn startup_screens_skip_completed_workspace() {
         &session_root,
         None,
         true,
+        true,
         Some("codex_auth_token"),
-        &StartupPreferences { welcome_seen: true },
+        &StartupPreferences {
+            welcome_seen: true,
+            selected_provider: None,
+        },
     );
 
     assert!(screens.is_empty());
@@ -101,6 +104,7 @@ fn startup_screens_skip_resumed_sessions() {
         &session_root,
         Some(&session_root.join("existing.jsonl")),
         true,
+        false,
         Some("codex_auth_token"),
         &StartupPreferences::default(),
     );
@@ -118,6 +122,13 @@ fn startup_ui_state_shows_prompt_and_scroll_state() {
             title: "Next".to_owned(),
             lines: vec!["step".to_owned()],
         },
+        choice_list: None,
+        provider_configured: true,
+        show_input: true,
+        prompt_helper: Some("Type to enter the REPL immediately. Enter also continues.".to_owned()),
+        compact_banner: Some(
+            "Type to start the REPL now, or Enter for the next screen.".to_owned(),
+        ),
     }];
 
     let state = build_startup_ui_state(
@@ -126,8 +137,9 @@ fn startup_ui_state_shows_prompt_and_scroll_state() {
         DEFAULT_OPENAI_REASONING_MODEL,
         SessionId::new_v4(),
         Path::new("/tmp/project"),
-        &screens,
+        &screens[0],
         0,
+        screens.len(),
         2,
     );
 
@@ -142,6 +154,47 @@ fn startup_ui_state_shows_prompt_and_scroll_state() {
         .header_context
         .as_deref()
         .is_some_and(|value| value.contains("/tmp/project")));
+}
+
+#[test]
+fn resolve_launch_provider_prefers_saved_provider_when_flags_are_missing() {
+    let selection = resolve_launch_provider(
+        None,
+        &StartupPreferences {
+            welcome_seen: false,
+            selected_provider: Some(ApiProvider::OpenAI),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(selection.provider, ApiProvider::OpenAI);
+    assert!(selection.configured);
+    assert_eq!(selection.source, LaunchProviderSource::Preference);
+}
+
+#[test]
+fn resolve_launch_provider_uses_default_when_nothing_is_configured() {
+    let selection = with_env_vars(
+        &[
+            ("CLAUDE_CODE_API_PROVIDER", None),
+            ("CLAUDE_CODE_USE_BEDROCK", None),
+            ("CLAUDE_CODE_USE_VERTEX", None),
+            ("CLAUDE_CODE_USE_FOUNDRY", None),
+        ],
+        || resolve_launch_provider(None, &StartupPreferences::default()),
+    )
+    .unwrap();
+
+    assert_eq!(selection.provider, ApiProvider::FirstParty);
+    assert!(!selection.configured);
+    assert_eq!(selection.source, LaunchProviderSource::Default);
+}
+
+#[test]
+fn bare_launch_defaults_to_interactive_repl() {
+    let cli = Cli::default();
+    assert!(should_launch_interactive_repl(&cli, None));
+    assert!(!should_launch_interactive_repl(&cli, Some("hello")));
 }
 
 #[test]

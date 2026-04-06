@@ -45,12 +45,15 @@ pub(crate) async fn run_interactive_repl(
     session_id: SessionId,
     raw_messages: &mut Vec<Message>,
     live_runtime: bool,
-    auth_source: Option<String>,
     transcript_path: Option<PathBuf>,
+    provider_configured: bool,
+    persist_selected_provider: bool,
     remote_mode: bool,
     ide_bridge_active: bool,
 ) -> Result<SessionId> {
+    let mut provider = provider;
     let mut active_model = active_model;
+    let mut live_runtime = live_runtime;
     let mut repl_session = ReplSessionState {
         session_id,
         transcript_path,
@@ -82,12 +85,13 @@ pub(crate) async fn run_interactive_repl(
         store.root_dir(),
         repl_session.transcript_path.as_deref(),
         live_runtime,
-        auth_source.as_deref(),
+        provider_configured,
+        None,
         &startup_preferences,
     );
     let mut initial_input_buffer = code_agent_ui::InputBuffer::new();
     if !startup_screens.is_empty() {
-        initial_input_buffer = run_startup_flow(
+        let startup_result = run_startup_flow(
             &mut terminal,
             provider,
             &active_model,
@@ -95,10 +99,30 @@ pub(crate) async fn run_interactive_repl(
             &cwd,
             &startup_screens,
         )?;
-        if !startup_preferences.welcome_seen {
-            startup_preferences.welcome_seen = true;
+        initial_input_buffer = startup_result.input_buffer;
+        provider = startup_result.provider;
+        if persist_selected_provider
+            && startup_preferences.selected_provider != Some(startup_result.provider)
+        {
+            startup_preferences.selected_provider = Some(startup_result.provider);
             save_startup_preferences(&startup_preferences)?;
         }
+        if compatibility_model_catalog(provider)
+            .get_model(&active_model)
+            .is_none()
+        {
+            if let Some(default_model) = default_model_for_provider(provider) {
+                active_model = default_model;
+            }
+        }
+        let auth = EnvironmentAuthResolver
+            .resolve_auth(AuthRequest {
+                provider,
+                profile: None,
+            })
+            .await
+            .ok();
+        live_runtime = auth.is_some() && provider_supports_live_runtime(provider);
     }
 
     let loop_result = async {

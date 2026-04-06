@@ -449,7 +449,10 @@ async fn load_plugin_report(root: PathBuf) -> Result<PluginReport> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let mut cli = parse_cli();
-    let provider = resolve_api_provider(cli.provider.as_deref())?;
+    let startup_preferences = load_startup_preferences();
+    let provider_selection =
+        resolve_launch_provider(cli.provider.as_deref(), &startup_preferences)?;
+    let provider = provider_selection.provider;
     let cwd = env::current_dir()?;
     let project_dir = get_project_dir(&cwd);
     let prompt = (!cli.prompt.is_empty()).then(|| cli.prompt.join(" "));
@@ -641,7 +644,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    if cli.repl {
+    if should_launch_interactive_repl(&cli, prompt.as_deref()) {
         if existing_messages.is_empty() && transcript_path.is_some() {
             existing_messages = store.load_session(session_id).await.unwrap_or_default();
         }
@@ -656,8 +659,12 @@ async fn main() -> Result<()> {
             session_id,
             &mut existing_messages,
             live_runtime,
-            auth_source.clone(),
             transcript_path.clone(),
+            provider_selection.configured,
+            matches!(
+                provider_selection.source,
+                LaunchProviderSource::Default | LaunchProviderSource::Preference
+            ),
             remote_mode_enabled(&cli),
             ide_bridge_enabled(&cli),
         )
@@ -784,3 +791,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn should_launch_interactive_repl(cli: &Cli, prompt: Option<&str>) -> bool {
+    cli.repl || (!cli.tui && prompt.is_none())
+}
