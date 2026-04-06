@@ -28,7 +28,7 @@ cargo install --path crates/cli --locked --force
 ccrust --version
 
 # Interactive REPL
-ccrust --repl
+ccrust
 
 # Non-interactive prompt
 ccrust 'Refactor the auth logic in src/auth.rs'
@@ -40,10 +40,10 @@ ccrust 'Refactor the auth logic in src/auth.rs'
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-api..."
-ccrust --repl
+ccrust
 ```
 
-### 2. OpenAI
+### 2. OpenAI-Compatible
 
 For OpenAI-family providers, the agent uses a dual-model architecture matching the original TS implementation:
 - reasoning model: `REASONING_MODEL` (default `gpt-5.4`) for thinking-enabled turns
@@ -53,46 +53,48 @@ The agent automatically selects the appropriate model per request based on wheth
 
 ```bash
 export OPENAI_API_KEY="sk-..."
-ccrust --provider openai --repl
+ccrust --provider openai-compatible
 ```
 
-### 3. OpenAI-Compatible Providers
+Official OpenAI uses the same `openai-compatible` provider mode and defaults to `https://api.openai.com/v1` when `OPENAI_BASE_URL` is unset. The legacy `openai` provider name is still accepted as an alias for compatibility.
+
+For other OpenAI-compatible APIs:
 
 ```bash
 export OPENAI_API_KEY="your-custom-token"
 export OPENAI_BASE_URL="https://api.yourprovider.com/v1"
-ccrust --provider openai-compatible --repl
+ccrust --provider openai-compatible
 ```
 
-### 4. ChatGPT Codex
+### 3. ChatGPT Codex
 
 Uses `~/.codex/auth.json` for authentication with automatic token refresh:
 
 ```bash
-ccrust --provider chatgpt-codex --repl
+ccrust --provider chatgpt-codex
 ```
 
-### 5. Amazon Bedrock
+### 4. Amazon Bedrock
 
 ```bash
 export AWS_ACCESS_KEY_ID="..."
 export AWS_SECRET_ACCESS_KEY="..."
 export AWS_REGION="us-east-1"
-ccrust --provider bedrock --repl
+ccrust --provider bedrock
 ```
 
-### 6. Google Cloud Vertex AI
+### 5. Google Cloud Vertex AI
 
 ```bash
 export VERTEX_ACCESS_TOKEN="..."
-ccrust --provider vertex --repl
+ccrust --provider vertex
 ```
 
-### 7. Azure AI Foundry
+### 6. Azure AI Foundry
 
 ```bash
 export ANTHROPIC_FOUNDRY_API_KEY="..."
-ccrust --provider foundry --repl
+ccrust --provider foundry
 ```
 
 ## Environment Variables Reference
@@ -101,7 +103,7 @@ ccrust --provider foundry --repl
 
 | Variable | Description | Default |
 |---|---|---|
-| `CLAUDE_CODE_API_PROVIDER` | Override the active provider (`firstParty`, `openai`, `chatgpt-codex`, `openai-compatible`, `bedrock`, `vertex`, `foundry`) | `firstParty` |
+| `CLAUDE_CODE_API_PROVIDER` | Override the active provider (`firstParty`, `openai-compatible`, `chatgpt-codex`, `bedrock`, `vertex`, `foundry`). `openai` is accepted as a legacy alias for `openai-compatible`. | `firstParty` |
 
 ### Authentication
 

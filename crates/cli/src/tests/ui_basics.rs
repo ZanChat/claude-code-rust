@@ -162,12 +162,12 @@ fn resolve_launch_provider_prefers_saved_provider_when_flags_are_missing() {
         None,
         &StartupPreferences {
             welcome_seen: false,
-            selected_provider: Some(ApiProvider::OpenAI),
+            selected_provider: Some(ApiProvider::OpenAICompatible),
         },
     )
     .unwrap();
 
-    assert_eq!(selection.provider, ApiProvider::OpenAI);
+    assert_eq!(selection.provider, ApiProvider::OpenAICompatible);
     assert!(selection.configured);
     assert_eq!(selection.source, LaunchProviderSource::Preference);
 }

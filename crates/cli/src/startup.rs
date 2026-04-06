@@ -120,13 +120,6 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
-fn env_var_present(name: &str) -> bool {
-    env::var(name)
-        .ok()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-}
-
 pub(crate) fn resolve_launch_provider(
     explicit: Option<&str>,
     preferences: &StartupPreferences,
@@ -204,21 +197,6 @@ fn provider_auth_status(provider: ApiProvider) -> (bool, Option<String>) {
                 auth.and_then(|material| material.source.filter(|value| !value.trim().is_empty())),
             )
         }
-        ApiProvider::OpenAI => {
-            let status = get_openai_auth_status(provider);
-            if status.has_credentials {
-                return (
-                    true,
-                    Some(openai_auth_source_label(status.source).to_owned()),
-                );
-            }
-            let snapshot = read_provider_auth_snapshot(provider);
-            (
-                snapshot.is_some(),
-                snapshot
-                    .and_then(|material| material.source.filter(|value| !value.trim().is_empty())),
-            )
-        }
         ApiProvider::ChatGPTCodex => {
             let status = get_openai_auth_status(provider);
             if status.has_credentials && status.source == OpenAIAuthSource::CodexAuthToken {
@@ -241,20 +219,13 @@ fn provider_auth_status(provider: ApiProvider) -> (bool, Option<String>) {
         }
         ApiProvider::OpenAICompatible => {
             let status = get_openai_auth_status(provider);
-            let has_key = status.has_credentials
-                && matches!(
-                    status.source,
-                    OpenAIAuthSource::OpenAiApiKey | OpenAIAuthSource::CodexAuthApiKey
-                );
-            let has_base_url = env_var_present("OPENAI_BASE_URL");
-            if has_key && has_base_url {
+            if status.has_credentials {
                 return (
                     true,
                     Some(openai_auth_source_label(status.source).to_owned()),
                 );
             }
-            let snapshot = read_provider_auth_snapshot(provider)
-                .filter(|material| material.api_key.is_some() && has_base_url);
+            let snapshot = read_provider_auth_snapshot(provider);
             (
                 snapshot.is_some(),
                 snapshot

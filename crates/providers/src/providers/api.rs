@@ -10,22 +10,19 @@ pub enum ApiProvider {
     Vertex,
     #[serde(rename = "foundry")]
     Foundry,
-    #[serde(rename = "openai")]
-    OpenAI,
     #[serde(rename = "chatgpt-codex")]
     ChatGPTCodex,
-    #[serde(rename = "openai-compatible")]
+    #[serde(rename = "openai-compatible", alias = "openai")]
     OpenAICompatible,
 }
 
 
 impl ApiProvider {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::FirstParty,
         Self::Bedrock,
         Self::Vertex,
         Self::Foundry,
-        Self::OpenAI,
         Self::ChatGPTCodex,
         Self::OpenAICompatible,
     ];
@@ -36,7 +33,6 @@ impl ApiProvider {
             Self::Bedrock => "bedrock",
             Self::Vertex => "vertex",
             Self::Foundry => "foundry",
-            Self::OpenAI => "openai",
             Self::ChatGPTCodex => "chatgpt-codex",
             Self::OpenAICompatible => "openai-compatible",
         }
@@ -58,7 +54,7 @@ impl FromStr for ApiProvider {
             "bedrock" => Ok(Self::Bedrock),
             "vertex" => Ok(Self::Vertex),
             "foundry" => Ok(Self::Foundry),
-            "openai" => Ok(Self::OpenAI),
+            "openai" => Ok(Self::OpenAICompatible),
             "chatgpt-codex" => Ok(Self::ChatGPTCodex),
             "openai-compatible" => Ok(Self::OpenAICompatible),
             other => Err(anyhow!("unsupported provider: {other}")),

@@ -28,6 +28,8 @@ use hmac::Mac;
 
 use sha2::{Digest, Sha256};
 
+const OFFICIAL_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
 #[derive(Clone, Debug)]
 pub struct HttpProvider {
     provider: ApiProvider,
@@ -624,9 +626,7 @@ impl Provider for HttpProvider {
     async fn start_stream(&self, request: ProviderRequest) -> Result<Box<dyn ProviderStream>> {
         match self.provider {
             ApiProvider::FirstParty => self.start_anthropic_stream(request).await,
-            ApiProvider::OpenAI | ApiProvider::OpenAICompatible => {
-                self.start_openai_responses_stream(request).await
-            }
+            ApiProvider::OpenAICompatible => self.start_openai_responses_stream(request).await,
             ApiProvider::ChatGPTCodex => self.start_chatgpt_codex_stream(request).await,
             ApiProvider::Bedrock => self.start_bedrock_stream(request).await,
             ApiProvider::Vertex => self.start_vertex_stream(request).await,
@@ -639,11 +639,12 @@ pub fn provider_base_url(provider: ApiProvider) -> String {
     match provider {
         ApiProvider::FirstParty => env::var("ANTHROPIC_BASE_URL")
             .unwrap_or_else(|_| "https://api.anthropic.com".to_owned()),
-        ApiProvider::OpenAI => "https://api.openai.com/v1".to_owned(),
         ApiProvider::ChatGPTCodex => CHATGPT_CODEX_BASE_URL.to_owned(),
         ApiProvider::OpenAICompatible => env::var("OPENAI_BASE_URL")
-            .map(|value| value.trim_end_matches('/').to_owned())
-            .unwrap_or_else(|_| "https://openai-compatible.invalid".to_owned()),
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| OFFICIAL_OPENAI_BASE_URL.to_owned()),
         ApiProvider::Bedrock => env_value(["ANTHROPIC_BEDROCK_BASE_URL", "BEDROCK_BASE_URL"])
             .unwrap_or_else(|| format!("https://bedrock-runtime.{}.amazonaws.com", bedrock_region())),
         ApiProvider::Vertex => env_value(["ANTHROPIC_VERTEX_BASE_URL", "VERTEX_BASE_URL"]).unwrap_or_else(
@@ -662,6 +663,10 @@ pub fn provider_base_url(provider: ApiProvider) -> String {
             })
             .unwrap_or_else(|| "https://foundry.unconfigured.local/anthropic".to_owned()),
     }
+}
+
+pub(crate) fn openai_compatible_uses_official_base_url() -> bool {
+    provider_base_url(ApiProvider::OpenAICompatible) == OFFICIAL_OPENAI_BASE_URL
 }
 
 pub(crate) fn build_anthropic_payload(
@@ -967,10 +972,9 @@ pub(crate) fn resolve_provider_model(provider: ApiProvider, model: &str) -> Stri
         }
         ApiProvider::Vertex if normalized.contains('@') => normalized,
         ApiProvider::Foundry if !normalized.starts_with("claude-") => normalized,
-        ApiProvider::FirstParty
-        | ApiProvider::OpenAI
-        | ApiProvider::ChatGPTCodex
-        | ApiProvider::OpenAICompatible => normalized,
+        ApiProvider::FirstParty | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
+            normalized
+        }
         ApiProvider::Bedrock => match normalized {
             "claude-3-7-sonnet-20250219" => "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
             "claude-3-5-sonnet-20241022" => "anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -1088,7 +1092,7 @@ pub(crate) fn openai_request_failure_label(provider: ApiProvider) -> &'static st
     match provider {
         ApiProvider::ChatGPTCodex => "ChatGPT Codex",
         ApiProvider::OpenAICompatible => "OpenAI-compatible",
-        _ => "OpenAI",
+        _ => "OpenAI-compatible",
     }
 }
 

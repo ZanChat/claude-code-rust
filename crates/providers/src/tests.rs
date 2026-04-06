@@ -198,7 +198,7 @@ fn uses_codex_home_for_auth_path() {
 fn detects_openai_api_key_auth() {
     with_env_lock(|| {
         with_env_var("OPENAI_API_KEY", Some("test-key"), || {
-            let status = get_openai_auth_status(ApiProvider::OpenAI);
+            let status = get_openai_auth_status(ApiProvider::OpenAICompatible);
             assert_eq!(status.source, OpenAIAuthSource::OpenAiApiKey);
             assert!(status.has_credentials);
         });
@@ -335,8 +335,8 @@ fn reports_config_migration_inputs() {
     with_env_lock(|| {
         with_env_var("CLAUDE_CODE_API_PROVIDER", Some("openai"), || {
             with_env_var("OPENAI_API_KEY", Some("test-key"), || {
-                let report = super::config_migration_report(ApiProvider::OpenAI);
-                assert_eq!(report.provider, ApiProvider::OpenAI);
+                let report = super::config_migration_report(ApiProvider::OpenAICompatible);
+                assert_eq!(report.provider, ApiProvider::OpenAICompatible);
                 assert_eq!(
                     report.env.get("CLAUDE_CODE_API_PROVIDER"),
                     Some(&"openai".to_owned())
@@ -359,7 +359,7 @@ fn openai_provider_hint_mentions_expected_setup() {
 #[test]
 fn exposes_provider_descriptors_and_model_catalogs() {
     let descriptor = provider_descriptor(ApiProvider::Foundry);
-    let catalog = compatibility_model_catalog(ApiProvider::OpenAI);
+    let catalog = compatibility_model_catalog(ApiProvider::OpenAICompatible);
 
     assert_eq!(descriptor.display_name, "Microsoft Foundry");
     assert!(descriptor.supports_tool_use);
@@ -421,7 +421,7 @@ async fn resolves_auth_from_environment() {
     let resolver = EnvironmentAuthResolver;
     let auth = resolver
         .resolve_auth(AuthRequest {
-            provider: ApiProvider::OpenAI,
+            provider: ApiProvider::OpenAICompatible,
             profile: None,
         })
         .await
@@ -437,7 +437,7 @@ async fn resolves_auth_from_environment() {
 
 #[tokio::test]
 async fn streams_echo_provider_text() {
-    let provider = EchoProvider::new(ApiProvider::OpenAI);
+    let provider = EchoProvider::new(ApiProvider::OpenAICompatible);
     let request = ProviderRequest {
         model: DEFAULT_OPENAI_REASONING_MODEL.to_owned(),
         messages: vec![Message::new(
@@ -451,13 +451,13 @@ async fn streams_echo_provider_text() {
 
     let (text, usage) = collect_provider_text(&provider, request).await.unwrap();
 
-    assert!(text.contains("openai echo"));
+    assert!(text.contains("openai-compatible echo"));
     assert_eq!(usage.unwrap().input_tokens, 3);
 }
 
 #[tokio::test]
 async fn collects_tool_calls_from_provider_stream() {
-    let provider = EchoProvider::new(ApiProvider::OpenAI);
+    let provider = EchoProvider::new(ApiProvider::OpenAICompatible);
     let request = ProviderRequest {
         model: DEFAULT_OPENAI_REASONING_MODEL.to_owned(),
         messages: vec![Message::new(
@@ -649,14 +649,19 @@ fn extracts_error_message_from_detail_array() {
 #[test]
 fn uses_provider_specific_openai_base_urls() {
     with_env_lock(|| {
+        with_env_var("OPENAI_BASE_URL", None, || {
+            assert_eq!(
+                provider_base_url(ApiProvider::OpenAICompatible),
+                "https://api.openai.com/v1"
+            );
+        });
+    });
+
+    with_env_lock(|| {
         with_env_var(
             "OPENAI_BASE_URL",
             Some("https://compat.example/v1/"),
             || {
-                assert_eq!(
-                    provider_base_url(ApiProvider::OpenAI),
-                    "https://api.openai.com/v1"
-                );
                 assert_eq!(
                     provider_base_url(ApiProvider::ChatGPTCodex),
                     "https://chatgpt.com/backend-api"
@@ -775,7 +780,7 @@ async fn sends_openai_responses_requests() {
     }))
     .await;
     let provider = HttpProvider::with_base_url(
-        ApiProvider::OpenAI,
+        ApiProvider::OpenAICompatible,
         AuthMaterial {
             api_key: Some("openai-key".to_owned()),
             bearer_token: Some("openai-key".to_owned()),

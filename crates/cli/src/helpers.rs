@@ -92,7 +92,7 @@ pub(crate) fn session_preview(messages: &[Message]) -> Option<String> {
 pub(crate) fn auth_hint_for_provider(provider: ApiProvider) -> String {
     if matches!(
         provider,
-        ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible
+        ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible
     ) {
         get_openai_credential_hint(provider)
     } else {

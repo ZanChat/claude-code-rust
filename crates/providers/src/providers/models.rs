@@ -55,9 +55,8 @@ pub fn get_openai_credential_hint(provider: ApiProvider) -> String {
             "Run official 'codex login' so {} contains auth_mode=chatgpt and refreshable tokens.",
             codex_auth_file_path().display()
         ),
-        ApiProvider::OpenAICompatible => "Set OPENAI_API_KEY and OPENAI_BASE_URL.".to_owned(),
-        ApiProvider::OpenAI => format!(
-            "Set OPENAI_API_KEY or sign in with Codex so {} exists.",
+        ApiProvider::OpenAICompatible => format!(
+            "Set OPENAI_API_KEY. Optionally set OPENAI_BASE_URL for a non-OpenAI compatible endpoint. Codex auth in {} also works when OPENAI_BASE_URL targets the official OpenAI API.",
             codex_auth_file_path().display()
         ),
         _ => "Provider does not use OpenAI-family credentials.".to_owned(),
@@ -144,14 +143,6 @@ pub fn provider_descriptor(provider: ApiProvider) -> ProviderDescriptor {
             supports_reasoning: true,
             requires_cloud_auth: true,
         },
-        ApiProvider::OpenAI => ProviderDescriptor {
-            provider,
-            display_name: "OpenAI".to_owned(),
-            supports_streaming: true,
-            supports_tool_use: true,
-            supports_reasoning: true,
-            requires_cloud_auth: false,
-        },
         ApiProvider::ChatGPTCodex => ProviderDescriptor {
             provider,
             display_name: "ChatGPT Codex".to_owned(),
@@ -202,7 +193,7 @@ pub fn compatibility_models_for(provider: ApiProvider) -> Vec<ModelMetadata> {
                 supports_reasoning: false,
             },
         ],
-        ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
+        ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
             openai_family_compatibility_models(provider)
         }
     }
@@ -333,7 +324,7 @@ pub fn model_supports_thinking(model: &str, provider: ApiProvider) -> bool {
     let lower = model.to_lowercase();
     match provider {
         // OpenAI family always supports "thinking" via reasoning_effort
-        ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => true,
+        ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => true,
         // 1P and Foundry: all Claude 4+ models
         ApiProvider::FirstParty | ApiProvider::Foundry => !lower.contains("claude-3-"),
         // 3P (Bedrock / Vertex): only Opus 4+ and Sonnet 4+
@@ -346,7 +337,7 @@ pub fn model_supports_thinking(model: &str, provider: ApiProvider) -> bool {
 /// Check if a Claude model supports adaptive thinking (newer 4.6+ models).
 pub fn model_supports_adaptive_thinking(model: &str, provider: ApiProvider) -> bool {
     match provider {
-        ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => true,
+        ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => true,
         _ => {
             let lower = model.to_lowercase();
             if lower.contains("opus-4-6") || lower.contains("sonnet-4-6") {
@@ -416,7 +407,7 @@ pub fn resolve_active_model(
     }
 
     match provider {
-        ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
+        ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
             // OpenAI providers split between reasoning and completion models
             if thinking_enabled {
                 get_openai_reasoning_model()
@@ -474,4 +465,3 @@ pub async fn collect_provider_text(
     let collected = collect_provider_response(provider, request).await?;
     Ok((collected.text, collected.usage))
 }
-

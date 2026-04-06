@@ -84,7 +84,7 @@ impl Default for OpenAIAuthStatus {
 pub fn is_openai_provider(provider: ApiProvider) -> bool {
     matches!(
         provider,
-        ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible
+        ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible
     )
 }
 
@@ -102,7 +102,13 @@ pub fn read_auth_snapshot() -> Option<BTreeMap<String, AuthMaterial>> {
 }
 
 pub fn read_provider_auth_snapshot(provider: ApiProvider) -> Option<AuthMaterial> {
-    read_auth_snapshot()?.remove(provider.as_str())
+    let mut providers = read_auth_snapshot()?;
+    match provider {
+        ApiProvider::OpenAICompatible => providers
+            .remove(provider.as_str())
+            .or_else(|| providers.remove("openai")),
+        _ => providers.remove(provider.as_str()),
+    }
 }
 
 fn openai_auth_url() -> String {
@@ -379,7 +385,11 @@ pub fn get_openai_auth_status(provider: ApiProvider) -> OpenAIAuthStatus {
         .as_ref()
         .and_then(|entry| entry.tokens.as_ref())
         .and_then(|tokens| tokens.access_token.clone());
-    if access_token.is_some() && provider != ApiProvider::OpenAICompatible {
+    if access_token.is_some()
+        && (provider == ApiProvider::ChatGPTCodex
+            || (provider == ApiProvider::OpenAICompatible
+                && openai_compatible_uses_official_base_url()))
+    {
         return OpenAIAuthStatus {
             has_credentials: true,
             source: OpenAIAuthSource::CodexAuthToken,
@@ -400,4 +410,3 @@ pub fn get_openai_auth_status(provider: ApiProvider) -> OpenAIAuthStatus {
         ..OpenAIAuthStatus::default()
     }
 }
-

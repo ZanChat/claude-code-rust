@@ -884,7 +884,7 @@ async fn config_migrate_reports_compatibility_inputs() {
         &tool_registry,
         &root,
         None,
-        ApiProvider::OpenAI,
+        ApiProvider::OpenAICompatible,
         &mut active_model,
         &mut repl_session,
         &mut raw_messages,
@@ -896,7 +896,7 @@ async fn config_migrate_reports_compatibility_inputs() {
     .await
     .unwrap();
 
-    assert!(status.contains("\"provider\": \"openai\""));
+    assert!(status.contains("\"provider\": \"openai-compatible\""));
 }
 
 #[tokio::test]

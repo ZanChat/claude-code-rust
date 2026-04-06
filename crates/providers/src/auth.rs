@@ -102,7 +102,7 @@ pub enum OpenAITokenFreshness {
 impl AuthResolver for EnvironmentAuthResolver {
     async fn resolve_auth(&self, request: AuthRequest) -> Result<AuthMaterial> {
         match request.provider {
-            ApiProvider::OpenAI | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
+            ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
                 let status = get_openai_auth_status(request.provider);
                 if status.has_credentials {
                     let mut api_key = status.api_key.clone();
@@ -128,16 +128,16 @@ impl AuthResolver for EnvironmentAuthResolver {
                     if request.provider == ApiProvider::OpenAICompatible
                         && !matches!(
                             source,
-                            OpenAIAuthSource::OpenAiApiKey | OpenAIAuthSource::CodexAuthApiKey
+                            OpenAIAuthSource::OpenAiApiKey
+                                | OpenAIAuthSource::CodexAuthApiKey
+                                | OpenAIAuthSource::CodexAuthToken
                         )
                     {
                         return Err(anyhow!(get_openai_credential_hint(request.provider)));
                     }
                     if request.provider == ApiProvider::OpenAICompatible
-                        && env::var("OPENAI_BASE_URL")
-                            .ok()
-                            .map(|value| value.trim().is_empty())
-                            .unwrap_or(true)
+                        && source == OpenAIAuthSource::CodexAuthToken
+                        && !openai_compatible_uses_official_base_url()
                     {
                         return Err(anyhow!(get_openai_credential_hint(request.provider)));
                     }
@@ -200,7 +200,12 @@ pub fn clear_auth_snapshot(provider: ApiProvider) -> Result<bool> {
         return Ok(false);
     }
     let mut providers = read_auth_snapshot().unwrap_or_default();
-    let removed = providers.remove(provider.as_str()).is_some();
+    let removed = match provider {
+        ApiProvider::OpenAICompatible => {
+            providers.remove(provider.as_str()).is_some() | providers.remove("openai").is_some()
+        }
+        _ => providers.remove(provider.as_str()).is_some(),
+    };
     fs::write(
         &path,
         serde_json::to_vec_pretty(&AuthSnapshotFile { providers })?,
@@ -214,6 +219,9 @@ pub fn write_auth_snapshot(provider: ApiProvider, auth: &AuthMaterial) -> Result
         fs::create_dir_all(parent)?;
     }
     let mut providers = read_auth_snapshot().unwrap_or_default();
+    if provider == ApiProvider::OpenAICompatible {
+        providers.remove("openai");
+    }
     providers.insert(provider.as_str().to_owned(), auth.clone());
     fs::write(
         &path,

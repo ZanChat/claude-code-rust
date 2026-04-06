@@ -11,7 +11,7 @@ This document incorporates the final pre-implementation review and supersedes an
 Primary goals:
 - Preserve the current Claude-Code-main-run workflows and operator experience as closely as practical.
 - Ship as a third-party tool, not as a fork carrying private platform assumptions.
-- Support Anthropic, OpenAI family, and openai-compatible or third-party providers already represented in the current codebase.
+- Support Anthropic, the OpenAI family, and third-party OpenAI-compatible providers already represented in the current codebase.
 - Replace leaked, internal, or private logic with clean Rust-native implementations.
 
 ## Progress Update
@@ -24,7 +24,7 @@ Status as of 2026-04-03:
 
 Implemented areas:
 - workspace, crate boundaries, canonical message/task/question models, and command registry
-- provider runtime for `firstParty`, `bedrock`, `vertex`, `foundry`, `openai`, `chatgpt-codex`, and `openai-compatible`
+- provider runtime for `firstParty`, `bedrock`, `vertex`, `foundry`, `chatgpt-codex`, and `openai-compatible` (with `openai` kept as a legacy alias)
 - production auth failure behavior instead of silent offline fallback; `EchoProvider` remains test-only
 - JSONL transcript compatibility, resume by session id or transcript path, compaction persistence, and materialized compacted runtime state
 - built-in tools for file, shell, search, network, MCP, task, memory, messaging, and workflow flows
@@ -275,7 +275,7 @@ Source-of-truth behavior:
 - `src/utils/chatgptCodex.ts`
 
 Compatibility target:
-- support Anthropic, OpenAI family, and openai-compatible or third-party providers already modeled in the current codebase
+- support Anthropic, the OpenAI family, and third-party OpenAI-compatible providers already modeled in the current codebase
 - preserve model resolution semantics where possible
 - preserve reasoning/completion model split where used
 - preserve tool-call and streaming behavior by provider family
@@ -294,7 +294,6 @@ Provider requirements:
 - `bedrock`
 - `vertex`
 - `foundry`
-- `openai`
 - `chatgpt-codex`
 - `openai-compatible`
 
@@ -601,7 +600,7 @@ Status:
 
 Deliverables:
 - provider trait set
-- `firstParty`, `bedrock`, `vertex`, `foundry`, `openai`, `chatgpt-codex`, and `openai-compatible` support scaffolding
+- `firstParty`, `bedrock`, `vertex`, `foundry`, `chatgpt-codex`, and `openai-compatible` support scaffolding
 - auth/config resolution
 - model metadata and context window registry
 

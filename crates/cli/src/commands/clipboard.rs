@@ -57,8 +57,7 @@ pub(crate) async fn render_auth_command_with_resume(
                 .await?;
             let snapshot_path = if matches!(
                 provider,
-                ApiProvider::OpenAI
-                    | ApiProvider::ChatGPTCodex
+                ApiProvider::ChatGPTCodex
                     | ApiProvider::OpenAICompatible
                     | ApiProvider::FirstParty
             ) {

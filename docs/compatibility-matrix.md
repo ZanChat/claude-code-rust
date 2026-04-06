@@ -4,7 +4,7 @@
 
 | Area | Contract |
 | --- | --- |
-| Provider modes | `firstParty`, `bedrock`, `vertex`, `foundry`, `openai`, `chatgpt-codex`, `openai-compatible` |
+| Provider modes | `firstParty`, `bedrock`, `vertex`, `foundry`, `chatgpt-codex`, `openai-compatible` (`openai` remains a legacy alias) |
 | Transcript format | Read and write the current JSONL transcript/session format directly |
 | Resume modes | Resume by session id and by explicit `.jsonl` path |
 | Plugin manifest | Preserve `.claude-plugin/plugin.json` |
