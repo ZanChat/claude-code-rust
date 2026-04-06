@@ -36,7 +36,7 @@ fn drain_mouse_scroll_burst(
 
 pub(crate) async fn run_interactive_repl(
     store: &ActiveSessionStore,
-    registry: &code_agent_core::CommandRegistry,
+    registry: &ccrust_core::CommandRegistry,
     tool_registry: &ToolRegistry,
     cwd: PathBuf,
     plugin_root: Option<&PathBuf>,
@@ -59,7 +59,7 @@ pub(crate) async fn run_interactive_repl(
         session_id,
         transcript_path,
     };
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut out = stdout();
     let mouse_capture_enabled =
         should_enable_mouse_capture(std::env::var("TERM_PROGRAM").ok().as_deref());
@@ -91,7 +91,7 @@ pub(crate) async fn run_interactive_repl(
         None,
         &startup_preferences,
     );
-    let mut initial_input_buffer = code_agent_ui::InputBuffer::new();
+    let mut initial_input_buffer = ccrust_ui::InputBuffer::new();
     if !startup_screens.is_empty() {
         let startup_result = run_startup_flow(
             &mut terminal,
@@ -166,7 +166,7 @@ pub(crate) async fn run_interactive_repl(
         let mut input_buffer = initial_input_buffer;
         let mut prompt_history = prompt_history_from_messages(raw_messages);
         let mut prompt_history_index = None;
-        let mut prompt_history_draft: Option<code_agent_ui::InputBuffer> = None;
+        let mut prompt_history_draft: Option<ccrust_ui::InputBuffer> = None;
         let mut transcript_scroll = 0u16;
         let mut status_line =
             repl_runtime_status(provider, &active_model, repl_session.session_id, live_runtime);
@@ -1634,11 +1634,11 @@ pub(crate) async fn run_interactive_repl(
             match key.code {
                 KeyCode::Esc => {
                     if vim_state.enabled {
-                        if matches!(vim_state.mode, code_agent_ui::vim::VimMode::Insert) {
+                        if matches!(vim_state.mode, ccrust_ui::vim::VimMode::Insert) {
                             vim_state.enter_normal();
                         } else {
-                            vim_state.mode = code_agent_ui::vim::VimMode::Normal(
-                                code_agent_ui::vim::CommandState::Idle,
+                            vim_state.mode = ccrust_ui::vim::VimMode::Normal(
+                                ccrust_ui::vim::CommandState::Idle,
                             );
                         }
                         dirty = true;
@@ -1745,16 +1745,16 @@ pub(crate) async fn run_interactive_repl(
                         selected_command_suggestion = 0;
                         dirty = true;
                     } else {
-                        if let code_agent_ui::vim::VimMode::Normal(ref mut cmd_state) =
+                        if let ccrust_ui::vim::VimMode::Normal(ref mut cmd_state) =
                             vim_state.mode
                         {
-                            let transition = code_agent_ui::vim::handle_normal_key(cmd_state, ch);
+                            let transition = ccrust_ui::vim::handle_normal_key(cmd_state, ch);
                             match transition {
-                                code_agent_ui::vim::VimTransition::EnterInsert => {
+                                ccrust_ui::vim::VimTransition::EnterInsert => {
                                     vim_state.enter_insert();
                                     dirty = true;
                                 }
-                                code_agent_ui::vim::VimTransition::MoveCursor(delta) => {
+                                ccrust_ui::vim::VimTransition::MoveCursor(delta) => {
                                     let mut new_pos = input_buffer.cursor as isize + delta;
                                     if new_pos < 0 {
                                         new_pos = 0;
@@ -1766,12 +1766,12 @@ pub(crate) async fn run_interactive_repl(
                                     input_buffer.cursor = new_pos as usize;
                                     dirty = true;
                                 }
-                                code_agent_ui::vim::VimTransition::SetCursor(pos) => {
+                                ccrust_ui::vim::VimTransition::SetCursor(pos) => {
                                     let max_pos = input_buffer.chars.len().saturating_sub(1);
                                     input_buffer.cursor = pos.min(max_pos);
                                     dirty = true;
                                 }
-                                code_agent_ui::vim::VimTransition::DeleteChars(mut amount) => {
+                                ccrust_ui::vim::VimTransition::DeleteChars(mut amount) => {
                                     reset_prompt_history_navigation(
                                         &mut prompt_history_index,
                                         &mut prompt_history_draft,
@@ -1786,7 +1786,7 @@ pub(crate) async fn run_interactive_repl(
                                     input_buffer.cursor = input_buffer.cursor.min(max_pos);
                                     dirty = true;
                                 }
-                                code_agent_ui::vim::VimTransition::ReplaceChar(r) => {
+                                ccrust_ui::vim::VimTransition::ReplaceChar(r) => {
                                     reset_prompt_history_navigation(
                                         &mut prompt_history_index,
                                         &mut prompt_history_draft,
@@ -1796,7 +1796,7 @@ pub(crate) async fn run_interactive_repl(
                                     }
                                     dirty = true;
                                 }
-                                code_agent_ui::vim::VimTransition::None => {}
+                                ccrust_ui::vim::VimTransition::None => {}
                             }
                         }
                     }

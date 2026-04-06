@@ -1,7 +1,5 @@
 use anyhow::Result;
-use code_agent_core::{
-    CommandSpec, ContentBlock, Message, MessageMetadata, MessageRole, TaskStatus,
-};
+use ccrust_core::{CommandSpec, ContentBlock, Message, MessageMetadata, MessageRole, TaskStatus};
 use ratatui::backend::{Backend, TestBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};

@@ -1,13 +1,13 @@
 fn build_repl_ui_state(
     app: &RatatuiApp,
-    registry: &code_agent_core::CommandRegistry,
+    registry: &ccrust_core::CommandRegistry,
     raw_messages: &[Message],
     pending_view: Option<&PendingReplView>,
     cwd: &Path,
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
     status_line: &str,
     progress_message: Option<String>,
     active_pane: PaneKind,
@@ -18,7 +18,7 @@ fn build_repl_ui_state(
     selected_command_suggestion: usize,
     status_marquee_tick: usize,
     interaction_state: &ReplInteractionState,
-) -> code_agent_ui::UiState {
+) -> ccrust_ui::UiState {
     let runtime_messages = materialize_runtime_messages(raw_messages);
     let message_action_items =
         message_action_items_from_runtime(&runtime_messages, pending_view, interaction_state);
@@ -197,14 +197,14 @@ fn build_repl_ui_state(
 
 fn draw_repl_state(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    registry: &code_agent_core::CommandRegistry,
+    registry: &ccrust_core::CommandRegistry,
     raw_messages: &[Message],
     pending_view: Option<&PendingReplView>,
     cwd: &Path,
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
     status_line: &str,
     progress_message: Option<String>,
     active_pane: PaneKind,
@@ -212,7 +212,7 @@ fn draw_repl_state(
     transcript_scroll: u16,
     choice_list: Option<ChoiceListState>,
     selected_command_suggestion: &mut usize,
-    vim_state: &code_agent_ui::vim::VimState,
+    vim_state: &ccrust_ui::vim::VimState,
     status_marquee_tick: usize,
     interaction_state: &ReplInteractionState,
 ) -> Result<()> {
@@ -245,14 +245,14 @@ fn draw_repl_state(
 
 fn repl_mouse_action(
     terminal: &Terminal<CrosstermBackend<std::io::Stdout>>,
-    registry: &code_agent_core::CommandRegistry,
+    registry: &ccrust_core::CommandRegistry,
     raw_messages: &[Message],
     pending_view: Option<&PendingReplView>,
     cwd: &Path,
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
     status_line: &str,
     progress_message: Option<String>,
     active_pane: PaneKind,

@@ -2,28 +2,27 @@ use super::*;
 use std::collections::BTreeSet;
 
 pub(crate) fn task_store_for(cwd: &Path) -> CoreLocalTaskStore {
-    CoreLocalTaskStore::new(cwd.join(".code-agent"))
+    CoreLocalTaskStore::new(cwd.join(".claude"))
 }
 
 async fn resolved_root_skill_entries(
     cwd: &Path,
     plugin_root: Option<&PathBuf>,
-) -> Result<Vec<code_agent_plugins::SkillEntry>> {
+) -> Result<Vec<ccrust_plugins::SkillEntry>> {
     let runtime = OutOfProcessPluginRuntime;
     let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
     runtime.discover_skills(&root).await
 }
 
-fn resolved_user_skill_entries() -> Vec<code_agent_plugins::SkillEntry> {
+fn resolved_user_skill_entries() -> Vec<ccrust_plugins::SkillEntry> {
     let home = claude_config_home_dir();
-    code_agent_plugins::discover_legacy_skill_entries(&home, "skills", "commands")
-        .unwrap_or_default()
+    ccrust_plugins::discover_legacy_skill_entries(&home, "skills", "commands").unwrap_or_default()
 }
 
 pub(crate) async fn resolved_skill_entries(
     cwd: &Path,
     plugin_root: Option<&PathBuf>,
-) -> Result<Vec<code_agent_plugins::SkillEntry>> {
+) -> Result<Vec<ccrust_plugins::SkillEntry>> {
     let mut skills = resolved_root_skill_entries(cwd, plugin_root).await?;
     let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
     let home = claude_config_home_dir();
@@ -44,7 +43,7 @@ pub(crate) async fn resolved_dynamic_commands(
     let mut commands = runtime.discover_commands(&root).await.unwrap_or_default();
     let home = claude_config_home_dir();
     if home != root {
-        commands.extend(code_agent_plugins::skill_command_specs(
+        commands.extend(ccrust_plugins::skill_command_specs(
             &resolved_user_skill_entries(),
         ));
     }
@@ -217,7 +216,7 @@ pub(crate) fn repl_header_context(cwd: &Path, session_id: SessionId) -> String {
 }
 
 pub(crate) fn apply_repl_header(
-    state: &mut code_agent_ui::UiState,
+    state: &mut ccrust_ui::UiState,
     provider: ApiProvider,
     active_model: &str,
     cwd: &Path,
@@ -269,7 +268,7 @@ pub(crate) fn command_palette_entries(registry: &CommandRegistry) -> Vec<Command
         .collect()
 }
 
-pub(crate) fn slash_command_query(input_buffer: &code_agent_ui::InputBuffer) -> Option<String> {
+pub(crate) fn slash_command_query(input_buffer: &ccrust_ui::InputBuffer) -> Option<String> {
     let text = input_buffer.as_str();
     if !text.starts_with('/') {
         return None;
@@ -288,7 +287,7 @@ pub(crate) fn slash_command_query(input_buffer: &code_agent_ui::InputBuffer) -> 
 
 pub(crate) fn command_suggestions(
     registry: &CommandRegistry,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
 ) -> Vec<CommandPaletteEntry> {
     let Some(query) = slash_command_query(input_buffer) else {
         return Vec::new();
@@ -310,7 +309,7 @@ pub(crate) fn command_suggestions(
 
 pub(crate) fn sync_command_selection(
     registry: &CommandRegistry,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
     selected_index: &mut usize,
 ) -> Vec<CommandPaletteEntry> {
     let suggestions = command_suggestions(registry, input_buffer);
@@ -321,7 +320,7 @@ pub(crate) fn sync_command_selection(
 }
 
 pub(crate) fn apply_selected_command(
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     entry: &CommandPaletteEntry,
 ) {
     input_buffer.replace(format!("{} ", entry.name));
@@ -361,7 +360,7 @@ pub(crate) fn prompt_history_from_messages(raw_messages: &[Message]) -> Vec<Stri
 
 pub(crate) fn reset_prompt_history_navigation(
     history_index: &mut Option<usize>,
-    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+    history_draft: &mut Option<ccrust_ui::InputBuffer>,
 ) {
     *history_index = None;
     *history_draft = None;
@@ -369,9 +368,9 @@ pub(crate) fn reset_prompt_history_navigation(
 
 pub(crate) fn navigate_prompt_history_up(
     history: &[String],
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     history_index: &mut Option<usize>,
-    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+    history_draft: &mut Option<ccrust_ui::InputBuffer>,
 ) -> bool {
     if history.is_empty() {
         return false;
@@ -392,9 +391,9 @@ pub(crate) fn navigate_prompt_history_up(
 
 pub(crate) fn navigate_prompt_history_down(
     history: &[String],
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     history_index: &mut Option<usize>,
-    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+    history_draft: &mut Option<ccrust_ui::InputBuffer>,
 ) -> bool {
     let Some(current_index) = *history_index else {
         return false;
@@ -423,11 +422,11 @@ enum PromptInputNavigationDirection {
 
 fn navigate_prompt_input(
     registry: &CommandRegistry,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     selected_command_suggestion: &mut usize,
     history: &[String],
     history_index: &mut Option<usize>,
-    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+    history_draft: &mut Option<ccrust_ui::InputBuffer>,
     direction: PromptInputNavigationDirection,
 ) {
     let suggestions = sync_command_selection(registry, input_buffer, selected_command_suggestion);
@@ -461,11 +460,11 @@ fn navigate_prompt_input(
 
 pub(crate) fn navigate_prompt_input_up(
     registry: &CommandRegistry,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     selected_command_suggestion: &mut usize,
     history: &[String],
     history_index: &mut Option<usize>,
-    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+    history_draft: &mut Option<ccrust_ui::InputBuffer>,
 ) {
     navigate_prompt_input(
         registry,
@@ -480,11 +479,11 @@ pub(crate) fn navigate_prompt_input_up(
 
 pub(crate) fn navigate_prompt_input_down(
     registry: &CommandRegistry,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     selected_command_suggestion: &mut usize,
     history: &[String],
     history_index: &mut Option<usize>,
-    history_draft: &mut Option<code_agent_ui::InputBuffer>,
+    history_draft: &mut Option<ccrust_ui::InputBuffer>,
 ) {
     navigate_prompt_input(
         registry,

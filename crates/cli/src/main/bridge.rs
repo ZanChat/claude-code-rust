@@ -5,7 +5,7 @@ fn persist_voice_capture(
     payload: &[u8],
 ) -> Result<PathBuf> {
     let path = cwd
-        .join(".code-agent")
+        .join(".claude")
         .join("voice")
         .join(format!("{stream_id}.{}", voice_extension(format)));
     if let Some(parent) = path.parent() {
@@ -79,7 +79,7 @@ struct LocalBridgeHandler<'a> {
 #[derive(Clone, Debug)]
 struct PendingRemoteTool {
     request: RemotePermissionRequest,
-    call: code_agent_core::ToolCall,
+    call: ccrust_core::ToolCall,
 }
 
 impl<'a> LocalBridgeHandler<'a> {
@@ -158,7 +158,7 @@ impl<'a> LocalBridgeHandler<'a> {
 
     async fn run_remote_tool_call(
         &mut self,
-        call: code_agent_core::ToolCall,
+        call: ccrust_core::ToolCall,
     ) -> Result<Vec<RemoteEnvelope>> {
         let parent_id = self.raw_messages.last().map(|message| message.id);
         let tool_call_message = build_assistant_message(
@@ -191,7 +191,7 @@ impl<'a> LocalBridgeHandler<'a> {
                 .await
             {
                 Ok(output) => (
-                    code_agent_core::ToolResult {
+                    ccrust_core::ToolResult {
                         tool_call_id: call.id.clone(),
                         output_text: output.content,
                         is_error: output.is_error,
@@ -199,7 +199,7 @@ impl<'a> LocalBridgeHandler<'a> {
                     self.tool_runtime_envelopes(&call.name, &output.metadata),
                 ),
                 Err(error) => (
-                    code_agent_core::ToolResult {
+                    ccrust_core::ToolResult {
                         tool_call_id: call.id.clone(),
                         output_text: error.to_string(),
                         is_error: true,
@@ -208,7 +208,7 @@ impl<'a> LocalBridgeHandler<'a> {
                 ),
             },
             Err(error) => (
-                code_agent_core::ToolResult {
+                ccrust_core::ToolResult {
                     tool_call_id: call.id.clone(),
                     output_text: format!("invalid tool input JSON: {error}"),
                     is_error: true,
@@ -239,7 +239,7 @@ impl<'a> LocalBridgeHandler<'a> {
 
     async fn execute_remote_tool_call(
         &mut self,
-        call: code_agent_core::ToolCall,
+        call: ccrust_core::ToolCall,
     ) -> Result<Vec<RemoteEnvelope>> {
         let Some(spec) = self.tool_registry.get(&call.name).map(|tool| tool.spec()) else {
             return Ok(self.with_session_state(vec![RemoteEnvelope::Error {
@@ -461,7 +461,7 @@ impl<'a> LocalBridgeHandler<'a> {
 impl BridgeSessionHandler for LocalBridgeHandler<'_> {
     async fn on_connect(
         &mut self,
-        _record: &code_agent_bridge::BridgeSessionRecord,
+        _record: &ccrust_bridge::BridgeSessionRecord,
     ) -> Result<Vec<RemoteEnvelope>> {
         Ok(vec![
             RemoteEnvelope::Event {
@@ -577,7 +577,7 @@ impl BridgeSessionHandler for LocalBridgeHandler<'_> {
                 self.pending_permission = None;
                 if !response.approved {
                     return Ok(self.with_session_state(vec![RemoteEnvelope::ToolResult {
-                        result: code_agent_core::ToolResult {
+                        result: ccrust_core::ToolResult {
                             tool_call_id: pending.call.id,
                             output_text: response
                                 .note

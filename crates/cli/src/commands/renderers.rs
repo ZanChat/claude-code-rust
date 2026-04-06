@@ -941,7 +941,7 @@ pub(crate) async fn render_remote_control_command(
                 address,
                 session_id,
                 vec![RemoteEnvelope::PermissionResponse {
-                    response: code_agent_bridge::RemotePermissionResponse {
+                    response: ccrust_bridge::RemotePermissionResponse {
                         id: permission_id.clone(),
                         approved,
                         note: (!note.trim().is_empty()).then_some(note),

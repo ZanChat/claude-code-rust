@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-code_agent_core = { package = "ccrust-core", path = "../core" }
+ccrust-core = { path = "../core" }
 hmac.workspace = true
 hex.workspace = true
 percent-encoding.workspace = true

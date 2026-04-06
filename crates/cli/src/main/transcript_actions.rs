@@ -19,7 +19,7 @@ fn cancel_transcript_search(
 }
 
 fn sync_transcript_search_preview(
-    ui_state: &code_agent_ui::UiState,
+    ui_state: &ccrust_ui::UiState,
     terminal_width: u16,
     terminal_height: u16,
     search_state: &mut ReplTranscriptSearchState,
@@ -52,7 +52,7 @@ fn sync_transcript_search_preview(
 }
 
 fn step_transcript_search_match(
-    ui_state: &code_agent_ui::UiState,
+    ui_state: &ccrust_ui::UiState,
     terminal_width: u16,
     terminal_height: u16,
     search_state: &mut ReplTranscriptSearchState,
@@ -272,7 +272,7 @@ fn move_message_action_selection(
 }
 
 fn sync_message_action_preview(
-    ui_state: &code_agent_ui::UiState,
+    ui_state: &ccrust_ui::UiState,
     terminal_width: u16,
     terminal_height: u16,
     interaction_state: &ReplInteractionState,
@@ -462,7 +462,7 @@ fn move_transcript_selection(
 }
 
 fn sync_transcript_selection_preview(
-    ui_state: &code_agent_ui::UiState,
+    ui_state: &ccrust_ui::UiState,
     terminal_width: u16,
     terminal_height: u16,
     interaction_state: &ReplInteractionState,
@@ -484,7 +484,7 @@ fn sync_transcript_selection_preview(
 }
 
 fn transcript_selection_copy_text(
-    ui_state: &code_agent_ui::UiState,
+    ui_state: &ccrust_ui::UiState,
     terminal_width: u16,
     interaction_state: &ReplInteractionState,
 ) -> Option<String> {
@@ -520,7 +520,7 @@ fn is_paste_shortcut(key: &KeyEvent) -> bool {
             && key_routing_modifiers(key.modifiers) == KeyModifiers::SHIFT)
 }
 
-fn insert_buffer_text(input_buffer: &mut code_agent_ui::InputBuffer, text: &str) -> bool {
+fn insert_buffer_text(input_buffer: &mut ccrust_ui::InputBuffer, text: &str) -> bool {
     let mut inserted = false;
     for ch in text.chars() {
         input_buffer.push(ch);
@@ -544,7 +544,7 @@ fn prompt_selection_move_for_key(key: &KeyEvent) -> Option<PromptSelectionMove> 
 }
 
 fn prompt_selection_text(
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
     interaction_state: &ReplInteractionState,
 ) -> Option<String> {
     let (start, end) = interaction_state
@@ -555,9 +555,9 @@ fn prompt_selection_text(
 }
 
 fn repl_selection_copy_text(
-    ui_state: &code_agent_ui::UiState,
+    ui_state: &ccrust_ui::UiState,
     terminal_width: u16,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
     interaction_state: &ReplInteractionState,
 ) -> Option<String> {
     if interaction_state.transcript_selection.is_some() {
@@ -568,7 +568,7 @@ fn repl_selection_copy_text(
 }
 
 fn move_prompt_selection_focus(
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
     focus: usize,
     selection_move: PromptSelectionMove,
 ) -> Option<usize> {
@@ -584,7 +584,7 @@ fn move_prompt_selection_focus(
 
 fn move_prompt_selection(
     interaction_state: &mut ReplInteractionState,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     selection_move: PromptSelectionMove,
 ) -> bool {
     let anchor = interaction_state
@@ -615,7 +615,7 @@ fn move_prompt_selection(
 
 fn set_prompt_cursor(
     interaction_state: &mut ReplInteractionState,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     cursor: usize,
 ) -> bool {
     let next_cursor = cursor.min(input_buffer.chars.len());
@@ -628,7 +628,7 @@ fn set_prompt_cursor(
 
 fn insert_prompt_text(
     interaction_state: &mut ReplInteractionState,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     text: &str,
 ) -> bool {
     let deleted = delete_prompt_selection(interaction_state, input_buffer);
@@ -638,7 +638,7 @@ fn insert_prompt_text(
 
 fn set_prompt_selection(
     interaction_state: &mut ReplInteractionState,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     anchor: usize,
     focus: usize,
 ) -> bool {
@@ -663,7 +663,7 @@ fn handle_prompt_mouse_action(
     mouse_kind: &MouseEventKind,
     cursor: usize,
     interaction_state: &mut ReplInteractionState,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
 ) -> bool {
     let cursor = cursor.min(input_buffer.chars.len());
     match mouse_kind {
@@ -694,7 +694,7 @@ fn handle_prompt_mouse_action(
 
 fn delete_prompt_selection(
     interaction_state: &mut ReplInteractionState,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
 ) -> bool {
     let Some((start, end)) = interaction_state
         .prompt_selection
@@ -772,7 +772,7 @@ fn primary_input_string(value: &Value) -> Option<String> {
     }
 }
 
-fn tool_primary_input(call: &code_agent_core::ToolCall) -> Option<ToolPrimaryInput> {
+fn tool_primary_input(call: &ccrust_core::ToolCall) -> Option<ToolPrimaryInput> {
     let payload = serde_json::from_str::<Value>(&call.input_json).ok()?;
     for key in primary_input_keys(&call.name) {
         if let Some(value) = payload.get(*key).and_then(primary_input_string) {
@@ -785,14 +785,14 @@ fn tool_primary_input(call: &code_agent_core::ToolCall) -> Option<ToolPrimaryInp
     None
 }
 
-fn message_tool_call(message: &Message) -> Option<&code_agent_core::ToolCall> {
+fn message_tool_call(message: &Message) -> Option<&ccrust_core::ToolCall> {
     message.blocks.iter().find_map(|block| match block {
         ContentBlock::ToolCall { call } => Some(call),
         _ => None,
     })
 }
 
-fn message_tool_result(message: &Message) -> Option<&code_agent_core::ToolResult> {
+fn message_tool_result(message: &Message) -> Option<&ccrust_core::ToolResult> {
     message.blocks.iter().find_map(|block| match block {
         ContentBlock::ToolResult { result } => Some(result),
         _ => None,
@@ -848,7 +848,7 @@ struct HistoryTranscriptGroupAccumulator {
 impl HistoryTranscriptGroupAccumulator {
     fn new(
         message: &Message,
-        call: &code_agent_core::ToolCall,
+        call: &ccrust_core::ToolCall,
         kind: HistoryTranscriptToolKind,
     ) -> Self {
         let mut accumulator = Self {
@@ -868,7 +868,7 @@ impl HistoryTranscriptGroupAccumulator {
     fn push_call(
         &mut self,
         message: &Message,
-        call: &code_agent_core::ToolCall,
+        call: &ccrust_core::ToolCall,
         kind: HistoryTranscriptToolKind,
     ) {
         self.messages.push(message.clone());
@@ -888,7 +888,7 @@ impl HistoryTranscriptGroupAccumulator {
         self.messages.push(message.clone());
     }
 
-    fn matches_result(&self, result: &code_agent_core::ToolResult) -> bool {
+    fn matches_result(&self, result: &ccrust_core::ToolResult) -> bool {
         self.tracked_call_ids.contains(&result.tool_call_id)
     }
 
@@ -1026,7 +1026,7 @@ fn history_transcript_tool_kind(tool_name: &str) -> Option<HistoryTranscriptTool
     }
 }
 
-fn history_transcript_hint(call: &code_agent_core::ToolCall) -> Option<String> {
+fn history_transcript_hint(call: &ccrust_core::ToolCall) -> Option<String> {
     let primary = tool_primary_input(call)?;
     let condensed = primary
         .value
@@ -1064,7 +1064,7 @@ fn history_preview_lines(text: &str, max_lines: usize, max_width: usize) -> Vec<
     lines
 }
 
-fn history_tool_call_detail_text(call: &code_agent_core::ToolCall) -> String {
+fn history_tool_call_detail_text(call: &ccrust_core::ToolCall) -> String {
     let display_name = tool_display_name(&call.name);
     let Some(primary_input) = tool_primary_input(call) else {
         return display_name;
@@ -1077,7 +1077,7 @@ fn history_tool_call_detail_text(call: &code_agent_core::ToolCall) -> String {
     }
 }
 
-fn history_tool_result_detail_lines(result: &code_agent_core::ToolResult) -> Vec<TranscriptLine> {
+fn history_tool_result_detail_lines(result: &ccrust_core::ToolResult) -> Vec<TranscriptLine> {
     let previews =
         history_preview_lines(&result.output_text, if result.is_error { 2 } else { 1 }, 76);
     let role = if result.is_error {

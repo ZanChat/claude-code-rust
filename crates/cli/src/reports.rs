@@ -1,4 +1,4 @@
-use code_agent_core::{QuestionRequest, QuestionResponse, SessionId, TaskRecord};
+use ccrust_core::{QuestionRequest, QuestionResponse, SessionId, TaskRecord};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::PathBuf;

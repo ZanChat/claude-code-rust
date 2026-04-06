@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use code_agent_core::{
+use ccrust_core::{
     AgentId, BoundaryKind, BoundaryMarker, ContentBlock, Message, MessageRole, SessionId,
 };
 use std::env;
@@ -731,11 +731,11 @@ pub fn summarize_transcript_path(path: &Path) -> Result<Option<SessionSummary>> 
                 .filter(|line| !line.trim().is_empty())
                 .find_map(|line| serde_json::from_str::<Message>(line).ok())
                 .and_then(|message| {
-                    (message.role == code_agent_core::MessageRole::User).then_some(message)
+                    (message.role == ccrust_core::MessageRole::User).then_some(message)
                 })
                 .and_then(|message| {
                     message.blocks.into_iter().find_map(|block| match block {
-                        code_agent_core::ContentBlock::Text { text } => Some(text),
+                        ccrust_core::ContentBlock::Text { text } => Some(text),
                         _ => None,
                     })
                 })

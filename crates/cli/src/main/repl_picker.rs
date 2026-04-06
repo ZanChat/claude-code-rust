@@ -1,9 +1,9 @@
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ReplTranscriptSearchState {
-    input_buffer: code_agent_ui::InputBuffer,
+    input_buffer: ccrust_ui::InputBuffer,
     open: bool,
     active_item: Option<usize>,
-    saved_input_buffer: code_agent_ui::InputBuffer,
+    saved_input_buffer: ccrust_ui::InputBuffer,
     saved_active_item: Option<usize>,
     anchor_scroll: u16,
 }
@@ -24,8 +24,8 @@ impl ReplTranscriptSearchState {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ReplPromptHistorySearchState {
-    input_buffer: code_agent_ui::InputBuffer,
-    original_input_buffer: code_agent_ui::InputBuffer,
+    input_buffer: ccrust_ui::InputBuffer,
+    original_input_buffer: ccrust_ui::InputBuffer,
     active_history_index: Option<usize>,
     active_match_position: Option<usize>,
     match_count: usize,
@@ -281,7 +281,7 @@ fn normalize_file_picker_path(path: &Path) -> String {
 }
 
 fn active_prompt_file_picker_token(
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
 ) -> Option<ReplFilePickerToken> {
     let chars = &input_buffer.chars;
     let cursor = input_buffer.cursor.min(chars.len());
@@ -455,7 +455,7 @@ fn rebuild_prompt_file_picker_index(cwd: &Path, file_picker: &mut ReplFilePicker
 
 fn sync_prompt_file_picker_state(
     cwd: &Path,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
     interaction_state: &mut ReplInteractionState,
 ) {
     if !should_show_prompt_file_picker(interaction_state) {
@@ -539,7 +539,7 @@ fn file_picker_match_rank(path: &str, query: &str) -> Option<(u8, usize, usize)>
 
 fn prompt_file_picker_matches(
     cwd: &Path,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
     interaction_state: &mut ReplInteractionState,
 ) -> Option<ReplFilePickerMatchSet> {
     sync_prompt_file_picker_state(cwd, input_buffer, interaction_state);
@@ -578,7 +578,7 @@ fn prompt_file_picker_matches(
 
 fn prompt_file_picker_choice_list(
     cwd: &Path,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
     interaction_state: &mut ReplInteractionState,
 ) -> Option<ChoiceListState> {
     let matches = prompt_file_picker_matches(cwd, input_buffer, interaction_state)?;
@@ -614,7 +614,7 @@ fn prompt_file_picker_choice_list(
 
 fn active_repl_choice_list(
     cwd: &Path,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
     explicit_choice_list: Option<ChoiceListState>,
     interaction_state: &mut ReplInteractionState,
 ) -> Option<ChoiceListState> {
@@ -625,7 +625,7 @@ fn active_repl_choice_list(
 fn handle_prompt_file_picker_key(
     cwd: &Path,
     key: &KeyEvent,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     interaction_state: &mut ReplInteractionState,
 ) -> bool {
     let Some(matches) = prompt_file_picker_matches(cwd, input_buffer, interaction_state) else {
@@ -695,7 +695,7 @@ fn handle_prompt_file_picker_key(
 
 fn open_prompt_history_search(
     interaction_state: &mut ReplInteractionState,
-    input_buffer: &code_agent_ui::InputBuffer,
+    input_buffer: &ccrust_ui::InputBuffer,
 ) {
     let search_state = interaction_state
         .prompt_history_search
@@ -712,7 +712,7 @@ fn open_prompt_history_search(
 
 fn cancel_prompt_history_search(
     interaction_state: &mut ReplInteractionState,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
 ) -> bool {
     let Some(search_state) = interaction_state.prompt_history_search.take() else {
         return false;
@@ -734,7 +734,7 @@ fn preview_prompt_history_match(
     history: &[String],
     history_index: usize,
     query: &str,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
 ) {
     let Some(entry) = history.get(history_index) else {
         return;
@@ -749,7 +749,7 @@ fn preview_prompt_history_match(
 fn sync_prompt_history_search_preview(
     history: &[String],
     search_state: &mut ReplPromptHistorySearchState,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
 ) {
     let query = search_state.input_buffer.as_str();
     if query.is_empty() {
@@ -788,7 +788,7 @@ fn sync_prompt_history_search_preview(
 fn step_prompt_history_search_match(
     history: &[String],
     search_state: &mut ReplPromptHistorySearchState,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
 ) -> bool {
     let query = search_state.input_buffer.as_str();
     if query.is_empty() {

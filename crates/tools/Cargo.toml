@@ -7,9 +7,9 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-code_agent_core = { package = "ccrust-core", path = "../core" }
-code_agent_mcp = { package = "ccrust-mcp", path = "../mcp" }
-code_agent_plugins = { package = "ccrust-plugins", path = "../plugins" }
+ccrust-core = { path = "../core" }
+ccrust-mcp = { path = "../mcp" }
+ccrust-plugins = { path = "../plugins" }
 reqwest.workspace = true
 schemars.workspace = true
 serde.workspace = true

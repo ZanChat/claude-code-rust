@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-code_agent_core = { package = "ccrust-core", path = "../core" }
+ccrust-core = { path = "../core" }
 futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true

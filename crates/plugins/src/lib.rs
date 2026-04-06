@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use code_agent_core::{CommandCategory, CommandKind, CommandSource, CommandSpec};
+use ccrust_core::{CommandCategory, CommandKind, CommandSource, CommandSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -684,7 +684,7 @@ mod tests {
         discover_legacy_skill_entries, BridgeLaunchRequest, OutOfProcessPluginRuntime,
         PluginRuntime, LEGACY_SKILLS_DIR, PLUGIN_MANIFEST_PATH, SKILL_FILE_NAME,
     };
-    use code_agent_core::CommandSource;
+    use ccrust_core::CommandSource;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -2,6 +2,7 @@
 Cargo.lock
 Claude-Code-main-run.code-workspace
 .env.*
+.claude/
 .code-agent/
 test.rs
 test

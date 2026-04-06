@@ -1,9 +1,9 @@
 use crate::{resume_command_for_session, resume_picker_item};
-use code_agent_session::SessionStore;
-use code_agent_session::{LocalSessionStore, ProjectSessionStore, SessionSummary};
+use ccrust_session::SessionStore;
+use ccrust_session::{LocalSessionStore, ProjectSessionStore, SessionSummary};
 use uuid::Uuid;
 
-use code_agent_core::{Message, SessionId};
+use ccrust_core::{Message, SessionId};
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +11,7 @@ use anyhow::Result;
 
 use crate::cli_args::Cli;
 
-use code_agent_ui::ChoiceListState;
+use ccrust_ui::ChoiceListState;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResumeTargetHint {

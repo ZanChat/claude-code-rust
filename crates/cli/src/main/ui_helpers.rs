@@ -178,7 +178,7 @@ fn pending_tool_detail_from_json(tool_name: &str, payload: &Value) -> Option<Str
         .or_else(|| preview_detail(&payload.to_string(), 1, 96))
 }
 
-fn pending_tool_detail_from_call(call: &code_agent_core::ToolCall) -> Option<String> {
+fn pending_tool_detail_from_call(call: &ccrust_core::ToolCall) -> Option<String> {
     serde_json::from_str::<Value>(&call.input_json)
         .ok()
         .as_ref()
@@ -718,7 +718,7 @@ fn build_tool_result_message(
     let mut message = Message::new(
         MessageRole::Tool,
         vec![ContentBlock::ToolResult {
-            result: code_agent_core::ToolResult {
+            result: ccrust_core::ToolResult {
                 tool_call_id,
                 output_text,
                 is_error,
@@ -734,7 +734,7 @@ fn build_assistant_message(
     session_id: SessionId,
     parent_id: Option<uuid::Uuid>,
     text: String,
-    tool_calls: Vec<code_agent_core::ToolCall>,
+    tool_calls: Vec<ccrust_core::ToolCall>,
 ) -> Message {
     let mut blocks = Vec::new();
     if !text.is_empty() {
@@ -770,7 +770,7 @@ fn provider_supports_live_runtime(provider: ApiProvider) -> bool {
 async fn resolve_provider_client(
     provider: ApiProvider,
     auth_configured: bool,
-) -> Result<Box<dyn code_agent_providers::Provider>> {
+) -> Result<Box<dyn ccrust_providers::Provider>> {
     if !auth_configured || !provider_supports_live_runtime(provider) {
         #[cfg(test)]
         {

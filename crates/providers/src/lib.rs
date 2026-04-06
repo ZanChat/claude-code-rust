@@ -3,7 +3,7 @@ pub use auth::*;
 pub mod http;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use code_agent_core::{ContentBlock, Message, MessageRole, TokenUsage, ToolCall};
+use ccrust_core::{ContentBlock, Message, MessageRole, TokenUsage, ToolCall};
 use hmac::Hmac;
 pub use http::*;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};

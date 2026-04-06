@@ -10,7 +10,7 @@ use tokio::time::sleep;
 
 use tokio::process::Command;
 
-use code_agent_core::{ContentBlock, Message, MessageRole};
+use ccrust_core::{ContentBlock, Message, MessageRole};
 
 use async_trait::async_trait;
 

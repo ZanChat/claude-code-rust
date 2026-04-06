@@ -34,7 +34,7 @@ async fn lightweight_repl_commands_return_output() {
         build_text_message(session_id, MessageRole::Assistant, "world".to_owned(), None),
     ];
     let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
 
     let cases = vec![
@@ -107,7 +107,7 @@ async fn repl_model_command_switches_active_model() {
     let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
     let session_id = SessionId::new_v4();
     let mut raw_messages = Vec::new();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
 
     let status = handle_repl_slash_command(
@@ -148,7 +148,7 @@ async fn repl_model_command_accepts_openai_compatible_custom_model() {
     let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
     let session_id = SessionId::new_v4();
     let mut raw_messages = Vec::new();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
 
     let status = handle_repl_slash_command(
@@ -195,7 +195,7 @@ async fn repl_clear_command_resets_transcript_state() {
     let persisted = build_text_message(session_id, MessageRole::User, "persist".to_owned(), None);
     store.append_message(session_id, &persisted).await.unwrap();
     let mut active_model = "claude-sonnet-4-6".to_owned();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
 
     let status = handle_repl_slash_command(
@@ -249,7 +249,7 @@ async fn repl_copy_command_writes_latest_assistant_response() {
         ),
     ];
     let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
 
     let status = handle_repl_slash_command(
@@ -309,7 +309,7 @@ async fn repl_copy_command_supports_explicit_message_index() {
         ),
     ];
     let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
 
     let status = handle_repl_slash_command(
@@ -455,7 +455,7 @@ async fn repl_resume_command_switches_live_session() {
         "current prompt".to_owned(),
         None,
     )];
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(current_session);
 
     let resumed_message = build_text_message(
@@ -507,7 +507,7 @@ async fn repl_tasks_command_creates_and_lists_tasks() {
     let session_id = SessionId::new_v4();
     let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
     let mut raw_messages = Vec::new();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
 
     let created = handle_repl_slash_command(
@@ -573,7 +573,7 @@ async fn repl_plugin_command_reports_manifest_details() {
     let session_id = SessionId::new_v4();
     let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
     let mut raw_messages = Vec::new();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
     write_test_file(
         &root.join(".claude-plugin/plugin.json"),
@@ -724,62 +724,73 @@ async fn resolve_prompt_command_prompt_supports_inline_manifest_content() {
     assert!(prompt.contains(&session_id.to_string()));
 }
 
-#[tokio::test]
-async fn repl_skill_command_executes_expanded_prompt() {
-    let root = temp_session_root("repl-skill-command");
-    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
-    let tool_registry = compatibility_tool_registry();
-    write_test_file(
-        &root.join(".claude-plugin/plugin.json"),
-        r#"{
-              "name": "review-tools",
-              "skills": "./skills/review"
-            }"#,
-    );
-    write_test_file(
-        &root.join("skills/review/SKILL.md"),
-        "---\narguments: target\n---\nReview $target from ${CLAUDE_SKILL_DIR} in session ${CLAUDE_SESSION_ID}.\n",
-    );
-    let registry = resolved_command_registry(&root, None).await;
-    let session_id = SessionId::new_v4();
-    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
-    let mut raw_messages = Vec::new();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
-    let mut repl_session = repl_session_state(session_id);
+#[test]
+fn repl_skill_command_executes_expanded_prompt() {
+    let home = temp_session_root("repl-skill-command-home");
+    let home_path = home.display().to_string();
 
-    let status = handle_repl_slash_command(
-        &registry,
-        CommandInvocation {
-            name: "review".to_owned(),
-            args: vec!["src/lib.rs".to_owned()],
-            raw_input: "/review src/lib.rs".to_owned(),
-        },
-        &store,
-        &tool_registry,
-        &root,
-        None,
-        ApiProvider::OpenAICompatible,
-        &mut active_model,
-        &mut repl_session,
-        &mut raw_messages,
-        false,
-        &mut vim_state,
-        false,
-        false,
-    )
-    .await
-    .unwrap();
+    with_env_var("CLAUDE_CONFIG_DIR", Some(&home_path), || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = temp_session_root("repl-skill-command");
+            let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+            let tool_registry = compatibility_tool_registry();
+            write_test_file(
+                &root.join(".claude-plugin/plugin.json"),
+                r#"{
+                      "name": "review-tools",
+                      "skills": "./skills/review"
+                    }"#,
+            );
+            write_test_file(
+                &root.join("skills/review/SKILL.md"),
+                "---\narguments: target\n---\nReview $target from ${CLAUDE_SKILL_DIR} in session ${CLAUDE_SESSION_ID}.\n",
+            );
+            let registry = resolved_command_registry(&root, None).await;
+            let session_id = SessionId::new_v4();
+            let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+            let mut raw_messages = Vec::new();
+            let mut vim_state = ccrust_ui::vim::VimState::default();
+            let mut repl_session = repl_session_state(session_id);
 
-    assert!(status.contains("1 steps"));
-    assert!(raw_messages.iter().any(|message| {
-        message.role == MessageRole::User
-            && message_text(message).contains("Base directory for this skill")
-            && message_text(message).contains("Review src/lib.rs")
-    }));
-    assert!(raw_messages.iter().any(|message| {
-        message.role == MessageRole::Assistant
-            && message_text(message).contains("Review src/lib.rs")
-    }));
+            let status = handle_repl_slash_command(
+                &registry,
+                CommandInvocation {
+                    name: "review".to_owned(),
+                    args: vec!["src/lib.rs".to_owned()],
+                    raw_input: "/review src/lib.rs".to_owned(),
+                },
+                &store,
+                &tool_registry,
+                &root,
+                None,
+                ApiProvider::OpenAICompatible,
+                &mut active_model,
+                &mut repl_session,
+                &mut raw_messages,
+                false,
+                &mut vim_state,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+
+            assert!(status.contains("1 steps"));
+            assert!(raw_messages.iter().any(|message| {
+                message.role == MessageRole::User
+                    && message_text(message).contains("Base directory for this skill")
+                    && message_text(message).contains("Review src/lib.rs")
+            }));
+            assert!(raw_messages.iter().any(|message| {
+                message.role == MessageRole::Assistant
+                    && message_text(message).contains("Review src/lib.rs")
+            }));
+        });
+    });
 }
 
 #[tokio::test]
@@ -791,7 +802,7 @@ async fn repl_mcp_command_lists_parsed_servers_and_auth() {
     let session_id = SessionId::new_v4();
     let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
     let mut raw_messages = Vec::new();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
     write_test_file(
         &root.join(".claude-plugin/plugin.json"),

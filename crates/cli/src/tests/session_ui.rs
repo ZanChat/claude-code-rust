@@ -113,9 +113,9 @@ async fn resume_hint_text_skips_missing_transcript() {
 
 #[test]
 fn build_repl_ui_state_handles_empty_command_suggestions() {
-    let app = code_agent_ui::RatatuiApp::new("repl");
+    let app = ccrust_ui::RatatuiApp::new("repl");
     let registry = compatibility_command_registry();
-    let input = code_agent_ui::InputBuffer::new();
+    let input = ccrust_ui::InputBuffer::new();
     let state = build_repl_ui_state(
         &app,
         &registry,
@@ -128,7 +128,7 @@ fn build_repl_ui_state_handles_empty_command_suggestions() {
         &input,
         "status",
         None,
-        code_agent_ui::PaneKind::Transcript,
+        ccrust_ui::PaneKind::Transcript,
         None,
         0,
         None,
@@ -150,7 +150,7 @@ fn build_repl_ui_state_handles_empty_command_suggestions() {
 
 #[test]
 fn build_repl_ui_state_groups_pending_steps() {
-    let app = code_agent_ui::RatatuiApp::new("repl");
+    let app = ccrust_ui::RatatuiApp::new("repl");
     let registry = compatibility_command_registry();
     let session_id = SessionId::new_v4();
     let user = build_text_message(session_id, MessageRole::User, "inspect".to_owned(), None);
@@ -194,10 +194,10 @@ fn build_repl_ui_state_groups_pending_steps() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         session_id,
-        &code_agent_ui::InputBuffer::new(),
+        &ccrust_ui::InputBuffer::new(),
         "status",
         Some("working".to_owned()),
-        code_agent_ui::PaneKind::Transcript,
+        ccrust_ui::PaneKind::Transcript,
         None,
         0,
         None,
@@ -221,7 +221,7 @@ fn build_repl_ui_state_groups_pending_steps() {
 
 #[test]
 fn build_repl_ui_state_collapses_history_tool_runs_into_single_group() {
-    let app = code_agent_ui::RatatuiApp::new("repl");
+    let app = ccrust_ui::RatatuiApp::new("repl");
     let registry = compatibility_command_registry();
     let session_id = SessionId::new_v4();
     let user = build_text_message(
@@ -282,10 +282,10 @@ fn build_repl_ui_state_collapses_history_tool_runs_into_single_group() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         session_id,
-        &code_agent_ui::InputBuffer::new(),
+        &ccrust_ui::InputBuffer::new(),
         "status",
         None,
-        code_agent_ui::PaneKind::Transcript,
+        ccrust_ui::PaneKind::Transcript,
         None,
         0,
         None,
@@ -307,7 +307,7 @@ fn build_repl_ui_state_collapses_history_tool_runs_into_single_group() {
 
 #[test]
 fn build_repl_ui_state_allows_clicking_history_group_title_text() {
-    let app = code_agent_ui::RatatuiApp::new("repl");
+    let app = ccrust_ui::RatatuiApp::new("repl");
     let registry = compatibility_command_registry();
     let session_id = SessionId::new_v4();
     let user = build_text_message(
@@ -368,10 +368,10 @@ fn build_repl_ui_state_allows_clicking_history_group_title_text() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         session_id,
-        &code_agent_ui::InputBuffer::new(),
+        &ccrust_ui::InputBuffer::new(),
         "status",
         None,
-        code_agent_ui::PaneKind::Transcript,
+        ccrust_ui::PaneKind::Transcript,
         None,
         0,
         None,
@@ -384,12 +384,12 @@ fn build_repl_ui_state_allows_clicking_history_group_title_text() {
     let TranscriptItem::Group(group) = &state.transcript_items[1] else {
         panic!("expected grouped history item");
     };
-    let expected_action = code_agent_ui::UiMouseAction::ToggleTranscriptGroup(group.id.clone());
+    let expected_action = ccrust_ui::UiMouseAction::ToggleTranscriptGroup(group.id.clone());
 
     let mut saw_title_hit = false;
     for row in 0..24 {
         for column in 4..100 {
-            if code_agent_ui::mouse_action_for_position(&state, 100, 24, column, row)
+            if ccrust_ui::mouse_action_for_position(&state, 100, 24, column, row)
                 == Some(expected_action.clone())
             {
                 saw_title_hit = true;
@@ -406,7 +406,7 @@ fn build_repl_ui_state_allows_clicking_history_group_title_text() {
 
 #[test]
 fn build_repl_ui_state_keeps_message_action_indices_for_grouped_history() {
-    let app = code_agent_ui::RatatuiApp::new("repl");
+    let app = ccrust_ui::RatatuiApp::new("repl");
     let registry = compatibility_command_registry();
     let session_id = SessionId::new_v4();
     let user = build_text_message(
@@ -442,10 +442,10 @@ fn build_repl_ui_state_keeps_message_action_indices_for_grouped_history() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         session_id,
-        &code_agent_ui::InputBuffer::new(),
+        &ccrust_ui::InputBuffer::new(),
         "status",
         None,
-        code_agent_ui::PaneKind::Transcript,
+        ccrust_ui::PaneKind::Transcript,
         None,
         0,
         None,
@@ -563,7 +563,7 @@ fn prompt_file_picker_lists_matching_workspace_files() {
     write_test_file(&root.join("src/main.rs"), "fn main() {}\n");
     write_test_file(&root.join("src/lib.rs"), "pub fn helper() {}\n");
 
-    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    let mut input_buffer = ccrust_ui::InputBuffer::new();
     input_buffer.replace("inspect @src/ma");
     let mut interaction_state = ReplInteractionState::default();
 
@@ -580,7 +580,7 @@ fn prompt_file_picker_inserts_selected_match_into_prompt() {
     let root = temp_session_root("file-picker-apply");
     write_test_file(&root.join("src/main.rs"), "fn main() {}\n");
 
-    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    let mut input_buffer = ccrust_ui::InputBuffer::new();
     input_buffer.replace("inspect @src/ma");
     let mut interaction_state = ReplInteractionState::default();
 
@@ -665,9 +665,9 @@ fn message_actions_show_expand_and_collapse_for_history_groups() {
 
 #[test]
 fn build_repl_ui_state_hides_prompt_in_transcript_mode() {
-    let app = code_agent_ui::RatatuiApp::new("repl-transcript");
+    let app = ccrust_ui::RatatuiApp::new("repl-transcript");
     let registry = compatibility_command_registry();
-    let mut search_input = code_agent_ui::InputBuffer::new();
+    let mut search_input = ccrust_ui::InputBuffer::new();
     search_input.replace("error");
     let interaction_state = ReplInteractionState {
         transcript_mode: true,
@@ -695,10 +695,10 @@ fn build_repl_ui_state_hides_prompt_in_transcript_mode() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         SessionId::new_v4(),
-        &code_agent_ui::InputBuffer::new(),
+        &ccrust_ui::InputBuffer::new(),
         "status",
         None,
-        code_agent_ui::PaneKind::Tasks,
+        ccrust_ui::PaneKind::Tasks,
         None,
         0,
         None,
@@ -710,19 +710,19 @@ fn build_repl_ui_state_hides_prompt_in_transcript_mode() {
 
     assert!(!state.show_input);
     assert!(state.transcript_mode);
-    assert_eq!(state.active_pane, Some(code_agent_ui::PaneKind::Transcript));
+    assert_eq!(state.active_pane, Some(ccrust_ui::PaneKind::Transcript));
     assert!(state.transcript_search.is_some());
 }
 
 #[test]
 fn build_repl_ui_state_keeps_prompt_visible_for_message_actions() {
-    let app = code_agent_ui::RatatuiApp::new("repl-message-actions");
+    let app = ccrust_ui::RatatuiApp::new("repl-message-actions");
     let registry = compatibility_command_registry();
     let session_id = SessionId::new_v4();
     let assistant_tool_call = Message::new(
         MessageRole::Assistant,
         vec![ContentBlock::ToolCall {
-            call: code_agent_core::ToolCall {
+            call: ccrust_core::ToolCall {
                 id: "tool-call-1".to_owned(),
                 name: "read_file".to_owned(),
                 input_json: json!({
@@ -747,10 +747,10 @@ fn build_repl_ui_state_keeps_prompt_visible_for_message_actions() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         session_id,
-        &code_agent_ui::InputBuffer::new(),
+        &ccrust_ui::InputBuffer::new(),
         "status",
         None,
-        code_agent_ui::PaneKind::Tasks,
+        ccrust_ui::PaneKind::Tasks,
         None,
         0,
         None,
@@ -761,7 +761,7 @@ fn build_repl_ui_state_keeps_prompt_visible_for_message_actions() {
     );
 
     assert!(state.show_input);
-    assert_eq!(state.active_pane, Some(code_agent_ui::PaneKind::Transcript));
+    assert_eq!(state.active_pane, Some(ccrust_ui::PaneKind::Transcript));
     assert_eq!(
         state
             .message_actions
@@ -780,7 +780,7 @@ fn build_repl_ui_state_keeps_prompt_visible_for_message_actions() {
 
 #[test]
 fn build_repl_ui_state_exposes_transcript_selection() {
-    let app = code_agent_ui::RatatuiApp::new("repl-selection");
+    let app = ccrust_ui::RatatuiApp::new("repl-selection");
     let registry = compatibility_command_registry();
     let interaction_state = ReplInteractionState {
         transcript_mode: true,
@@ -811,10 +811,10 @@ fn build_repl_ui_state_exposes_transcript_selection() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         SessionId::new_v4(),
-        &code_agent_ui::InputBuffer::new(),
+        &ccrust_ui::InputBuffer::new(),
         "status",
         None,
-        code_agent_ui::PaneKind::Tasks,
+        ccrust_ui::PaneKind::Tasks,
         None,
         0,
         None,
@@ -835,7 +835,7 @@ fn message_action_copy_prefers_tool_primary_input() {
     let assistant_tool_call = Message::new(
         MessageRole::Assistant,
         vec![ContentBlock::ToolCall {
-            call: code_agent_core::ToolCall {
+            call: ccrust_core::ToolCall {
                 id: "tool-call-1".to_owned(),
                 name: "run_in_terminal".to_owned(),
                 input_json: json!({
@@ -867,7 +867,7 @@ async fn config_migrate_reports_compatibility_inputs() {
     let session_id = SessionId::new_v4();
     let root = env::temp_dir();
     let registry = resolved_command_registry(&root, None).await;
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let invocation = CommandInvocation {
         name: "config".to_owned(),
         args: vec!["migrate".to_owned()],
@@ -908,7 +908,7 @@ async fn repl_config_command_reports_runtime_state() {
     let mut active_model = "claude-sonnet-4-6".to_owned();
     let session_id = SessionId::new_v4();
     let mut raw_messages = Vec::new();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
 
     let status = handle_repl_slash_command(
@@ -947,7 +947,7 @@ async fn repl_ide_command_reports_bridge_state() {
     let mut active_model = "claude-sonnet-4-6".to_owned();
     let session_id = SessionId::new_v4();
     let mut raw_messages = Vec::new();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
 
     let disconnected = handle_repl_slash_command(

@@ -115,7 +115,7 @@ impl Tool for TodoWriteTool {
         if !todos.is_array() {
             bail!("todo_write expects an array field named 'items' or 'todos'");
         }
-        let path = context.cwd.join(".code-agent").join("todos.json");
+        let path = context.cwd.join(".claude").join("todos.json");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -146,7 +146,7 @@ impl Tool for MemoryTool {
     }
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let path = context.cwd.join(".code-agent").join("memory.json");
+        let path = context.cwd.join(".claude").join("memory.json");
         let action = input_string_or(&input, "action", "read");
         match action.as_str() {
             "read" => {

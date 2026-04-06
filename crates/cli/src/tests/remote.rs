@@ -65,7 +65,7 @@ async fn repl_mcp_auth_login_starts_device_flow() {
     let session_id = SessionId::new_v4();
     let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
     let mut raw_messages = Vec::new();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
     write_test_file(
         &root.join(".claude-plugin/plugin.json"),
@@ -126,7 +126,7 @@ async fn repl_remote_control_reports_local_state() {
     let session_id = SessionId::new_v4();
     let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
     let mut raw_messages = Vec::new();
-    let mut vim_state = code_agent_ui::vim::VimState::default();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut repl_session = repl_session_state(session_id);
 
     let status = handle_repl_slash_command(
@@ -579,7 +579,7 @@ async fn local_bridge_handler_requires_permission_for_remote_tool_calls() {
 
     let initial = handler
         .on_envelope(&RemoteEnvelope::ToolCall {
-            call: code_agent_core::ToolCall {
+            call: ccrust_core::ToolCall {
                 id: "remote-write".to_owned(),
                 name: "file_write".to_owned(),
                 input_json: json!({

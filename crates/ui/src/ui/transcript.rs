@@ -29,10 +29,10 @@ fn content_block_text(block: &ContentBlock) -> Option<String> {
         ContentBlock::ToolResult { result } => Some(result.output_text.clone()),
         ContentBlock::Boundary { boundary } => Some(
             match boundary.kind {
-                code_agent_core::BoundaryKind::Compact => "[compact boundary]",
-                code_agent_core::BoundaryKind::MicroCompact => "[micro-compact boundary]",
-                code_agent_core::BoundaryKind::SessionMemory => "[session-memory boundary]",
-                code_agent_core::BoundaryKind::Resume => "[resume boundary]",
+                ccrust_core::BoundaryKind::Compact => "[compact boundary]",
+                ccrust_core::BoundaryKind::MicroCompact => "[micro-compact boundary]",
+                ccrust_core::BoundaryKind::SessionMemory => "[session-memory boundary]",
+                ccrust_core::BoundaryKind::Resume => "[resume boundary]",
             }
             .to_owned(),
         ),

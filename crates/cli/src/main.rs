@@ -23,37 +23,37 @@ use cli_args::*;
 mod reports;
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use code_agent_bridge::{
+use ccrust_bridge::{
     base64_decode, base64_encode, connect_and_exchange, serve_bridge_session, serve_direct_session,
     AssistantDirective, BridgeServerConfig, BridgeSessionHandler, RemoteEndpoint, RemoteEnvelope,
     RemoteMode, RemotePermissionRequest, RemoteSessionState, ResumeSessionRequest, VoiceFrame,
 };
-use code_agent_core::{
+use ccrust_core::{
     compatibility_command_registry, coordinator_tasks, create_coordinator_synthesis_task,
     create_coordinator_task, create_coordinator_worker_task, resume_tasks_for_question,
     update_task_record, AppEvent, BoundaryKind, CommandInvocation, CommandRegistry, CommandSource,
     CommandSpec, ContentBlock, LocalTaskStore as CoreLocalTaskStore, Message, MessageRole,
     QuestionRequest, QuestionResponse, SessionId, TaskRecord, TaskStatus, TaskStore,
 };
-use code_agent_mcp::parse_mcp_server_configs;
-use code_agent_plugins::{
+use ccrust_mcp::parse_mcp_server_configs;
+use ccrust_plugins::{
     BridgeLaunchRequest, CommandDefinitions, OutOfProcessPluginRuntime, PluginManifest,
     PluginRuntime, PLUGIN_MANIFEST_PATH, SKILL_FILE_NAME,
 };
-use code_agent_providers::{
+use ccrust_providers::{
     build_provider, clear_auth_snapshot, code_agent_auth_snapshot_path,
     compatibility_model_catalog, config_migration_report, get_anthropic_credential_hint,
     get_openai_credential_hint, ApiProvider, AuthRequest, AuthResolver, EnvironmentAuthResolver,
     ModelCatalog, ProviderEvent, ProviderRequest, ProviderToolDefinition,
 };
-use code_agent_session::{
+use ccrust_session::{
     agent_transcript_path_for, claude_config_home_dir, compact_messages, estimate_message_tokens,
     extract_last_json_string_field, get_project_dir, import_transcript_to_session_root,
     materialize_runtime_messages, CompactionConfig, CompactionOutcome, JsonlTranscriptCodec,
     SessionSummary, TranscriptCodec,
 };
-use code_agent_tools::{compatibility_tool_registry, ToolCallRequest, ToolContext, ToolRegistry};
-use code_agent_ui::{
+use ccrust_tools::{compatibility_tool_registry, ToolCallRequest, ToolContext, ToolRegistry};
+use ccrust_ui::{
     draw_terminal as draw_tui, mouse_action_for_position, render_to_string as render_tui_to_string,
     transcript_line_from_message, transcript_search_match_items, transcript_search_scroll_for_view,
     transcript_selectable_lines_for_view, transcript_selection_text_for_view,
@@ -90,7 +90,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 #[cfg(test)]
-use code_agent_providers::EchoProvider;
+use ccrust_providers::EchoProvider;
 
 const UI_EVENT_TAG: &str = "ui_event";
 const UI_ROLE_ATTRIBUTE: &str = "ui_role";

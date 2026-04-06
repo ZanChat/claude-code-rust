@@ -26,21 +26,21 @@ use super::{
     StartupPreferences, StartupScreen,
 };
 use crate::commands::should_enable_mouse_capture;
-use code_agent_bridge::{
+use ccrust_bridge::{
     base64_encode, serve_direct_session, AssistantDirective, BridgeServerConfig,
     BridgeSessionHandler, RemoteEnvelope, RemotePermissionResponse, ResumeSessionRequest,
     VoiceFrame,
 };
-use code_agent_core::{
+use ccrust_core::{
     compatibility_command_registry, CommandInvocation, CommandSource, ContentBlock, SessionId,
     TaskRecord, TaskStatus, ToolCall,
 };
-use code_agent_providers::{
+use ccrust_providers::{
     ApiProvider, DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
 };
-use code_agent_session::{materialize_runtime_messages, LocalSessionStore, SessionSummary};
-use code_agent_tools::compatibility_tool_registry;
-use code_agent_ui::{
+use ccrust_session::{materialize_runtime_messages, LocalSessionStore, SessionSummary};
+use ccrust_tools::compatibility_tool_registry;
+use ccrust_ui::{
     PromptSelectionState, TranscriptItem, TranscriptSelectionPoint, TranscriptSelectionState,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};

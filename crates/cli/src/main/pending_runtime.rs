@@ -1,20 +1,20 @@
 async fn run_pending_repl_operation<F, T>(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    registry: &code_agent_core::CommandRegistry,
+    registry: &ccrust_core::CommandRegistry,
     pending_view: Arc<Mutex<PendingReplView>>,
     cwd: &Path,
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     prompt_history_index: &mut Option<usize>,
-    prompt_history_draft: &mut Option<code_agent_ui::InputBuffer>,
+    prompt_history_draft: &mut Option<ccrust_ui::InputBuffer>,
     status_line: &str,
     active_pane: &mut PaneKind,
     compact_banner: Option<String>,
     transcript_scroll: &mut u16,
     selected_command_suggestion: &mut usize,
-    vim_state: &mut code_agent_ui::vim::VimState,
+    vim_state: &mut ccrust_ui::vim::VimState,
     interaction_state: &mut ReplInteractionState,
     operation: F,
 ) -> Result<PendingReplOperationResult<T>>
@@ -1159,11 +1159,11 @@ where
 
                     match key.code {
                         KeyCode::Esc if vim_state.enabled => {
-                            if matches!(vim_state.mode, code_agent_ui::vim::VimMode::Insert) {
+                            if matches!(vim_state.mode, ccrust_ui::vim::VimMode::Insert) {
                                 vim_state.enter_normal();
                             } else {
-                                vim_state.mode = code_agent_ui::vim::VimMode::Normal(
-                                    code_agent_ui::vim::CommandState::Idle,
+                                vim_state.mode = ccrust_ui::vim::VimMode::Normal(
+                                    ccrust_ui::vim::CommandState::Idle,
                                 );
                             }
                         }

@@ -2,14 +2,14 @@ use crate::{
     auth_hint_for_provider, friendly_auth_source, persist_managed_login_env, user_ccrust_env_path,
     workspace_is_empty, ManagedLoginConfigState,
 };
-use code_agent_session::claude_config_home_dir;
+use ccrust_session::claude_config_home_dir;
 use crossterm::event;
 
 use crate::{
     apply_repl_header, is_paste_shortcut, read_text_from_clipboard, repl_status, status_with_detail,
 };
 use crate::{scroll_down, scroll_up};
-use code_agent_ui::{
+use ccrust_ui::{
     draw_terminal as draw_tui, ChoiceListItem, ChoiceListState, PaneKind, RatatuiApp,
     TranscriptLine,
 };
@@ -22,11 +22,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use code_agent_ui::{CommandPaletteEntry, PanePreview, UiState};
+use ccrust_ui::{CommandPaletteEntry, PanePreview, UiState};
 
-use code_agent_core::SessionId;
+use ccrust_core::SessionId;
 
-use code_agent_providers::{
+use ccrust_providers::{
     compatibility_model_catalog, get_anthropic_auth_material, get_openai_auth_status,
     get_openai_completion_model, get_openai_completion_think_level, get_openai_reasoning_model,
     get_openai_reasoning_think_level, is_openai_provider, provider_descriptor,
@@ -76,7 +76,7 @@ pub(crate) struct StartupScreen {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StartupFlowResult {
-    pub(crate) input_buffer: code_agent_ui::InputBuffer,
+    pub(crate) input_buffer: ccrust_ui::InputBuffer,
     pub(crate) provider: ApiProvider,
 }
 
@@ -467,7 +467,7 @@ pub(crate) fn run_startup_flow<B: ratatui::backend::Backend>(
 ) -> Result<StartupFlowResult> {
     if screens.is_empty() {
         return Ok(StartupFlowResult {
-            input_buffer: code_agent_ui::InputBuffer::new(),
+            input_buffer: ccrust_ui::InputBuffer::new(),
             provider,
         });
     }
@@ -587,7 +587,7 @@ pub(crate) fn run_startup_flow<B: ratatui::backend::Backend>(
                 KeyCode::Esc => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 KeyCode::Char(ch) if key.modifiers.is_empty() && screen.show_input => {
-                    let mut input_buffer = code_agent_ui::InputBuffer::new();
+                    let mut input_buffer = ccrust_ui::InputBuffer::new();
                     input_buffer.push(ch);
                     return Ok(StartupFlowResult {
                         input_buffer,
@@ -601,7 +601,7 @@ pub(crate) fn run_startup_flow<B: ratatui::backend::Backend>(
     }
 
     Ok(StartupFlowResult {
-        input_buffer: code_agent_ui::InputBuffer::new(),
+        input_buffer: ccrust_ui::InputBuffer::new(),
         provider: selected_provider,
     })
 }
@@ -618,15 +618,15 @@ fn onboarding_status_line(
     )
 }
 
-fn masked_input_buffer(input_buffer: &code_agent_ui::InputBuffer) -> code_agent_ui::InputBuffer {
-    let mut masked = code_agent_ui::InputBuffer::new();
+fn masked_input_buffer(input_buffer: &ccrust_ui::InputBuffer) -> ccrust_ui::InputBuffer {
+    let mut masked = ccrust_ui::InputBuffer::new();
     masked.chars = vec!['*'; input_buffer.chars.len()];
     masked.cursor = input_buffer.cursor.min(masked.chars.len());
     masked
 }
 
 pub(crate) fn insert_onboarding_input_text(
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     text: &str,
 ) -> bool {
     let mut inserted = false;
@@ -670,7 +670,7 @@ fn draw_onboarding_state<B: ratatui::backend::Backend>(
     cwd: &Path,
     step_label: &str,
     screen: &StartupScreen,
-    input_buffer: Option<&code_agent_ui::InputBuffer>,
+    input_buffer: Option<&ccrust_ui::InputBuffer>,
     secret_input: bool,
 ) -> Result<()> {
     let app = RatatuiApp::new(format!("{provider}  {active_model}"));
@@ -803,7 +803,7 @@ fn run_onboarding_input_step<B: ratatui::backend::Backend>(
     required: bool,
     validator: Option<fn(&str) -> bool>,
 ) -> Result<Option<String>> {
-    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    let mut input_buffer = ccrust_ui::InputBuffer::new();
     input_buffer.replace(initial_value);
     let mut compact_banner = None;
 

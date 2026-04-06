@@ -328,8 +328,8 @@ pub fn mcp_auth_cache_dir() -> PathBuf {
         return PathBuf::from(codex_home).join("mcp-auth");
     }
     match env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(".code-agent").join("mcp-auth"),
-        None => PathBuf::from(".code-agent").join("mcp-auth"),
+        Some(home) => PathBuf::from(home).join(".claude").join("mcp-auth"),
+        None => PathBuf::from(".claude").join("mcp-auth"),
     }
 }
 

@@ -5,7 +5,7 @@ use super::{
     summarize_transcript_path, transcript_path_for, CompactionConfig, JsonlTranscriptCodec,
     LocalSessionStore, TranscriptCodec,
 };
-use code_agent_core::{BoundaryKind, ContentBlock, Message, MessageRole};
+use ccrust_core::{BoundaryKind, ContentBlock, Message, MessageRole};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};

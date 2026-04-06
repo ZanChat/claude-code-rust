@@ -10,7 +10,7 @@ pub(crate) async fn handle_repl_slash_command(
     repl_session: &mut ReplSessionState,
     raw_messages: &mut Vec<Message>,
     live_runtime: bool,
-    vim_state: &mut code_agent_ui::vim::VimState,
+    vim_state: &mut ccrust_ui::vim::VimState,
     remote_mode: bool,
     ide_bridge_active: bool,
 ) -> Result<String> {
@@ -173,7 +173,7 @@ pub(crate) async fn handle_repl_slash_command(
             if vim_state.enabled {
                 vim_state.enter_normal();
             } else {
-                vim_state.mode = code_agent_ui::vim::VimMode::Insert;
+                vim_state.mode = ccrust_ui::vim::VimMode::Insert;
             }
             render_vim_command(vim_state.enabled)
         }
@@ -237,7 +237,7 @@ enum ReplSubmissionOutcome {
 async fn process_repl_submission(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     store: &ActiveSessionStore,
-    registry: &code_agent_core::CommandRegistry,
+    registry: &ccrust_core::CommandRegistry,
     tool_registry: &ToolRegistry,
     cwd: &PathBuf,
     plugin_root: Option<&PathBuf>,
@@ -247,10 +247,10 @@ async fn process_repl_submission(
     raw_messages: &mut Vec<Message>,
     live_runtime: &mut bool,
     prompt_text: String,
-    input_buffer: &mut code_agent_ui::InputBuffer,
+    input_buffer: &mut ccrust_ui::InputBuffer,
     prompt_history: &mut Vec<String>,
     prompt_history_index: &mut Option<usize>,
-    prompt_history_draft: &mut Option<code_agent_ui::InputBuffer>,
+    prompt_history_draft: &mut Option<ccrust_ui::InputBuffer>,
     transcript_scroll: &mut u16,
     status_line: &mut String,
     status_marquee_tick: &mut usize,
@@ -261,7 +261,7 @@ async fn process_repl_submission(
     ide_picker: &mut Option<ReplIdePickerState>,
     connected_ide_bridge: &Option<DetectedIdeCandidate>,
     selected_command_suggestion: &mut usize,
-    vim_state: &mut code_agent_ui::vim::VimState,
+    vim_state: &mut ccrust_ui::vim::VimState,
     login_config: &mut ManagedLoginConfigState,
     remote_mode: bool,
     ide_bridge_active: bool,

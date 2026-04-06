@@ -377,10 +377,10 @@ impl Provider for EchoProvider {
             .messages
             .iter()
             .rev()
-            .find(|message| matches!(message.role, code_agent_core::MessageRole::User))
+            .find(|message| matches!(message.role, ccrust_core::MessageRole::User))
             .and_then(|message| {
                 message.blocks.iter().find_map(|block| match block {
-                    code_agent_core::ContentBlock::Text { text } => Some(text.clone()),
+                    ccrust_core::ContentBlock::Text { text } => Some(text.clone()),
                     _ => None,
                 })
             })

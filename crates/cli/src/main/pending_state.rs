@@ -165,10 +165,10 @@ fn provider_assistant_message(
     session_id: SessionId,
     parent_id: Option<Uuid>,
     text: String,
-    tool_calls: Vec<code_agent_core::ToolCall>,
+    tool_calls: Vec<ccrust_core::ToolCall>,
     provider: ApiProvider,
     model: &str,
-    usage: Option<code_agent_core::TokenUsage>,
+    usage: Option<ccrust_core::TokenUsage>,
 ) -> Message {
     let mut assistant_message = build_assistant_message(session_id, parent_id, text, tool_calls);
     assistant_message.metadata.provider = Some(provider.to_string());

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use code_agent_core::{
+use ccrust_core::{
     AppEvent, Message, QuestionRequest, QuestionResponse, SessionId, TaskRecord, ToolCall,
     ToolResult,
 };
@@ -559,7 +559,7 @@ mod tests {
     };
     use anyhow::Result;
     use async_trait::async_trait;
-    use code_agent_core::{ContentBlock, Message, MessageRole};
+    use ccrust_core::{ContentBlock, Message, MessageRole};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn relays_websocket_messages_and_special_envelopes() {

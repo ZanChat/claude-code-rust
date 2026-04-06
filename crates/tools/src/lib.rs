@@ -1,17 +1,17 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use code_agent_core::{
+use ccrust_core::{
     create_agent_task, create_workflow_task_set, AgentTaskRequest, LocalTaskStore, QuestionRequest,
     SessionId, TaskRecord, TaskStatus, TaskStore, WorkflowTaskRequest,
 };
-use code_agent_mcp::{
+use ccrust_mcp::{
     call_tool_from_config, clear_cached_auth_token, clear_pending_device_flow,
     list_resources_from_config, load_cached_auth_token, load_pending_device_flow,
     parse_mcp_server_configs, poll_oauth_device_flow, read_resource_from_config,
     refresh_oauth_device_token, start_oauth_device_flow, store_cached_auth_token,
     CachedMcpAuthToken, McpAuthConfig, McpServerConfig,
 };
-use code_agent_plugins::{OutOfProcessPluginRuntime, PluginRuntime};
+use ccrust_plugins::{OutOfProcessPluginRuntime, PluginRuntime};
 use reqwest::Method;
 use schemars::schema::RootSchema;
 use schemars::JsonSchema;

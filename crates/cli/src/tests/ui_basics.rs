@@ -136,11 +136,11 @@ fn startup_screens_skip_resumed_sessions() {
 
 #[test]
 fn startup_ui_state_shows_prompt_and_scroll_state() {
-    let app = code_agent_ui::RatatuiApp::new("startup");
+    let app = ccrust_ui::RatatuiApp::new("startup");
     let screens = vec![super::StartupScreen {
         title: "Setup".to_owned(),
         body: vec!["line one".to_owned(), "line two".to_owned()],
-        preview: code_agent_ui::PanePreview {
+        preview: ccrust_ui::PanePreview {
             title: "Next".to_owned(),
             lines: vec!["step".to_owned()],
         },
@@ -171,7 +171,7 @@ fn startup_ui_state_shows_prompt_and_scroll_state() {
         state.prompt_helper.as_deref(),
         Some("Type to enter the REPL immediately. Enter also continues.")
     );
-    assert_eq!(state.active_pane, Some(code_agent_ui::PaneKind::Transcript));
+    assert_eq!(state.active_pane, Some(ccrust_ui::PaneKind::Transcript));
     assert!(state
         .header_context
         .as_deref()
@@ -366,7 +366,7 @@ fn task_entries_for_ui_preserve_parent_child_structure() {
 #[test]
 fn command_suggestions_follow_slash_prefixes() {
     let registry = compatibility_command_registry();
-    let mut input = code_agent_ui::InputBuffer::new();
+    let mut input = ccrust_ui::InputBuffer::new();
     input.replace("/h");
 
     let suggestions = command_suggestions(&registry, &input);
@@ -379,7 +379,7 @@ fn command_suggestions_follow_slash_prefixes() {
 #[test]
 fn command_suggestions_stop_after_command_arguments_start() {
     let registry = compatibility_command_registry();
-    let mut input = code_agent_ui::InputBuffer::new();
+    let mut input = ccrust_ui::InputBuffer::new();
     input.replace(format!("/model {DEFAULT_OPENAI_REASONING_MODEL}"));
 
     let suggestions = command_suggestions(&registry, &input);
@@ -390,7 +390,7 @@ fn command_suggestions_stop_after_command_arguments_start() {
 #[test]
 fn prompt_up_prioritizes_command_suggestions_before_history() {
     let registry = compatibility_command_registry();
-    let mut input = code_agent_ui::InputBuffer::new();
+    let mut input = ccrust_ui::InputBuffer::new();
     input.replace("/m");
     let history = vec!["older prompt".to_owned()];
     let mut selected_command_suggestion = 0usize;
@@ -418,7 +418,7 @@ fn prompt_up_prioritizes_command_suggestions_before_history() {
 #[test]
 fn prompt_down_prioritizes_command_suggestions_before_history() {
     let registry = compatibility_command_registry();
-    let mut input = code_agent_ui::InputBuffer::new();
+    let mut input = ccrust_ui::InputBuffer::new();
     input.replace("/m");
     let history = vec!["older prompt".to_owned()];
     let mut selected_command_suggestion = 0usize;
@@ -451,19 +451,19 @@ fn pane_shortcut_accepts_supported_platform_modifiers() {
     let control_shortcut = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL);
     assert_eq!(
         pane_from_shortcut(&control_shortcut),
-        Some(code_agent_ui::PaneKind::Transcript)
+        Some(ccrust_ui::PaneKind::Transcript)
     );
 
     let super_shortcut = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SUPER);
     assert_eq!(
         pane_from_shortcut(&super_shortcut),
-        Some(code_agent_ui::PaneKind::Transcript)
+        Some(ccrust_ui::PaneKind::Transcript)
     );
 
     let alt_shortcut = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT);
     assert_eq!(
         pane_from_shortcut(&alt_shortcut),
-        Some(code_agent_ui::PaneKind::Transcript)
+        Some(ccrust_ui::PaneKind::Transcript)
     );
 
     let shifted_control_shortcut = KeyEvent::new(
@@ -480,42 +480,42 @@ fn pane_shortcut_accepts_apple_terminal_option_symbols() {
             &KeyEvent::new(KeyCode::Char('¡'), KeyModifiers::NONE),
             Some("Apple_Terminal")
         ),
-        Some(code_agent_ui::PaneKind::Transcript)
+        Some(ccrust_ui::PaneKind::Transcript)
     );
     assert_eq!(
         pane_from_shortcut_for_terminal(
             &KeyEvent::new(KeyCode::Char('™'), KeyModifiers::NONE),
             Some("Apple_Terminal")
         ),
-        Some(code_agent_ui::PaneKind::Diff)
+        Some(ccrust_ui::PaneKind::Diff)
     );
     assert_eq!(
         pane_from_shortcut_for_terminal(
             &KeyEvent::new(KeyCode::Char('£'), KeyModifiers::NONE),
             Some("Apple_Terminal")
         ),
-        Some(code_agent_ui::PaneKind::FileViewer)
+        Some(ccrust_ui::PaneKind::FileViewer)
     );
     assert_eq!(
         pane_from_shortcut_for_terminal(
             &KeyEvent::new(KeyCode::Char('¢'), KeyModifiers::NONE),
             Some("Apple_Terminal")
         ),
-        Some(code_agent_ui::PaneKind::Tasks)
+        Some(ccrust_ui::PaneKind::Tasks)
     );
     assert_eq!(
         pane_from_shortcut_for_terminal(
             &KeyEvent::new(KeyCode::Char('∞'), KeyModifiers::NONE),
             Some("Apple_Terminal")
         ),
-        Some(code_agent_ui::PaneKind::Permissions)
+        Some(ccrust_ui::PaneKind::Permissions)
     );
     assert_eq!(
         pane_from_shortcut_for_terminal(
             &KeyEvent::new(KeyCode::Char('§'), KeyModifiers::NONE),
             Some("Apple_Terminal")
         ),
-        Some(code_agent_ui::PaneKind::Logs)
+        Some(ccrust_ui::PaneKind::Logs)
     );
     assert!(pane_from_shortcut_for_terminal(
         &KeyEvent::new(KeyCode::Char('¡'), KeyModifiers::NONE),
@@ -563,7 +563,7 @@ fn paste_shortcut_matches_expected_bindings() {
 
 #[test]
 fn onboarding_input_insert_pastes_at_cursor_and_ignores_line_breaks() {
-    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    let mut input_buffer = ccrust_ui::InputBuffer::new();
     input_buffer.replace("abef");
     input_buffer.cursor = 2;
 
@@ -575,7 +575,7 @@ fn onboarding_input_insert_pastes_at_cursor_and_ignores_line_breaks() {
 
 #[test]
 fn onboarding_input_insert_ignores_line_break_only_paste() {
-    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    let mut input_buffer = ccrust_ui::InputBuffer::new();
     input_buffer.replace("token");
     let before = input_buffer.clone();
 
@@ -656,7 +656,7 @@ fn ctrl_r_enters_prompt_history_search_only_from_prompt_mode() {
 
 #[test]
 fn prompt_selection_extracts_selected_input_text() {
-    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    let mut input_buffer = ccrust_ui::InputBuffer::new();
     input_buffer.replace("abcdef");
     input_buffer.cursor = 1;
     let mut interaction_state = ReplInteractionState::default();
@@ -687,7 +687,7 @@ fn prompt_selection_extracts_selected_input_text() {
 
 #[test]
 fn delete_prompt_selection_removes_selected_range() {
-    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    let mut input_buffer = ccrust_ui::InputBuffer::new();
     input_buffer.replace("abcdef");
     let mut interaction_state = ReplInteractionState::default();
     interaction_state.prompt_selection = Some(PromptSelectionState {
@@ -707,7 +707,7 @@ fn delete_prompt_selection_removes_selected_range() {
 
 #[test]
 fn insert_prompt_text_replaces_selected_range() {
-    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    let mut input_buffer = ccrust_ui::InputBuffer::new();
     input_buffer.replace("abcdef");
     let mut interaction_state = ReplInteractionState::default();
     interaction_state.prompt_selection = Some(PromptSelectionState {
@@ -728,7 +728,7 @@ fn insert_prompt_text_replaces_selected_range() {
 
 #[test]
 fn prompt_mouse_drag_updates_cursor_and_selection() {
-    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    let mut input_buffer = ccrust_ui::InputBuffer::new();
     input_buffer.replace("abcdef");
     let mut interaction_state = ReplInteractionState::default();
 
@@ -799,7 +799,7 @@ fn prompt_history_seeds_from_user_messages_only() {
 #[test]
 fn prompt_history_navigation_restores_draft_after_latest_entry() {
     let history = vec!["alpha".to_owned(), "beta".to_owned()];
-    let mut input = code_agent_ui::InputBuffer::new();
+    let mut input = ccrust_ui::InputBuffer::new();
     input.replace("draft");
     let mut history_index = None;
     let mut history_draft = None;
@@ -863,7 +863,7 @@ fn prompt_history_search_preview_cancel_and_accept_follow_ts_behavior() {
         "alpha beta".to_owned(),
         "beta two".to_owned(),
     ];
-    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    let mut input_buffer = ccrust_ui::InputBuffer::new();
     input_buffer.replace("draft prompt");
     let mut interaction_state = ReplInteractionState::default();
 

@@ -132,7 +132,7 @@ fn resolve_path(cwd: &Path, value: &str) -> PathBuf {
 }
 
 fn runtime_dir(cwd: &Path) -> PathBuf {
-    cwd.join(".code-agent")
+    cwd.join(".claude")
 }
 
 fn task_store(cwd: &Path) -> LocalTaskStore {

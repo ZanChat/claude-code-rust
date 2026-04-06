@@ -8,9 +8,7 @@ use super::{
     TaskUiEntry, TranscriptGroup, TranscriptItem, TranscriptLine, TranscriptMessageActionsState,
     TranscriptSearchState, TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
 };
-use code_agent_core::{
-    compatibility_command_registry, ContentBlock, Message, MessageRole, TaskStatus,
-};
+use ccrust_core::{compatibility_command_registry, ContentBlock, Message, MessageRole, TaskStatus};
 use ratatui::style::Color;
 use std::collections::BTreeMap;
 

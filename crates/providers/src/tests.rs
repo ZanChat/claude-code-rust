@@ -9,7 +9,7 @@ use super::{
     OpenAIAuthSource, OpenAITokenFreshness, ProviderRequest, ProviderToolDefinition,
     DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
 };
-use code_agent_core::{ContentBlock, Message, MessageRole, ToolCall};
+use ccrust_core::{ContentBlock, Message, MessageRole, ToolCall};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::env;
