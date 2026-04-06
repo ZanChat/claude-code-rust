@@ -116,6 +116,7 @@ pub struct TranscriptLine {
     pub role: String,
     pub text: String,
     pub author_label: Option<String>,
+    pub token_label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

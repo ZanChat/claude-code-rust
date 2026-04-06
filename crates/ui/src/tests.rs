@@ -8,7 +8,9 @@ use super::{
     TaskUiEntry, TranscriptGroup, TranscriptItem, TranscriptLine, TranscriptMessageActionsState,
     TranscriptSearchState, TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
 };
-use ccrust_core::{compatibility_command_registry, ContentBlock, Message, MessageRole, TaskStatus};
+use ccrust_core::{
+    compatibility_command_registry, ContentBlock, Message, MessageRole, TaskStatus, TokenUsage,
+};
 use ratatui::style::Color;
 use std::collections::BTreeMap;
 
@@ -82,6 +84,7 @@ fn renders_compact_layout_for_narrow_terminals() {
         role: "user".to_owned(),
         text: "This layout should collapse cleanly when the terminal is narrow.".to_owned(),
         author_label: None,
+        token_label: None,
     }];
     state.show_input = true;
     state.task_preview.title = "Setup".to_owned();
@@ -386,6 +389,7 @@ fn transcript_widget_supports_scroll_offset() {
             },
             text: format!("line {index}"),
             author_label: None,
+            token_label: None,
         })
         .collect();
     let pinned = render_to_string(&state, 60, 10).unwrap();
@@ -414,6 +418,48 @@ fn assistant_rows_use_model_and_channel_author_label() {
     let rendered = render_to_string(&state, 100, 24).unwrap();
 
     assert!(rendered.contains("gemini-3.1-pro-preview(openai-compatible)"));
+}
+
+#[test]
+fn assistant_rows_render_exact_usage_token_labels() {
+    let mut assistant = Message::new(
+        MessageRole::Assistant,
+        vec![ContentBlock::Text {
+            text: "Ready".to_owned(),
+        }],
+    );
+    assistant.metadata.model = Some("gpt-5.4".to_owned());
+    assistant.metadata.provider = Some("chatgpt-codex".to_owned());
+    assistant.metadata.usage = Some(TokenUsage {
+        input_tokens: 10,
+        output_tokens: 3,
+        cache_creation_input_tokens: 2,
+        cache_read_input_tokens: 5,
+    });
+
+    let state = RatatuiApp::new("usage")
+        .state_from_messages(vec![assistant], &compatibility_command_registry().all());
+    let rendered = render_to_string(&state, 100, 24).unwrap();
+
+    assert!(rendered.contains("gpt-5.4(chatgpt-codex)"));
+    assert!(rendered.contains("20 tok (in 10, out 3, cache 7)"));
+}
+
+#[test]
+fn non_assistant_rows_render_estimated_context_tokens() {
+    let state = RatatuiApp::new("estimated").state_from_messages(
+        vec![Message::new(
+            MessageRole::User,
+            vec![ContentBlock::Text {
+                text: "Inspect the diff and explain the failures.".to_owned(),
+            }],
+        )],
+        &compatibility_command_registry().all(),
+    );
+    let rendered = render_to_string(&state, 100, 24).unwrap();
+
+    assert!(rendered.contains("You"));
+    assert!(rendered.contains("ctx tok"));
 }
 
 #[test]
@@ -508,6 +554,7 @@ fn transcript_groups_render_and_toggle_from_mouse_hit_testing() {
             role: "assistant".to_owned(),
             text: "Tool call: list_dir".to_owned(),
             author_label: Some("gpt-5.4(chatgpt-codex)".to_owned()),
+            token_label: None,
         }],
     }];
 
@@ -558,6 +605,7 @@ fn transcript_item_history_group_arrow_has_click_target() {
             role: "history_tool_call".to_owned(),
             text: "Read src/lib.rs".to_owned(),
             author_label: None,
+            token_label: None,
         }],
     })];
 
@@ -594,6 +642,7 @@ fn history_group_toggle_hit_testing_covers_visible_header_text() {
             role: "history_tool_call".to_owned(),
             text: "Read src/lib.rs".to_owned(),
             author_label: None,
+            token_label: None,
         }],
     })];
 
@@ -710,11 +759,13 @@ fn transcript_search_matches_visible_items() {
             role: "user".to_owned(),
             text: "first prompt".to_owned(),
             author_label: None,
+            token_label: None,
         },
         TranscriptLine {
             role: "assistant".to_owned(),
             text: "error output".to_owned(),
             author_label: None,
+            token_label: None,
         },
     ];
     state.transcript_groups = vec![TranscriptGroup {
@@ -727,6 +778,7 @@ fn transcript_search_matches_visible_items() {
             role: "assistant".to_owned(),
             text: "resolved".to_owned(),
             author_label: None,
+            token_label: None,
         }],
     }];
 
@@ -746,6 +798,7 @@ fn single_item_transcript_groups_search_hidden_children() {
             role: "assistant".to_owned(),
             text: "needle inside collapsed child".to_owned(),
             author_label: None,
+            token_label: None,
         }],
     })];
 
@@ -766,11 +819,13 @@ fn single_item_transcript_groups_render_compact_details_when_expanded() {
                 role: "history_tool_call".to_owned(),
                 text: "Read src/lib.rs".to_owned(),
                 author_label: None,
+                token_label: None,
             },
             TranscriptLine {
                 role: "history_tool_result".to_owned(),
                 text: "pub fn render_to_string(...)".to_owned(),
                 author_label: None,
+                token_label: None,
             },
         ],
     })];
@@ -800,6 +855,7 @@ fn transcript_search_scroll_targets_match() {
             role: "assistant".to_owned(),
             text: format!("line {index}"),
             author_label: None,
+            token_label: None,
         })
         .collect();
 
@@ -813,6 +869,7 @@ fn transcript_selection_text_uses_visual_line_slices() {
         role: "assistant".to_owned(),
         text: "abcdef".to_owned(),
         author_label: None,
+        token_label: None,
     }];
 
     let selectable_lines = transcript_selectable_lines_for_view(&state, 80);
@@ -846,6 +903,7 @@ fn transcript_selection_highlights_exact_range() {
         role: "assistant".to_owned(),
         text: "abcdef".to_owned(),
         author_label: None,
+        token_label: None,
     }];
     let selectable_lines = transcript_selectable_lines_for_view(&state, 80);
     let content_line = selectable_lines
@@ -926,6 +984,7 @@ fn message_actions_highlight_selected_transcript_item() {
         role: "user".to_owned(),
         text: "selected row".to_owned(),
         author_label: None,
+        token_label: None,
     }];
 
     let lines = transcript_visual_lines(&state, 80);

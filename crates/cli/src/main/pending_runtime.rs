@@ -6,6 +6,7 @@ async fn run_pending_repl_operation<F, T>(
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
+    total_usage_totals: UsageTotals,
     input_buffer: &mut ccrust_ui::InputBuffer,
     prompt_history_index: &mut Option<usize>,
     prompt_history_draft: &mut Option<ccrust_ui::InputBuffer>,
@@ -55,6 +56,7 @@ where
                             provider,
                             active_model,
                             session_id,
+                            total_usage_totals,
                             input_buffer,
                             status_line,
                             Some(format!(
@@ -135,6 +137,7 @@ where
                             provider,
                             active_model,
                             session_id,
+                            total_usage_totals,
                             input_buffer,
                             status_line,
                             Some(format!(
@@ -199,6 +202,7 @@ where
                                     provider,
                                     active_model,
                                     session_id,
+                                    total_usage_totals,
                                     input_buffer,
                                     status_line,
                                     Some(format!(
@@ -253,6 +257,7 @@ where
                                     provider,
                                     active_model,
                                     session_id,
+                                    total_usage_totals,
                                     input_buffer,
                                     status_line,
                                     Some(format!(
@@ -315,6 +320,7 @@ where
                                         provider,
                                         active_model,
                                         session_id,
+                                        total_usage_totals,
                                         input_buffer,
                                         status_line,
                                         Some(format!(
@@ -405,6 +411,7 @@ where
                                         provider,
                                         active_model,
                                         session_id,
+                                        total_usage_totals,
                                         input_buffer,
                                         status_line,
                                         Some(format!(
@@ -481,6 +488,7 @@ where
                                         provider,
                                         active_model,
                                         session_id,
+                                        total_usage_totals,
                                         input_buffer,
                                         status_line,
                                         Some(format!(
@@ -630,6 +638,7 @@ where
                                 provider,
                                 active_model,
                                 session_id,
+                                total_usage_totals,
                                 input_buffer,
                                 status_line,
                                 Some(format!(
@@ -766,6 +775,7 @@ where
                                         provider,
                                         active_model,
                                         session_id,
+                                        total_usage_totals,
                                         input_buffer,
                                         status_line,
                                         Some(format!(
@@ -820,6 +830,7 @@ where
                                         provider,
                                         active_model,
                                         session_id,
+                                        total_usage_totals,
                                         input_buffer,
                                         status_line,
                                         Some(format!(
@@ -857,6 +868,7 @@ where
                                         provider,
                                         active_model,
                                         session_id,
+                                        total_usage_totals,
                                         input_buffer,
                                         status_line,
                                         Some(format!(
@@ -898,6 +910,7 @@ where
                                         provider,
                                         active_model,
                                         session_id,
+                                        total_usage_totals,
                                         input_buffer,
                                         status_line,
                                         Some(format!(
@@ -940,6 +953,7 @@ where
                                         provider,
                                         active_model,
                                         session_id,
+                                        total_usage_totals,
                                         input_buffer,
                                         status_line,
                                         Some(format!(
@@ -984,6 +998,7 @@ where
                                 provider,
                                 active_model,
                                 session_id,
+                                total_usage_totals,
                                 input_buffer,
                                 status_line,
                                 Some(format!(
@@ -1056,6 +1071,7 @@ where
                                     provider,
                                     active_model,
                                     session_id,
+                                    total_usage_totals,
                                     input_buffer,
                                     status_line,
                                     Some(format!(
@@ -1096,6 +1112,7 @@ where
                                     provider,
                                     active_model,
                                     session_id,
+                                    total_usage_totals,
                                     input_buffer,
                                     status_line,
                                     Some(format!(
@@ -1305,6 +1322,7 @@ where
             provider,
             active_model,
             session_id,
+            total_usage_totals,
             input_buffer,
             status_line,
             Some(format!(
@@ -1335,4 +1353,3 @@ enum PendingReplOperationResult<T> {
     Completed(T),
     Interrupted,
 }
-

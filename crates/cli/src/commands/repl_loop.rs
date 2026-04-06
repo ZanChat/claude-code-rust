@@ -180,9 +180,19 @@ pub(crate) async fn run_interactive_repl(
         let mut queued_submissions = VecDeque::new();
         let mut interaction_state = ReplInteractionState::default();
         let mut pending_event = None;
+        let mut total_usage_totals = usage_totals_for_store(store).await?;
+        let mut tracked_usage_session_id = repl_session.session_id;
+        let mut tracked_session_usage_totals = usage_totals_for_messages(raw_messages);
         let mut dirty = true;
         loop {
             if dirty {
+                let current_session_usage_totals = usage_totals_for_messages(raw_messages);
+                if tracked_usage_session_id == repl_session.session_id {
+                    total_usage_totals.subtract_totals(tracked_session_usage_totals);
+                    total_usage_totals.add_totals(current_session_usage_totals);
+                }
+                tracked_usage_session_id = repl_session.session_id;
+                tracked_session_usage_totals = current_session_usage_totals;
                 draw_repl_state(
                     &mut terminal,
                     registry,
@@ -192,6 +202,7 @@ pub(crate) async fn run_interactive_repl(
                     provider,
                     &active_model,
                     repl_session.session_id,
+                    total_usage_totals,
                     &input_buffer,
                     &status_line,
                     None,
@@ -234,6 +245,7 @@ pub(crate) async fn run_interactive_repl(
                         raw_messages,
                         &mut live_runtime,
                         prompt_text,
+                        total_usage_totals,
                         &mut input_buffer,
                         &mut prompt_history,
                         &mut prompt_history_index,
@@ -313,6 +325,7 @@ pub(crate) async fn run_interactive_repl(
                             provider,
                             &active_model,
                             repl_session.session_id,
+                            total_usage_totals,
                             &input_buffer,
                             &status_line,
                             None,
@@ -409,6 +422,7 @@ pub(crate) async fn run_interactive_repl(
                         provider,
                         &active_model,
                         repl_session.session_id,
+                        total_usage_totals,
                         &input_buffer,
                         &status_line,
                         None,
@@ -683,6 +697,7 @@ pub(crate) async fn run_interactive_repl(
                             provider,
                             &active_model,
                             repl_session.session_id,
+                            total_usage_totals,
                             &input_buffer,
                             &status_line,
                             None,
@@ -736,6 +751,7 @@ pub(crate) async fn run_interactive_repl(
                             provider,
                             &active_model,
                             repl_session.session_id,
+                            total_usage_totals,
                             &input_buffer,
                             &status_line,
                             None,
@@ -795,6 +811,7 @@ pub(crate) async fn run_interactive_repl(
                                 provider,
                                 &active_model,
                                 repl_session.session_id,
+                                total_usage_totals,
                                 &input_buffer,
                                 &status_line,
                                 None,
@@ -879,6 +896,7 @@ pub(crate) async fn run_interactive_repl(
                                 provider,
                                 &active_model,
                                 repl_session.session_id,
+                                total_usage_totals,
                                 &input_buffer,
                                 &status_line,
                                 None,
@@ -966,6 +984,7 @@ pub(crate) async fn run_interactive_repl(
                                 provider,
                                 &active_model,
                                 repl_session.session_id,
+                                total_usage_totals,
                                 &input_buffer,
                                 &status_line,
                                 None,
@@ -1113,6 +1132,7 @@ pub(crate) async fn run_interactive_repl(
                         provider,
                         &active_model,
                         repl_session.session_id,
+                        total_usage_totals,
                         &input_buffer,
                         &status_line,
                         None,
@@ -1250,6 +1270,7 @@ pub(crate) async fn run_interactive_repl(
                                 provider,
                                 &active_model,
                                 repl_session.session_id,
+                                total_usage_totals,
                                 &input_buffer,
                                 &status_line,
                                 None,
@@ -1301,6 +1322,7 @@ pub(crate) async fn run_interactive_repl(
                                 provider,
                                 &active_model,
                                 repl_session.session_id,
+                                total_usage_totals,
                                 &input_buffer,
                                 &status_line,
                                 None,
@@ -1334,6 +1356,7 @@ pub(crate) async fn run_interactive_repl(
                                 provider,
                                 &active_model,
                                 repl_session.session_id,
+                                total_usage_totals,
                                 &input_buffer,
                                 &status_line,
                                 None,
@@ -1371,6 +1394,7 @@ pub(crate) async fn run_interactive_repl(
                                 provider,
                                 &active_model,
                                 repl_session.session_id,
+                                total_usage_totals,
                                 &input_buffer,
                                 &status_line,
                                 None,
@@ -1409,6 +1433,7 @@ pub(crate) async fn run_interactive_repl(
                                 provider,
                                 &active_model,
                                 repl_session.session_id,
+                                total_usage_totals,
                                 &input_buffer,
                                 &status_line,
                                 None,
@@ -1450,6 +1475,7 @@ pub(crate) async fn run_interactive_repl(
                         provider,
                         &active_model,
                         repl_session.session_id,
+                        total_usage_totals,
                         &input_buffer,
                         &status_line,
                         None,
@@ -1522,6 +1548,7 @@ pub(crate) async fn run_interactive_repl(
                             provider,
                             &active_model,
                             repl_session.session_id,
+                            total_usage_totals,
                             &input_buffer,
                             &status_line,
                             None,
@@ -1559,6 +1586,7 @@ pub(crate) async fn run_interactive_repl(
                             provider,
                             &active_model,
                             repl_session.session_id,
+                            total_usage_totals,
                             &input_buffer,
                             &status_line,
                             None,
@@ -1842,6 +1870,7 @@ pub(crate) async fn run_interactive_repl(
                         raw_messages,
                         &mut live_runtime,
                         prompt_text,
+                        total_usage_totals,
                         &mut input_buffer,
                         &mut prompt_history,
                         &mut prompt_history_index,

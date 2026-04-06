@@ -1092,6 +1092,7 @@ fn history_tool_result_detail_lines(result: &ccrust_core::ToolResult) -> Vec<Tra
             role: role.to_owned(),
             text,
             author_label: None,
+            token_label: None,
         })
         .collect()
 }
@@ -1105,6 +1106,7 @@ fn history_transcript_detail_lines(messages: &[Message]) -> Vec<TranscriptLine> 
                 role: "history_tool_call".to_owned(),
                 text: history_tool_call_detail_text(call),
                 author_label: None,
+                token_label: None,
             });
             continue;
         }
@@ -1119,6 +1121,7 @@ fn history_transcript_detail_lines(messages: &[Message]) -> Vec<TranscriptLine> 
             role: "history_tool_result".to_owned(),
             text: "No additional details.".to_owned(),
             author_label: None,
+            token_label: None,
         });
     }
 
@@ -1238,4 +1241,3 @@ fn message_actions_ui_state(
             .map(|input| input.label.to_owned()),
     })
 }
-

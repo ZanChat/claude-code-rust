@@ -215,6 +215,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ccrust-core",
+ "ccrust-session",
  "crossterm",
  "ratatui",
  "serde",

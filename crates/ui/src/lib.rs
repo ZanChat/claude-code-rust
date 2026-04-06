@@ -1,5 +1,8 @@
 use anyhow::Result;
-use ccrust_core::{CommandSpec, ContentBlock, Message, MessageMetadata, MessageRole, TaskStatus};
+use ccrust_core::{
+    CommandSpec, ContentBlock, Message, MessageMetadata, MessageRole, TaskStatus, TokenUsage,
+};
+use ccrust_session::estimate_message_tokens;
 use ratatui::backend::{Backend, TestBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};

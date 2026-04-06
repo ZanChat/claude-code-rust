@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 ccrust-core = { path = "../core" }
+ccrust-session = { path = "../session" }
 crossterm.workspace = true
 ratatui.workspace = true
 serde.workspace = true

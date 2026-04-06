@@ -7,6 +7,7 @@ fn build_repl_ui_state(
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
+    total_usage_totals: UsageTotals,
     input_buffer: &ccrust_ui::InputBuffer,
     status_line: &str,
     progress_message: Option<String>,
@@ -19,6 +20,7 @@ fn build_repl_ui_state(
     status_marquee_tick: usize,
     interaction_state: &ReplInteractionState,
 ) -> ccrust_ui::UiState {
+    let session_usage_totals = usage_totals_for_messages(raw_messages);
     let runtime_messages = materialize_runtime_messages(raw_messages);
     let message_action_items =
         message_action_items_from_runtime(&runtime_messages, pending_view, interaction_state);
@@ -117,7 +119,15 @@ fn build_repl_ui_state(
         )
         .items;
     }
-    apply_repl_header(&mut state, provider, active_model, cwd, session_id);
+    apply_repl_header_with_usage(
+        &mut state,
+        provider,
+        active_model,
+        cwd,
+        session_id,
+        session_usage_totals,
+        total_usage_totals,
+    );
     let (mut task_items, question_items) = load_task_ui_data(cwd);
     let pending_task_items = pending_view
         .filter(|view| !view.steps.is_empty())
@@ -204,6 +214,7 @@ fn draw_repl_state(
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
+    total_usage_totals: UsageTotals,
     input_buffer: &ccrust_ui::InputBuffer,
     status_line: &str,
     progress_message: Option<String>,
@@ -227,6 +238,7 @@ fn draw_repl_state(
         provider,
         active_model,
         session_id,
+        total_usage_totals,
         input_buffer,
         status_line,
         progress_message,
@@ -252,6 +264,7 @@ fn repl_mouse_action(
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
+    total_usage_totals: UsageTotals,
     input_buffer: &ccrust_ui::InputBuffer,
     status_line: &str,
     progress_message: Option<String>,
@@ -278,6 +291,7 @@ fn repl_mouse_action(
         provider,
         active_model,
         session_id,
+        total_usage_totals,
         input_buffer,
         status_line,
         progress_message,

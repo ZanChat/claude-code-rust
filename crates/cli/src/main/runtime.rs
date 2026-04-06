@@ -636,10 +636,20 @@ async fn main() -> Result<()> {
             existing_messages = store.load_session(session_id).await.unwrap_or_default();
         }
         let runtime_messages = materialize_runtime_messages(&existing_messages);
+        let session_usage_totals = usage_totals_for_messages(&existing_messages);
+        let total_usage_totals = usage_totals_for_store(&store).await?;
         let title = format!("{provider}  {active_model}");
         let app = RatatuiApp::new(title);
         let mut state = app.state_from_messages(runtime_messages, &registry.all());
-        apply_repl_header(&mut state, provider, &active_model, &cwd, session_id);
+        apply_repl_header_with_usage(
+            &mut state,
+            provider,
+            &active_model,
+            &cwd,
+            session_id,
+            session_usage_totals,
+            total_usage_totals,
+        );
         state.status_line = repl_status(provider, &active_model, session_id);
         if let Some(path) = transcript_path.as_ref() {
             state.compact_banner = Some(format!("resume {}", shorten_path(path, 72)));

@@ -7,6 +7,52 @@ fn transcript_role(message: &Message) -> String {
         .unwrap_or_else(|| format!("{:?}", message.role).to_lowercase())
 }
 
+fn compact_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn total_usage_tokens(usage: &TokenUsage) -> u64 {
+    usage.input_tokens
+        + usage.output_tokens
+        + usage.cache_creation_input_tokens
+        + usage.cache_read_input_tokens
+}
+
+fn format_usage_token_label(usage: &TokenUsage) -> String {
+    let total = compact_token_count(total_usage_tokens(usage));
+    let mut details = Vec::new();
+    if usage.input_tokens > 0 {
+        details.push(format!("in {}", compact_token_count(usage.input_tokens)));
+    }
+    if usage.output_tokens > 0 {
+        details.push(format!("out {}", compact_token_count(usage.output_tokens)));
+    }
+    let cache_tokens = usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
+    if cache_tokens > 0 {
+        details.push(format!("cache {}", compact_token_count(cache_tokens)));
+    }
+    if details.is_empty() {
+        format!("{total} tok")
+    } else {
+        format!("{total} tok ({})", details.join(", "))
+    }
+}
+
+fn transcript_token_label(message: &Message) -> Option<String> {
+    if let Some(usage) = message.metadata.usage.as_ref() {
+        return Some(format_usage_token_label(usage));
+    }
+
+    let estimated = estimate_message_tokens(std::slice::from_ref(message));
+    (estimated > 0).then(|| format!("~{} ctx tok", compact_token_count(estimated)))
+}
+
 pub fn transcript_line_from_message(message: &Message) -> TranscriptLine {
     TranscriptLine {
         role: transcript_role(message),
@@ -17,6 +63,7 @@ pub fn transcript_line_from_message(message: &Message) -> TranscriptLine {
             .collect::<Vec<_>>()
             .join("\n\n"),
         author_label: transcript_author_label(message),
+        token_label: transcript_token_label(message),
     }
 }
 
@@ -469,14 +516,24 @@ fn append_wrapped_transcript_line(
         .author_label
         .as_deref()
         .unwrap_or(role_label(&transcript_line.role));
+    let header = transcript_line
+        .token_label
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("{label} · {value}"))
+        .unwrap_or_else(|| label.to_owned());
     let label_style = role_style(&transcript_line.role);
 
     if transcript_line.text.trim().is_empty() {
-        lines.push(Line::from(Span::styled(label.to_owned(), label_style)));
+        for segment in wrap_plain_text(&header, width) {
+            lines.push(Line::from(Span::styled(segment, label_style)));
+        }
         return;
     }
 
-    lines.push(Line::from(Span::styled(label.to_owned(), label_style)));
+    for segment in wrap_plain_text(&header, width) {
+        lines.push(Line::from(Span::styled(segment, label_style)));
+    }
     for segment in wrap_plain_text(&transcript_line.text, width) {
         lines.push(Line::from(vec![Span::raw(segment)]));
     }

@@ -215,6 +215,107 @@ pub(crate) fn repl_header_context(cwd: &Path, session_id: SessionId) -> String {
     format!("{} · s:{}", cwd.display(), short_session_id(session_id))
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UsageTotals {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_creation_input_tokens: u64,
+    pub(crate) cache_read_input_tokens: u64,
+    pub(crate) response_count: usize,
+}
+
+impl UsageTotals {
+    pub(crate) fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+    }
+
+    fn add_usage(&mut self, usage: &ccrust_core::TokenUsage) {
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.cache_creation_input_tokens += usage.cache_creation_input_tokens;
+        self.cache_read_input_tokens += usage.cache_read_input_tokens;
+        self.response_count += 1;
+    }
+
+    fn add_messages(&mut self, messages: &[Message]) {
+        for message in messages {
+            if let Some(usage) = message.metadata.usage.as_ref() {
+                self.add_usage(usage);
+            }
+        }
+    }
+
+    pub(crate) fn add_totals(&mut self, other: Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.response_count += other.response_count;
+    }
+
+    pub(crate) fn subtract_totals(&mut self, other: Self) {
+        self.input_tokens = self.input_tokens.saturating_sub(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_sub(other.output_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_sub(other.cache_creation_input_tokens);
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_sub(other.cache_read_input_tokens);
+        self.response_count = self.response_count.saturating_sub(other.response_count);
+    }
+}
+
+pub(crate) fn usage_totals_for_messages(messages: &[Message]) -> UsageTotals {
+    let mut totals = UsageTotals::default();
+    totals.add_messages(messages);
+    totals
+}
+
+pub(crate) async fn usage_totals_for_store(store: &ActiveSessionStore) -> Result<UsageTotals> {
+    let mut totals = UsageTotals::default();
+    for summary in store.list_sessions().await? {
+        let messages = store.load_session(summary.session_id).await?;
+        totals.add_messages(&messages);
+    }
+    Ok(totals)
+}
+
+fn compact_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn usage_totals_label(prefix: &str, totals: UsageTotals) -> String {
+    format!(
+        "{prefix} {} tok",
+        compact_token_count(totals.total_tokens())
+    )
+}
+
+pub(crate) fn repl_header_context_with_usage(
+    cwd: &Path,
+    session_id: SessionId,
+    session_totals: UsageTotals,
+    total_totals: UsageTotals,
+) -> String {
+    format!(
+        "{} · s:{} · {} · {}",
+        cwd.display(),
+        short_session_id(session_id),
+        usage_totals_label("session", session_totals),
+        usage_totals_label("total", total_totals),
+    )
+}
+
 pub(crate) fn apply_repl_header(
     state: &mut ccrust_ui::UiState,
     provider: ApiProvider,
@@ -225,6 +326,25 @@ pub(crate) fn apply_repl_header(
     state.header_title = Some(repl_header_title());
     state.header_subtitle = Some(repl_header_subtitle(provider, active_model));
     state.header_context = Some(repl_header_context(cwd, session_id));
+}
+
+pub(crate) fn apply_repl_header_with_usage(
+    state: &mut ccrust_ui::UiState,
+    provider: ApiProvider,
+    active_model: &str,
+    cwd: &Path,
+    session_id: SessionId,
+    session_totals: UsageTotals,
+    total_totals: UsageTotals,
+) {
+    state.header_title = Some(repl_header_title());
+    state.header_subtitle = Some(repl_header_subtitle(provider, active_model));
+    state.header_context = Some(repl_header_context_with_usage(
+        cwd,
+        session_id,
+        session_totals,
+        total_totals,
+    ));
 }
 
 pub(crate) fn status_with_detail(base: String, detail: impl AsRef<str>) -> String {

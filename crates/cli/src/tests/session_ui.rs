@@ -1,4 +1,5 @@
 use super::*;
+use crate::UsageTotals;
 
 #[tokio::test]
 async fn continue_flag_resolves_latest_session_explicitly() {
@@ -125,6 +126,7 @@ fn build_repl_ui_state_handles_empty_command_suggestions() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         SessionId::new_v4(),
+        UsageTotals::default(),
         &input,
         "status",
         None,
@@ -146,6 +148,58 @@ fn build_repl_ui_state_handles_empty_command_suggestions() {
         state.header_subtitle.as_deref(),
         Some("gpt-5.4 · chatgpt-codex")
     );
+}
+
+#[test]
+fn build_repl_ui_state_adds_session_and_total_usage_to_header_context() {
+    let app = ccrust_ui::RatatuiApp::new("repl");
+    let registry = compatibility_command_registry();
+    let session_id = SessionId::new_v4();
+    let mut assistant = build_text_message(
+        session_id,
+        MessageRole::Assistant,
+        "Done.".to_owned(),
+        None,
+    );
+    assistant.metadata.usage = Some(ccrust_core::TokenUsage {
+        input_tokens: 12,
+        output_tokens: 4,
+        cache_creation_input_tokens: 2,
+        cache_read_input_tokens: 2,
+    });
+
+    let state = build_repl_ui_state(
+        &app,
+        &registry,
+        &[assistant],
+        None,
+        Path::new("."),
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        session_id,
+        UsageTotals {
+            input_tokens: 40,
+            output_tokens: 10,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 1,
+            response_count: 3,
+        },
+        &ccrust_ui::InputBuffer::new(),
+        "status",
+        None,
+        ccrust_ui::PaneKind::Transcript,
+        None,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        &ReplInteractionState::default(),
+    );
+
+    let header_context = state.header_context.unwrap_or_default();
+    assert!(header_context.contains("session 20 tok"));
+    assert!(header_context.contains("total 54 tok"));
 }
 
 #[test]
@@ -194,6 +248,7 @@ fn build_repl_ui_state_groups_pending_steps() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         session_id,
+        UsageTotals::default(),
         &ccrust_ui::InputBuffer::new(),
         "status",
         Some("working".to_owned()),
@@ -282,6 +337,7 @@ fn build_repl_ui_state_collapses_history_tool_runs_into_single_group() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         session_id,
+        UsageTotals::default(),
         &ccrust_ui::InputBuffer::new(),
         "status",
         None,
@@ -368,6 +424,7 @@ fn build_repl_ui_state_allows_clicking_history_group_title_text() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         session_id,
+        UsageTotals::default(),
         &ccrust_ui::InputBuffer::new(),
         "status",
         None,
@@ -442,6 +499,7 @@ fn build_repl_ui_state_keeps_message_action_indices_for_grouped_history() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         session_id,
+        UsageTotals::default(),
         &ccrust_ui::InputBuffer::new(),
         "status",
         None,
@@ -695,6 +753,7 @@ fn build_repl_ui_state_hides_prompt_in_transcript_mode() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         SessionId::new_v4(),
+        UsageTotals::default(),
         &ccrust_ui::InputBuffer::new(),
         "status",
         None,
@@ -747,6 +806,7 @@ fn build_repl_ui_state_keeps_prompt_visible_for_message_actions() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         session_id,
+        UsageTotals::default(),
         &ccrust_ui::InputBuffer::new(),
         "status",
         None,
@@ -811,6 +871,7 @@ fn build_repl_ui_state_exposes_transcript_selection() {
         ApiProvider::ChatGPTCodex,
         DEFAULT_OPENAI_REASONING_MODEL,
         SessionId::new_v4(),
+        UsageTotals::default(),
         &ccrust_ui::InputBuffer::new(),
         "status",
         None,

@@ -443,6 +443,7 @@ pub(crate) fn build_startup_ui_state(
             role: "setup".to_owned(),
             text: line.clone(),
             author_label: None,
+            token_label: None,
         })
         .collect();
     state.transcript_scroll = transcript_scroll;
