@@ -74,7 +74,7 @@ pub(crate) fn parse_cli() -> Cli {
             "--input" => cli.input = args.next(),
             "--help" | "-h" => {
                 println!(
-                    "Usage: code-agent-rust [--provider NAME] [--model NAME] [-c|--continue] [--resume TARGET] [--list-sessions] [--tool NAME --input JSON] [--tui|--repl] [--voice-text TEXT|--voice-file PATH] [--bridge-server ADDR|tcp://ADDR --bridge-connect URL|tcp://ADDR] [prompt]"
+                    "Usage: ccrust [--provider NAME] [--model NAME] [-c|--continue] [--resume TARGET] [--list-sessions] [--tool NAME --input JSON] [--tui|--repl] [--voice-text TEXT|--voice-file PATH] [--bridge-server ADDR|tcp://ADDR --bridge-connect URL|tcp://ADDR] [prompt]"
                 );
                 println!("Slash commands such as '/help', '/resume <session>', '/clear', '/compact', '/model', and '/config' are supported.");
                 std::process::exit(0);

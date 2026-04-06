@@ -191,7 +191,7 @@ pub(crate) fn repl_status(
 }
 
 pub(crate) fn repl_header_title() -> String {
-    format!("code-agent-rust v{}", env!("CARGO_PKG_VERSION"))
+    format!("ccrust v{}", env!("CARGO_PKG_VERSION"))
 }
 
 pub(crate) fn repl_header_subtitle(provider: ApiProvider, active_model: &str) -> String {

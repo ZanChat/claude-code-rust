@@ -1,6 +1,6 @@
-# code-agent-rust
+# ccrust
 
-A powerful, third-party Rust-native reimplementation of Claude Code agent workflows. Full compatibility with agent tasks, standard tools, plugins, MCP, and multi-provider support.
+The `code-agent-rust` repository builds the `ccrust` binary: a Rust-native reimplementation of Claude Code agent workflows with support for tasks, tools, plugins, MCP, and multiple providers.
 
 ## Installation
 
@@ -10,27 +10,28 @@ Requires [Rust and Cargo](https://rustup.rs/).
 git clone git@github.com:ZanChat/claude-code-rust.git
 cd claude-code-rust
 
-# Build the release binary
-cargo build --release
-
-# The executable will be at
-./target/release/code-agent-rust
+cargo install --path crates/cli --locked
 ```
 
-Development mode:
+Cargo installs the binary as `ccrust` into `~/.cargo/bin` by default.
+
+To refresh a local build while testing changes:
 
 ```bash
-cargo run --bin code-agent-rust -- [arguments...]
+cargo install --path crates/cli --locked --force
 ```
 
-## Running the Agent
+## Running ccrust
 
 ```bash
+# Check the installed binary
+ccrust --version
+
 # Interactive REPL
-cargo run --bin code-agent-rust -- --repl
+ccrust --repl
 
 # Non-interactive prompt
-cargo run --bin code-agent-rust -- 'Refactor the auth logic in src/auth.rs'
+ccrust 'Refactor the auth logic in src/auth.rs'
 ```
 
 ## Supported API Providers & Authentication
@@ -39,30 +40,28 @@ cargo run --bin code-agent-rust -- 'Refactor the auth logic in src/auth.rs'
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-api..."
-cargo run --bin code-agent-rust -- --repl
+ccrust --repl
 ```
 
 ### 2. OpenAI
 
-For OpenAI-family providers, the agent uses a **dual-model architecture** matching the original TS implementation:
-- **Reasoning model** (`REASONING_MODEL`, default `gpt-5.4`): used for thinking-enabled turns requiring deep analysis.
-- **Completion model** (`COMPLETION_MODEL`, default `gpt-5.3-codex`): used for standard turns and utility calls (faster, cheaper).
+For OpenAI-family providers, the agent uses a dual-model architecture matching the original TS implementation:
+- reasoning model: `REASONING_MODEL` (default `gpt-5.4`) for thinking-enabled turns
+- completion model: `COMPLETION_MODEL` (default `gpt-5.3-codex`) for standard turns and utility calls
 
-The agent automatically selects the appropriate model per-request based on whether thinking/reasoning is active for a given turn.
+The agent automatically selects the appropriate model per request based on whether reasoning is active for a given turn.
 
 ```bash
 export OPENAI_API_KEY="sk-..."
-cargo run --bin code-agent-rust -- --provider openai --repl
+ccrust --provider openai --repl
 ```
 
 ### 3. OpenAI-Compatible Providers
 
-Generic providers conforming to the OpenAI chat/completions schema:
-
 ```bash
 export OPENAI_API_KEY="your-custom-token"
 export OPENAI_BASE_URL="https://api.yourprovider.com/v1"
-cargo run --bin code-agent-rust -- --provider openai-compatible --repl
+ccrust --provider openai-compatible --repl
 ```
 
 ### 4. ChatGPT Codex
@@ -70,7 +69,7 @@ cargo run --bin code-agent-rust -- --provider openai-compatible --repl
 Uses `~/.codex/auth.json` for authentication with automatic token refresh:
 
 ```bash
-cargo run --bin code-agent-rust -- --provider chatgpt-codex --repl
+ccrust --provider chatgpt-codex --repl
 ```
 
 ### 5. Amazon Bedrock
@@ -79,23 +78,21 @@ cargo run --bin code-agent-rust -- --provider chatgpt-codex --repl
 export AWS_ACCESS_KEY_ID="..."
 export AWS_SECRET_ACCESS_KEY="..."
 export AWS_REGION="us-east-1"
-cargo run --bin code-agent-rust -- --provider bedrock --repl
+ccrust --provider bedrock --repl
 ```
 
 ### 6. Google Cloud Vertex AI
 
 ```bash
 export VERTEX_ACCESS_TOKEN="..."
-# Or use: gcloud auth application-default print-access-token
-cargo run --bin code-agent-rust -- --provider vertex --repl
+ccrust --provider vertex --repl
 ```
 
 ### 7. Azure AI Foundry
 
 ```bash
 export ANTHROPIC_FOUNDRY_API_KEY="..."
-# Or: export FOUNDRY_BASE_URL="https://your-resource.services.ai.azure.com/anthropic"
-cargo run --bin code-agent-rust -- --provider foundry --repl
+ccrust --provider foundry --repl
 ```
 
 ## Environment Variables Reference
@@ -115,7 +112,7 @@ cargo run --bin code-agent-rust -- --provider foundry --repl
 | `AWS_ACCESS_KEY_ID` | AWS access key for Bedrock |
 | `AWS_SECRET_ACCESS_KEY` | AWS secret key for Bedrock |
 | `AWS_SESSION_TOKEN` | Optional AWS session token for Bedrock |
-| `AWS_BEARER_TOKEN_BEDROCK` | Direct bearer token for Bedrock (skips SigV4) |
+| `AWS_BEARER_TOKEN_BEDROCK` | Direct bearer token for Bedrock |
 | `VERTEX_ACCESS_TOKEN` | OAuth access token for Vertex AI |
 | `GOOGLE_OAUTH_ACCESS_TOKEN` | Alternative Google OAuth token for Vertex AI |
 | `ANTHROPIC_FOUNDRY_API_KEY` | API key for Azure AI Foundry |
@@ -134,27 +131,21 @@ cargo run --bin code-agent-rust -- --provider foundry --repl
 | `ANTHROPIC_FOUNDRY_BASE_URL` / `FOUNDRY_BASE_URL` | Override Foundry endpoint | Derived from resource name |
 | `ANTHROPIC_FOUNDRY_RESOURCE` | Azure AI Foundry resource name | — |
 
-### Model Selection (All Providers)
-
-Override the default model when `--model` is not specified. For OpenAI providers, the agent automatically selects between reasoning and completion models per-turn. For Claude providers, these are only used if explicitly set.
+### Model Selection
 
 | Variable | Description | Default |
 |---|---|---|
-| `REASONING_MODEL` | Model for thinking-enabled turns (OpenAI default split) | `gpt-5.4` |
-| `COMPLETION_MODEL` | Model for standard/utility turns (OpenAI default split) | `gpt-5.3-codex` |
+| `REASONING_MODEL` | Model for thinking-enabled turns | `gpt-5.4` |
+| `COMPLETION_MODEL` | Model for standard and utility turns | `gpt-5.3-codex` |
 
-### OpenAI Thinking (Reasoning Effort)
-
-Controls the `reasoning_effort` parameter sent to OpenAI-family providers.
+### OpenAI Thinking
 
 | Variable | Description | Default |
 |---|---|---|
 | `REASONING_MODEL_THINK` | Reasoning effort for the reasoning model (`low`, `medium`, `high`, `xhigh`) | `xhigh` |
 | `COMPLETION_MODEL_THINK` | Reasoning effort for the completion model (`low`, `medium`, `high`, `xhigh`) | `xhigh` |
 
-### Claude Thinking (Budget / Adaptive)
-
-Claude models use a different thinking mechanism: either `adaptive` (model decides) or `budget_tokens` (explicit token count). The agent auto-detects the correct mode based on the model version.
+### Claude Thinking
 
 | Variable | Description | Default |
 |---|---|---|
@@ -174,7 +165,7 @@ Claude models use a different thinking mechanism: either `adaptive` (model decid
 
 | Variable | Description |
 |---|---|
-| `CLAUDE_CODE_SKIP_BEDROCK_AUTH` | Skip AWS SigV4 auth for Bedrock (use with mock or proxy) |
+| `CLAUDE_CODE_SKIP_BEDROCK_AUTH` | Skip AWS SigV4 auth for Bedrock |
 | `CLAUDE_CODE_SKIP_VERTEX_AUTH` | Skip OAuth for Vertex AI |
 | `CLAUDE_CODE_SKIP_FOUNDRY_AUTH` | Skip auth for Foundry |
 
@@ -190,7 +181,7 @@ Inside the REPL:
 
 | Command | Description |
 |---|---|
-| `/vim` | Toggle Vim mode (full state machine) |
+| `/vim` | Toggle Vim mode |
 | `/status` | Print runtime provider and environment status |
 | `/ide` | Inspect IDE bridge compatibility and connection state |
 | `/model <name>` | Switch active model |

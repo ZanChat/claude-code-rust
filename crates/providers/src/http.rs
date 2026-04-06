@@ -596,7 +596,7 @@ impl HttpProvider {
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_static(concat!("code-agent-rust/", env!("CARGO_PKG_VERSION"))),
+            HeaderValue::from_static(concat!("ccrust/", env!("CARGO_PKG_VERSION"))),
         );
 
         let bearer = self

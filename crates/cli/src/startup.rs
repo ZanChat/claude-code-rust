@@ -37,9 +37,7 @@ pub(crate) struct StartupScreen {
 }
 
 pub(crate) fn startup_preferences_path() -> PathBuf {
-    claude_config_home_dir()
-        .join("code-agent-rust")
-        .join("startup.json")
+    claude_config_home_dir().join("ccrust").join("startup.json")
 }
 
 pub(crate) fn load_startup_preferences() -> StartupPreferences {

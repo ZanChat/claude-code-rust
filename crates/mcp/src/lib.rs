@@ -770,7 +770,7 @@ fn initialize_request() -> Value {
                 "resources": {}
             },
             "clientInfo": {
-                "name": "code-agent-rust",
+                "name": "ccrust",
                 "version": env!("CARGO_PKG_VERSION")
             }
         }

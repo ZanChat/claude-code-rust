@@ -2,7 +2,7 @@
 
 ## V1 Contract
 
-`code-agent-rust` reads and writes the current Claude Code JSONL transcript format directly.
+`ccrust` reads and writes the current Claude Code JSONL transcript format directly.
 
 The runtime preserves these user-visible behaviors:
 - transcript file extension remains `.jsonl`

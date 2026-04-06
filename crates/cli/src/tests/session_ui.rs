@@ -73,7 +73,7 @@ async fn logout_report_includes_resume_command() {
             .get("resume_command")
             .and_then(|value| value.as_str())
             .map(str::to_owned),
-        Some(format!("code-agent-rust --resume {session_id}"))
+        Some(format!("ccrust --resume {session_id}"))
     );
 }
 
@@ -92,7 +92,7 @@ async fn resume_hint_text_matches_repl_exit_message() {
     assert_eq!(
         resume_hint_text(&hint),
         Some(format!(
-            "\nResume this session with:\ncode-agent-rust --resume {session_id}\n"
+            "\nResume this session with:\nccrust --resume {session_id}\n"
         ))
     );
 }

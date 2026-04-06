@@ -666,7 +666,7 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let width_hint = MIN_WIDTH.max(COMPACT_WIDTH);
     let notice = Paragraph::new(vec![
         Line::from(Span::styled(
-            "code-agent-rust",
+            "ccrust",
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),

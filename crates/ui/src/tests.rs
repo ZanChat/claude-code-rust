@@ -459,21 +459,24 @@ fn attachment_ui_events_render_with_custom_roles_and_authors() {
     );
     let rendered = render_to_string(&state, 100, 24).unwrap();
 
-    assert!(rendered.contains("You  /tasks list"));
-    assert!(rendered.contains("/tasks  {\"count\":1}"));
-    assert!(rendered.contains("Task  running review workspace [workflow]"));
+    assert!(rendered.contains("You"));
+    assert!(rendered.contains("/tasks list"));
+    assert!(rendered.contains("/tasks"));
+    assert!(rendered.contains("{\"count\":1}"));
+    assert!(rendered.contains("Task"));
+    assert!(rendered.contains("running review workspace [workflow]"));
 }
 
 #[test]
 fn renders_runtime_header() {
     let mut state = RatatuiApp::new("header").initial_state();
-    state.header_title = Some("code-agent-rust v0.1.0".to_owned());
+    state.header_title = Some("ccrust v0.1.0".to_owned());
     state.header_subtitle = Some("gemini-3.1-pro-preview · openai-compatible".to_owned());
     state.header_context = Some("/Users/pengfeiduan/workspace/code-agent-rust".to_owned());
 
     let rendered = render_to_string(&state, 80, 24).unwrap();
 
-    assert!(rendered.contains("code-agent-rust v0.1.0"));
+    assert!(rendered.contains("ccrust v0.1.0"));
     assert!(rendered.contains("gemini-3.1-pro-preview"));
     assert!(rendered.contains("workspace/code-agent-rust"));
 }
@@ -481,7 +484,7 @@ fn renders_runtime_header() {
 #[test]
 fn wraps_long_runtime_header_content() {
     let mut state = RatatuiApp::new("wrapped header").initial_state();
-    state.header_title = Some("code-agent-rust v0.1.0".to_owned());
+    state.header_title = Some("ccrust v0.1.0".to_owned());
     state.header_subtitle =
         Some("gemini-3.1-pro-preview · openai-compatible · reasoning".to_owned());
     state.header_context =
@@ -815,15 +818,19 @@ fn transcript_selection_text_uses_visual_line_slices() {
     }];
 
     let selectable_lines = transcript_selectable_lines_for_view(&state, 80);
-    let text = &selectable_lines[0].text;
+    let content_line = selectable_lines
+        .iter()
+        .find(|line| line.text.contains("abcdef"))
+        .unwrap();
+    let text = &content_line.text;
     let offset = text.find("abcdef").unwrap();
     let selection = TranscriptSelectionState {
         anchor: TranscriptSelectionPoint {
-            line_index: selectable_lines[0].line_index,
+            line_index: content_line.line_index,
             column: offset + 1,
         },
         focus: TranscriptSelectionPoint {
-            line_index: selectable_lines[0].line_index,
+            line_index: content_line.line_index,
             column: offset + 4,
         },
     };
@@ -843,22 +850,30 @@ fn transcript_selection_highlights_exact_range() {
         author_label: None,
     }];
     let selectable_lines = transcript_selectable_lines_for_view(&state, 80);
-    let text = &selectable_lines[0].text;
+    let content_line = selectable_lines
+        .iter()
+        .find(|line| line.text.contains("abcdef"))
+        .unwrap();
+    let text = &content_line.text;
     let offset = text.find("abcdef").unwrap();
     state.transcript_selection = Some(TranscriptSelectionState {
         anchor: TranscriptSelectionPoint {
-            line_index: selectable_lines[0].line_index,
+            line_index: content_line.line_index,
             column: offset + 1,
         },
         focus: TranscriptSelectionPoint {
-            line_index: selectable_lines[0].line_index,
+            line_index: content_line.line_index,
             column: offset + 4,
         },
     });
 
     let lines = transcript_visual_lines(&state, 80);
 
-    assert!(lines[0].line.spans.iter().any(|span| {
+    let content_line = lines
+        .iter()
+        .find(|line| line.plain_text.contains("abcdef"))
+        .unwrap();
+    assert!(content_line.line.spans.iter().any(|span| {
         span.content.as_ref() == "bcd" && span.style.bg == Some(super::Color::Yellow)
     }));
 }

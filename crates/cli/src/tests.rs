@@ -104,7 +104,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn temp_session_root(label: &str) -> PathBuf {
-    let root = env::temp_dir().join(format!("code-agent-rust-{label}-{}", Uuid::new_v4()));
+    let root = env::temp_dir().join(format!("ccrust-{label}-{}", Uuid::new_v4()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
     root

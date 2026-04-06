@@ -14,7 +14,7 @@ pub(crate) async fn render_auth_command(provider: ApiProvider, action: &str) -> 
 }
 
 pub(crate) fn resume_command_for_session(session_id: SessionId) -> String {
-    format!("code-agent-rust --resume {session_id}")
+    format!("ccrust --resume {session_id}")
 }
 
 pub(crate) async fn latest_resume_hint(
@@ -298,7 +298,7 @@ fn run_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<()>
 }
 
 fn write_copy_fallback_file(text: &str) -> Result<PathBuf> {
-    let copy_dir = std::env::temp_dir().join("code-agent-rust");
+    let copy_dir = std::env::temp_dir().join("ccrust");
     fs::create_dir_all(&copy_dir)?;
     let file_path = copy_dir.join(format!("response-{}.md", Uuid::new_v4()));
     fs::write(&file_path, text)?;

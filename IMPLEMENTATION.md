@@ -1,8 +1,8 @@
-# code-agent-rust Implementation Spec
+# ccrust Implementation Spec
 
 ## Mission
 
-`code-agent-rust` is a greenfield Rust rewrite of the restored Claude Code behavior.
+`ccrust` is a greenfield Rust rewrite of the restored Claude Code behavior.
 
 The implementation target is a third-party agent tool that keeps near-full parity with the current CLI, agent loop, tool execution, session behavior, and advanced subsystems, while replacing the TypeScript/Bun runtime with a Rust-native architecture.
 
