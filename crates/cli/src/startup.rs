@@ -1,8 +1,13 @@
-use crate::{auth_hint_for_provider, friendly_auth_source, workspace_is_empty};
+use crate::{
+    auth_hint_for_provider, friendly_auth_source, persist_managed_login_env, user_ccrust_env_path,
+    workspace_is_empty, ManagedLoginConfigState,
+};
 use code_agent_session::claude_config_home_dir;
 use crossterm::event;
 
-use crate::{apply_repl_header, repl_status, status_with_detail};
+use crate::{
+    apply_repl_header, is_paste_shortcut, read_text_from_clipboard, repl_status, status_with_detail,
+};
 use crate::{scroll_down, scroll_up};
 use code_agent_ui::{
     draw_terminal as draw_tui, ChoiceListItem, ChoiceListState, PaneKind, RatatuiApp,
@@ -14,6 +19,7 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use code_agent_ui::{CommandPaletteEntry, PanePreview, UiState};
@@ -22,8 +28,9 @@ use code_agent_core::SessionId;
 
 use code_agent_providers::{
     compatibility_model_catalog, get_anthropic_auth_material, get_openai_auth_status,
-    is_openai_provider, provider_descriptor, read_provider_auth_snapshot, ApiProvider,
-    ModelCatalog, OpenAIAuthSource,
+    get_openai_completion_model, get_openai_completion_think_level, get_openai_reasoning_model,
+    get_openai_reasoning_think_level, is_openai_provider, provider_descriptor,
+    read_provider_auth_snapshot, ApiProvider, ModelCatalog, OpenAIAuthSource,
 };
 
 use anyhow::Result;
@@ -42,6 +49,7 @@ pub(crate) struct StartupPreferences {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LaunchProviderSource {
     Cli,
+    ConfigFile,
     Env,
     Preference,
     Default,
@@ -70,6 +78,33 @@ pub(crate) struct StartupScreen {
 pub(crate) struct StartupFlowResult {
     pub(crate) input_buffer: code_agent_ui::InputBuffer,
     pub(crate) provider: ApiProvider,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenAICompatiblePreset {
+    OpenAI,
+    OpenRouter,
+    Gemini,
+    Custom,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LoginConfigDraft {
+    provider: ApiProvider,
+    anthropic_api_key: String,
+    openai_api_key: String,
+    openai_base_url: String,
+    reasoning_model: String,
+    completion_model: String,
+    reasoning_model_think: String,
+    completion_model_think: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LoginOnboardingOutcome {
+    pub(crate) provider: ApiProvider,
+    pub(crate) config_path: PathBuf,
+    pub(crate) env_values: BTreeMap<String, String>,
 }
 
 pub(crate) fn startup_preferences_path() -> PathBuf {
@@ -123,6 +158,7 @@ fn env_flag(name: &str) -> bool {
 pub(crate) fn resolve_launch_provider(
     explicit: Option<&str>,
     preferences: &StartupPreferences,
+    login_config: &ManagedLoginConfigState,
 ) -> Result<LaunchProviderSelection> {
     if let Some(raw) = explicit.filter(|value| !value.trim().is_empty()) {
         return Ok(LaunchProviderSelection {
@@ -137,7 +173,11 @@ pub(crate) fn resolve_launch_provider(
             return Ok(LaunchProviderSelection {
                 provider: raw.parse()?,
                 configured: true,
-                source: LaunchProviderSource::Env,
+                source: if login_config.provider_from_file {
+                    LaunchProviderSource::ConfigFile
+                } else {
+                    LaunchProviderSource::Env
+                },
             });
         }
     }
@@ -159,7 +199,7 @@ pub(crate) fn resolve_launch_provider(
     if let Some(provider) = preferences.selected_provider {
         return Ok(LaunchProviderSelection {
             provider,
-            configured: true,
+            configured: false,
             source: LaunchProviderSource::Preference,
         });
     }
@@ -305,23 +345,19 @@ fn build_provider_setup_screen(
                 format!("provider: {}", provider.as_str()),
                 format!("model: {default_model}"),
                 "commands: /login /config /model".to_owned(),
-                if ready {
-                    "press Enter to open the REPL".to_owned()
-                } else {
-                    "press Enter, then run /login or /config".to_owned()
-                },
+                "press Enter to continue setup".to_owned(),
             ],
         },
         choice_list: Some(provider_choice_list(provider)),
         provider_configured,
         show_input: false,
-        prompt_helper: Some("Use ↑/↓ to choose a provider. Enter opens the REPL.".to_owned()),
+        prompt_helper: Some("Use ↑/↓ to choose a provider. Enter continues setup.".to_owned()),
         compact_banner: Some(if ready {
-            "Provider is ready. Enter opens the REPL.".to_owned()
+            "Provider is ready. Enter continues setup.".to_owned()
         } else if is_openai_provider(provider) {
-            "Provider selected. Enter opens the REPL; then finish login/config.".to_owned()
+            "Provider selected. Enter continues to login setup.".to_owned()
         } else {
-            "Provider selected. Enter opens the REPL.".to_owned()
+            "Provider selected. Enter continues to login setup.".to_owned()
         }),
     }
 }
@@ -342,13 +378,14 @@ pub(crate) fn build_startup_screens(
         active_model,
         session_id,
         session_root,
+        live_runtime,
         auth_source,
         preferences,
     );
     if transcript_path.is_some() {
         return Vec::new();
     }
-    if provider_configured && live_runtime {
+    if provider_configured {
         return Vec::new();
     }
     vec![build_provider_setup_screen(
@@ -567,4 +604,710 @@ pub(crate) fn run_startup_flow<B: ratatui::backend::Backend>(
         input_buffer: code_agent_ui::InputBuffer::new(),
         provider: selected_provider,
     })
+}
+
+fn onboarding_status_line(
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    step_label: &str,
+) -> String {
+    status_with_detail(
+        repl_status(provider, active_model, session_id),
+        format!("login onboarding · {step_label}"),
+    )
+}
+
+fn masked_input_buffer(input_buffer: &code_agent_ui::InputBuffer) -> code_agent_ui::InputBuffer {
+    let mut masked = code_agent_ui::InputBuffer::new();
+    masked.chars = vec!['*'; input_buffer.chars.len()];
+    masked.cursor = input_buffer.cursor.min(masked.chars.len());
+    masked
+}
+
+pub(crate) fn insert_onboarding_input_text(
+    input_buffer: &mut code_agent_ui::InputBuffer,
+    text: &str,
+) -> bool {
+    let mut inserted = false;
+    for ch in text.chars().filter(|ch| !matches!(ch, '\r' | '\n')) {
+        input_buffer.push(ch);
+        inserted = true;
+    }
+    inserted
+}
+
+fn build_onboarding_screen(
+    title: &str,
+    body: Vec<String>,
+    preview_title: &str,
+    preview_lines: Vec<String>,
+    choice_list: Option<ChoiceListState>,
+    show_input: bool,
+    prompt_helper: &str,
+    compact_banner: Option<String>,
+) -> StartupScreen {
+    StartupScreen {
+        title: title.to_owned(),
+        body,
+        preview: PanePreview {
+            title: preview_title.to_owned(),
+            lines: preview_lines,
+        },
+        choice_list,
+        provider_configured: false,
+        show_input,
+        prompt_helper: Some(prompt_helper.to_owned()),
+        compact_banner,
+    }
+}
+
+fn draw_onboarding_state<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    cwd: &Path,
+    step_label: &str,
+    screen: &StartupScreen,
+    input_buffer: Option<&code_agent_ui::InputBuffer>,
+    secret_input: bool,
+) -> Result<()> {
+    let app = RatatuiApp::new(format!("{provider}  {active_model}"));
+    let mut state = build_startup_ui_state(
+        &app,
+        provider,
+        active_model,
+        session_id,
+        cwd,
+        screen,
+        0,
+        1,
+        0,
+    );
+    state.status_line = onboarding_status_line(provider, active_model, session_id, step_label);
+    if let Some(buffer) = input_buffer {
+        state.input_buffer = if secret_input {
+            masked_input_buffer(buffer)
+        } else {
+            buffer.clone()
+        };
+    }
+    draw_tui(terminal, &state)?;
+    Ok(())
+}
+
+fn onboarding_choice_list(
+    title: &str,
+    subtitle: &str,
+    selected: usize,
+    items: Vec<ChoiceListItem>,
+) -> ChoiceListState {
+    ChoiceListState {
+        title: title.to_owned(),
+        subtitle: Some(subtitle.to_owned()),
+        items,
+        selected,
+        empty_message: None,
+    }
+}
+
+fn run_onboarding_choice_step<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    cwd: &Path,
+    step_label: &str,
+    title: &str,
+    body: Vec<String>,
+    preview_title: &str,
+    preview_lines: Vec<String>,
+    mut choice_list: ChoiceListState,
+    compact_banner: Option<String>,
+) -> Result<Option<usize>> {
+    loop {
+        let screen = build_onboarding_screen(
+            title,
+            body.clone(),
+            preview_title,
+            preview_lines.clone(),
+            Some(choice_list.clone()),
+            false,
+            "Use ↑/↓ to choose. Enter accepts. Esc cancels.",
+            compact_banner.clone(),
+        );
+        draw_onboarding_state(
+            terminal,
+            provider,
+            active_model,
+            session_id,
+            cwd,
+            step_label,
+            &screen,
+            None,
+            false,
+        )?;
+
+        match event::read()? {
+            Event::Resize(width, height) => {
+                terminal.resize(Rect::new(0, 0, width, height))?;
+            }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    choice_list.selected = choice_list.selected.saturating_sub(1);
+                }
+                MouseEventKind::ScrollDown => {
+                    choice_list.selected =
+                        (choice_list.selected + 1).min(choice_list.items.len().saturating_sub(1));
+                }
+                _ => {}
+            },
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Up | KeyCode::Left => {
+                    choice_list.selected = choice_list.selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Right => {
+                    choice_list.selected =
+                        (choice_list.selected + 1).min(choice_list.items.len().saturating_sub(1));
+                }
+                KeyCode::Home => choice_list.selected = 0,
+                KeyCode::End => {
+                    choice_list.selected = choice_list.items.len().saturating_sub(1);
+                }
+                KeyCode::Enter => return Ok(Some(choice_list.selected)),
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(None)
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn run_onboarding_input_step<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    cwd: &Path,
+    step_label: &str,
+    title: &str,
+    body: Vec<String>,
+    preview_title: &str,
+    preview_lines: Vec<String>,
+    initial_value: String,
+    secret_input: bool,
+    required: bool,
+    validator: Option<fn(&str) -> bool>,
+) -> Result<Option<String>> {
+    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    input_buffer.replace(initial_value);
+    let mut compact_banner = None;
+
+    loop {
+        let screen = build_onboarding_screen(
+            title,
+            body.clone(),
+            preview_title,
+            preview_lines.clone(),
+            None,
+            true,
+            "Enter accepts the current value. Cmd/Ctrl+V pastes. Esc cancels onboarding.",
+            compact_banner.clone(),
+        );
+        draw_onboarding_state(
+            terminal,
+            provider,
+            active_model,
+            session_id,
+            cwd,
+            step_label,
+            &screen,
+            Some(&input_buffer),
+            secret_input,
+        )?;
+
+        match event::read()? {
+            Event::Resize(width, height) => {
+                terminal.resize(Rect::new(0, 0, width, height))?;
+            }
+            Event::Paste(text) => {
+                if insert_onboarding_input_text(&mut input_buffer, &text) {
+                    compact_banner = None;
+                }
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press && is_paste_shortcut(&key) => {
+                if let Some(text) = read_text_from_clipboard() {
+                    if insert_onboarding_input_text(&mut input_buffer, &text) {
+                        compact_banner = None;
+                    }
+                }
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Enter => {
+                    let value = input_buffer.as_str();
+                    let trimmed = value.trim();
+                    if required && trimmed.is_empty() {
+                        compact_banner = Some("A value is required for this field.".to_owned());
+                        continue;
+                    }
+                    if let Some(validate) = validator {
+                        if !trimmed.is_empty() && !validate(trimmed) {
+                            compact_banner =
+                                Some("Expected one of: low, medium, high, xhigh.".to_owned());
+                            continue;
+                        }
+                    }
+                    return Ok(Some(trimmed.to_owned()));
+                }
+                KeyCode::Backspace => {
+                    input_buffer.pop();
+                    compact_banner = None;
+                }
+                KeyCode::Left => {
+                    input_buffer.cursor = input_buffer.cursor.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    input_buffer.cursor = (input_buffer.cursor + 1).min(input_buffer.chars.len());
+                }
+                KeyCode::Home => input_buffer.cursor = 0,
+                KeyCode::End => input_buffer.cursor = input_buffer.chars.len(),
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(None)
+                }
+                KeyCode::Char(ch)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    input_buffer.push(ch);
+                    compact_banner = None;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+fn openai_compatible_preset_choice_list(selected: OpenAICompatiblePreset) -> ChoiceListState {
+    let items = vec![
+        ChoiceListItem {
+            label: "OpenAI".to_owned(),
+            detail: Some("Official OpenAI API".to_owned()),
+            secondary: None,
+        },
+        ChoiceListItem {
+            label: "OpenRouter".to_owned(),
+            detail: Some("Preset base URL for OpenRouter".to_owned()),
+            secondary: None,
+        },
+        ChoiceListItem {
+            label: "Gemini".to_owned(),
+            detail: Some("Google Gemini OpenAI-compatible endpoint".to_owned()),
+            secondary: None,
+        },
+        ChoiceListItem {
+            label: "Custom".to_owned(),
+            detail: Some("Choose your own OpenAI-compatible base URL".to_owned()),
+            secondary: None,
+        },
+    ];
+    let selected = match selected {
+        OpenAICompatiblePreset::OpenAI => 0,
+        OpenAICompatiblePreset::OpenRouter => 1,
+        OpenAICompatiblePreset::Gemini => 2,
+        OpenAICompatiblePreset::Custom => 3,
+    };
+    onboarding_choice_list(
+        "Choose preset",
+        "Pick a prefilled OpenAI-compatible target.",
+        selected,
+        items,
+    )
+}
+
+fn infer_openai_compatible_preset(base_url: &str) -> OpenAICompatiblePreset {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() || trimmed == "https://api.openai.com/v1" {
+        return OpenAICompatiblePreset::OpenAI;
+    }
+    if trimmed.contains("openrouter.ai") {
+        return OpenAICompatiblePreset::OpenRouter;
+    }
+    if trimmed.contains("generativelanguage.googleapis.com") {
+        return OpenAICompatiblePreset::Gemini;
+    }
+    OpenAICompatiblePreset::Custom
+}
+
+fn openai_compatible_preset_base_url(preset: OpenAICompatiblePreset) -> &'static str {
+    match preset {
+        OpenAICompatiblePreset::OpenAI => "https://api.openai.com/v1",
+        OpenAICompatiblePreset::OpenRouter => "https://openrouter.ai/api/v1",
+        OpenAICompatiblePreset::Gemini => {
+            "https://generativelanguage.googleapis.com/v1beta/openai/"
+        }
+        OpenAICompatiblePreset::Custom => "",
+    }
+}
+
+fn openai_compatible_think_level(value: &str) -> bool {
+    matches!(value, "low" | "medium" | "high" | "xhigh")
+}
+
+fn login_draft_from_environment(provider: ApiProvider) -> LoginConfigDraft {
+    let mut draft = LoginConfigDraft {
+        provider,
+        anthropic_api_key: env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+        openai_api_key: env::var("OPENAI_API_KEY").unwrap_or_default(),
+        openai_base_url: env::var("OPENAI_BASE_URL").unwrap_or_default(),
+        reasoning_model: env::var("REASONING_MODEL")
+            .unwrap_or_else(|_| get_openai_reasoning_model()),
+        completion_model: env::var("COMPLETION_MODEL")
+            .unwrap_or_else(|_| get_openai_completion_model()),
+        reasoning_model_think: env::var("REASONING_MODEL_THINK")
+            .unwrap_or_else(|_| get_openai_reasoning_think_level()),
+        completion_model_think: env::var("COMPLETION_MODEL_THINK")
+            .unwrap_or_else(|_| get_openai_completion_think_level()),
+    };
+
+    if provider == ApiProvider::OpenAICompatible {
+        let preset = infer_openai_compatible_preset(&draft.openai_base_url);
+        if draft.openai_base_url.trim().is_empty() {
+            draft.openai_base_url = openai_compatible_preset_base_url(preset).to_owned();
+        }
+        if preset == OpenAICompatiblePreset::Gemini {
+            if draft.reasoning_model.trim().is_empty() {
+                draft.reasoning_model = "gemini-3.1-pro-preview".to_owned();
+            }
+            if draft.completion_model.trim().is_empty() {
+                draft.completion_model = "gemini-3.1-pro-preview".to_owned();
+            }
+            if draft.reasoning_model_think.trim().is_empty() {
+                draft.reasoning_model_think = "high".to_owned();
+            }
+            if draft.completion_model_think.trim().is_empty() {
+                draft.completion_model_think = "medium".to_owned();
+            }
+        }
+    }
+
+    draft
+}
+
+fn apply_openai_compatible_preset_defaults(
+    draft: &mut LoginConfigDraft,
+    preset: OpenAICompatiblePreset,
+) {
+    draft.provider = ApiProvider::OpenAICompatible;
+    draft.openai_base_url = openai_compatible_preset_base_url(preset).to_owned();
+    if draft.reasoning_model.trim().is_empty() {
+        draft.reasoning_model = if preset == OpenAICompatiblePreset::Gemini {
+            "gemini-3.1-pro-preview".to_owned()
+        } else {
+            get_openai_reasoning_model()
+        };
+    }
+    if draft.completion_model.trim().is_empty() {
+        draft.completion_model = if preset == OpenAICompatiblePreset::Gemini {
+            "gemini-3.1-pro-preview".to_owned()
+        } else {
+            get_openai_completion_model()
+        };
+    }
+    if draft.reasoning_model_think.trim().is_empty() {
+        draft.reasoning_model_think = if preset == OpenAICompatiblePreset::Gemini {
+            "high".to_owned()
+        } else {
+            get_openai_reasoning_think_level()
+        };
+    }
+    if draft.completion_model_think.trim().is_empty() {
+        draft.completion_model_think = if preset == OpenAICompatiblePreset::Gemini {
+            "medium".to_owned()
+        } else {
+            get_openai_completion_think_level()
+        };
+    }
+}
+
+fn managed_login_env_values(draft: &LoginConfigDraft) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::from([(
+        "CLAUDE_CODE_API_PROVIDER".to_owned(),
+        draft.provider.to_string(),
+    )]);
+
+    match draft.provider {
+        ApiProvider::FirstParty => {
+            if !draft.anthropic_api_key.trim().is_empty() {
+                values.insert(
+                    "ANTHROPIC_API_KEY".to_owned(),
+                    draft.anthropic_api_key.trim().to_owned(),
+                );
+            }
+        }
+        ApiProvider::OpenAICompatible => {
+            for (key, value) in [
+                ("OPENAI_API_KEY", draft.openai_api_key.trim()),
+                ("OPENAI_BASE_URL", draft.openai_base_url.trim()),
+                ("REASONING_MODEL", draft.reasoning_model.trim()),
+                ("COMPLETION_MODEL", draft.completion_model.trim()),
+                ("REASONING_MODEL_THINK", draft.reasoning_model_think.trim()),
+                (
+                    "COMPLETION_MODEL_THINK",
+                    draft.completion_model_think.trim(),
+                ),
+            ] {
+                if !value.is_empty() {
+                    values.insert(key.to_owned(), value.to_owned());
+                }
+            }
+        }
+        ApiProvider::ChatGPTCodex
+        | ApiProvider::Bedrock
+        | ApiProvider::Vertex
+        | ApiProvider::Foundry => {}
+    }
+
+    values
+}
+
+fn onboarding_target_path_preview(cwd: &Path, tracked_path: Option<&Path>) -> String {
+    tracked_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| user_ccrust_env_path())
+        .display()
+        .to_string()
+        .replace(&cwd.display().to_string(), ".")
+}
+
+pub(crate) fn run_login_onboarding_flow<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    cwd: &Path,
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    tracked_path: Option<&Path>,
+) -> Result<Option<LoginOnboardingOutcome>> {
+    let provider_index = ApiProvider::ALL
+        .iter()
+        .position(|candidate| *candidate == provider)
+        .unwrap_or_default();
+    let provider_choice = run_onboarding_choice_step(
+        terminal,
+        provider,
+        active_model,
+        session_id,
+        cwd,
+        "1/2",
+        "Login Setup",
+        vec![
+            "Choose the provider to save into ccrust config.".to_owned(),
+            format!(
+                "Config path: {}",
+                onboarding_target_path_preview(cwd, tracked_path)
+            ),
+        ],
+        "Saved Config",
+        vec![
+            "ccrust writes login-related settings to .env.ccrust".to_owned(),
+            "CLI flags and real environment variables still override the saved values.".to_owned(),
+        ],
+        provider_choice_list(ApiProvider::ALL[provider_index]),
+        Some("Esc skips onboarding and opens the REPL.".to_owned()),
+    )?;
+    let Some(provider_choice) = provider_choice else {
+        return Ok(None);
+    };
+    let selected_provider = ApiProvider::ALL[provider_choice];
+    let mut draft = login_draft_from_environment(selected_provider);
+
+    if selected_provider == ApiProvider::OpenAICompatible {
+        let preset = infer_openai_compatible_preset(&draft.openai_base_url);
+        let preset_choice = run_onboarding_choice_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "2/8",
+            "OpenAI-Compatible Preset",
+            vec![
+                "Pick a preset base URL for the OpenAI-compatible provider.".to_owned(),
+                "You can still edit the fields before saving.".to_owned(),
+            ],
+            "Preset Details",
+            vec![
+                "OpenAI uses the official OpenAI API.".to_owned(),
+                "OpenRouter and Gemini prefill their OpenAI-compatible base URLs.".to_owned(),
+            ],
+            openai_compatible_preset_choice_list(preset),
+            Some("Enter accepts the preset. Esc cancels onboarding.".to_owned()),
+        )?;
+        let Some(preset_choice) = preset_choice else {
+            return Ok(None);
+        };
+        let preset = match preset_choice {
+            0 => OpenAICompatiblePreset::OpenAI,
+            1 => OpenAICompatiblePreset::OpenRouter,
+            2 => OpenAICompatiblePreset::Gemini,
+            _ => OpenAICompatiblePreset::Custom,
+        };
+        apply_openai_compatible_preset_defaults(&mut draft, preset);
+
+        draft.openai_api_key = match run_onboarding_input_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "3/8",
+            "API Key",
+            vec!["Enter the API key for the selected OpenAI-compatible endpoint.".to_owned()],
+            "Preview",
+            vec![
+                format!("provider: {}", selected_provider),
+                format!("base_url: {}", draft.openai_base_url),
+            ],
+            draft.openai_api_key.clone(),
+            true,
+            true,
+            None,
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        draft.openai_base_url = match run_onboarding_input_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "4/8",
+            "Base URL",
+            vec!["Edit the OpenAI-compatible base URL if needed.".to_owned()],
+            "Preview",
+            vec![format!("provider: {}", selected_provider)],
+            draft.openai_base_url.clone(),
+            false,
+            true,
+            None,
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        draft.reasoning_model = match run_onboarding_input_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "5/8",
+            "Reasoning Model",
+            vec!["Set the model used for thinking-enabled turns.".to_owned()],
+            "Preview",
+            vec![format!("base_url: {}", draft.openai_base_url)],
+            draft.reasoning_model.clone(),
+            false,
+            true,
+            None,
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        draft.completion_model = match run_onboarding_input_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "6/8",
+            "Completion Model",
+            vec!["Set the model used for standard turns and utility calls.".to_owned()],
+            "Preview",
+            vec![format!("reasoning model: {}", draft.reasoning_model)],
+            draft.completion_model.clone(),
+            false,
+            true,
+            None,
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        draft.reasoning_model_think = match run_onboarding_input_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "7/8",
+            "Reasoning Think",
+            vec![
+                "Set the reasoning effort for the reasoning model.".to_owned(),
+                "Use one of: low, medium, high, xhigh.".to_owned(),
+            ],
+            "Preview",
+            vec![format!("completion model: {}", draft.completion_model)],
+            draft.reasoning_model_think.clone(),
+            false,
+            true,
+            Some(openai_compatible_think_level),
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        draft.completion_model_think = match run_onboarding_input_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "8/8",
+            "Completion Think",
+            vec![
+                "Set the reasoning effort for the completion model.".to_owned(),
+                "Use one of: low, medium, high, xhigh.".to_owned(),
+            ],
+            "Preview",
+            vec![format!("reasoning think: {}", draft.reasoning_model_think)],
+            draft.completion_model_think.clone(),
+            false,
+            true,
+            Some(openai_compatible_think_level),
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+    } else if selected_provider == ApiProvider::FirstParty {
+        draft.anthropic_api_key = match run_onboarding_input_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "2/2",
+            "Anthropic API Key",
+            vec!["Enter the Anthropic API key to save into ccrust config.".to_owned()],
+            "Preview",
+            vec![format!("provider: {}", selected_provider)],
+            draft.anthropic_api_key.clone(),
+            true,
+            true,
+            None,
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+    }
+
+    let env_values = managed_login_env_values(&draft);
+    let config_path = persist_managed_login_env(cwd, tracked_path, &env_values)?;
+    Ok(Some(LoginOnboardingOutcome {
+        provider: selected_provider,
+        config_path,
+        env_values,
+    }))
 }

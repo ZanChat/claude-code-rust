@@ -91,6 +91,28 @@ fn startup_screens_skip_when_provider_is_ready() {
 }
 
 #[test]
+fn startup_screens_skip_when_provider_is_configured_but_auth_is_missing() {
+    let root = temp_session_root("startup-configured-no-auth");
+    let session_root = root.join(".sessions");
+    fs::create_dir_all(&session_root).unwrap();
+
+    let screens = build_startup_screens(
+        ApiProvider::OpenAICompatible,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        SessionId::new_v4(),
+        &root,
+        &session_root,
+        None,
+        false,
+        true,
+        None,
+        &StartupPreferences::default(),
+    );
+
+    assert!(screens.is_empty());
+}
+
+#[test]
 fn startup_screens_skip_resumed_sessions() {
     let root = temp_session_root("startup-resume");
     let session_root = root.join(".sessions");
@@ -164,11 +186,12 @@ fn resolve_launch_provider_prefers_saved_provider_when_flags_are_missing() {
             welcome_seen: false,
             selected_provider: Some(ApiProvider::OpenAICompatible),
         },
+        &ManagedLoginConfigState::default(),
     )
     .unwrap();
 
     assert_eq!(selection.provider, ApiProvider::OpenAICompatible);
-    assert!(selection.configured);
+    assert!(!selection.configured);
     assert_eq!(selection.source, LaunchProviderSource::Preference);
 }
 
@@ -181,13 +204,93 @@ fn resolve_launch_provider_uses_default_when_nothing_is_configured() {
             ("CLAUDE_CODE_USE_VERTEX", None),
             ("CLAUDE_CODE_USE_FOUNDRY", None),
         ],
-        || resolve_launch_provider(None, &StartupPreferences::default()),
+        || {
+            resolve_launch_provider(
+                None,
+                &StartupPreferences::default(),
+                &ManagedLoginConfigState::default(),
+            )
+        },
     )
     .unwrap();
 
     assert_eq!(selection.provider, ApiProvider::FirstParty);
     assert!(!selection.configured);
     assert_eq!(selection.source, LaunchProviderSource::Default);
+}
+
+#[test]
+fn config_env_files_load_with_local_override_but_real_env_wins() {
+    let root = temp_session_root("config-env-order");
+    let home = temp_session_root("config-env-home");
+    let home_path = home.display().to_string();
+
+    with_env_vars(
+        &[
+            ("CLAUDE_CONFIG_DIR", Some(&home_path)),
+            ("CLAUDE_CODE_API_PROVIDER", None),
+            ("OPENAI_API_KEY", Some("env-key")),
+            ("OPENAI_BASE_URL", None),
+            ("REASONING_MODEL", None),
+            ("COMPLETION_MODEL", None),
+        ],
+        || {
+            write_test_file(
+                &user_ccrust_env_path(),
+                "CLAUDE_CODE_API_PROVIDER=openai-compatible\nOPENAI_API_KEY=user-key\nOPENAI_BASE_URL=https://user.example/v1\nREASONING_MODEL=user-model\n",
+            );
+            write_test_file(
+                &project_ccrust_env_path(&root),
+                "CLAUDE_CODE_API_PROVIDER=openai-compatible\nOPENAI_API_KEY=project-key\nOPENAI_BASE_URL=https://project.example/v1\nCOMPLETION_MODEL=project-completion\n",
+            );
+
+            let state = apply_managed_login_env(&root);
+
+            assert!(state.provider_from_file);
+            assert_eq!(state.tracked_path, Some(project_ccrust_env_path(&root)));
+            assert_eq!(
+                env::var("CLAUDE_CODE_API_PROVIDER").unwrap(),
+                "openai-compatible"
+            );
+            assert_eq!(env::var("OPENAI_API_KEY").unwrap(), "env-key");
+            assert_eq!(
+                env::var("OPENAI_BASE_URL").unwrap(),
+                "https://project.example/v1"
+            );
+            assert_eq!(env::var("REASONING_MODEL").unwrap(), "user-model");
+            assert_eq!(env::var("COMPLETION_MODEL").unwrap(), "project-completion");
+        },
+    );
+}
+
+#[test]
+fn resolve_launch_provider_reports_config_file_source() {
+    let root = temp_session_root("launch-provider-config-file");
+    let home = temp_session_root("launch-provider-config-home");
+    let home_path = home.display().to_string();
+
+    with_env_vars(
+        &[
+            ("CLAUDE_CONFIG_DIR", Some(&home_path)),
+            ("CLAUDE_CODE_API_PROVIDER", None),
+            ("CLAUDE_CODE_USE_BEDROCK", None),
+            ("CLAUDE_CODE_USE_VERTEX", None),
+            ("CLAUDE_CODE_USE_FOUNDRY", None),
+        ],
+        || {
+            write_test_file(
+                &user_ccrust_env_path(),
+                "CLAUDE_CODE_API_PROVIDER=openai-compatible\n",
+            );
+            let state = apply_managed_login_env(&root);
+            let selection =
+                resolve_launch_provider(None, &StartupPreferences::default(), &state).unwrap();
+
+            assert_eq!(selection.provider, ApiProvider::OpenAICompatible);
+            assert!(selection.configured);
+            assert_eq!(selection.source, LaunchProviderSource::ConfigFile);
+        },
+    );
 }
 
 #[test]
@@ -456,6 +559,28 @@ fn paste_shortcut_matches_expected_bindings() {
 
     let plain_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
     assert!(!is_paste_shortcut(&plain_v));
+}
+
+#[test]
+fn onboarding_input_insert_pastes_at_cursor_and_ignores_line_breaks() {
+    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    input_buffer.replace("abef");
+    input_buffer.cursor = 2;
+
+    assert!(insert_onboarding_input_text(&mut input_buffer, "cd\r\n"));
+
+    assert_eq!(input_buffer.as_str(), "abcdef");
+    assert_eq!(input_buffer.cursor, 4);
+}
+
+#[test]
+fn onboarding_input_insert_ignores_line_break_only_paste() {
+    let mut input_buffer = code_agent_ui::InputBuffer::new();
+    input_buffer.replace("token");
+    let before = input_buffer.clone();
+
+    assert!(!insert_onboarding_input_text(&mut input_buffer, "\r\n"));
+    assert_eq!(input_buffer, before);
 }
 
 #[test]

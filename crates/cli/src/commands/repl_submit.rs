@@ -241,11 +241,11 @@ async fn process_repl_submission(
     tool_registry: &ToolRegistry,
     cwd: &PathBuf,
     plugin_root: Option<&PathBuf>,
-    provider: ApiProvider,
+    provider: &mut ApiProvider,
     active_model: &mut String,
     repl_session: &mut ReplSessionState,
     raw_messages: &mut Vec<Message>,
-    live_runtime: bool,
+    live_runtime: &mut bool,
     prompt_text: String,
     input_buffer: &mut code_agent_ui::InputBuffer,
     prompt_history: &mut Vec<String>,
@@ -262,6 +262,7 @@ async fn process_repl_submission(
     connected_ide_bridge: &Option<DetectedIdeCandidate>,
     selected_command_suggestion: &mut usize,
     vim_state: &mut code_agent_ui::vim::VimState,
+    login_config: &mut ManagedLoginConfigState,
     remote_mode: bool,
     ide_bridge_active: bool,
     queued_submissions: &mut VecDeque<String>,
@@ -284,7 +285,7 @@ async fn process_repl_submission(
                 resumable_sessions(store.list_sessions().await?, repl_session.session_id);
             if sessions.is_empty() {
                 *status_line = status_with_detail(
-                    repl_status(provider, active_model, repl_session.session_id),
+                    repl_runtime_status(*provider, active_model, repl_session.session_id, *live_runtime),
                     "No conversations found to resume",
                 );
             } else {
@@ -292,7 +293,12 @@ async fn process_repl_submission(
                     sessions,
                     selected: 0,
                 });
-                *status_line = repl_status(provider, active_model, repl_session.session_id);
+                *status_line = repl_runtime_status(
+                    *provider,
+                    active_model,
+                    repl_session.session_id,
+                    *live_runtime,
+                );
             }
             *status_marquee_tick = 0;
             return Ok(ReplSubmissionOutcome::Continue);
@@ -300,7 +306,114 @@ async fn process_repl_submission(
 
         if invocation.name == "ide" && invocation.args.is_empty() {
             *ide_picker = Some(repl_ide_picker_state(cwd, connected_ide_bridge.as_ref()));
-            *status_line = repl_status(provider, active_model, repl_session.session_id);
+            *status_line = repl_runtime_status(
+                *provider,
+                active_model,
+                repl_session.session_id,
+                *live_runtime,
+            );
+            *status_marquee_tick = 0;
+            return Ok(ReplSubmissionOutcome::Continue);
+        }
+
+        if matches!(invocation.name.as_str(), "login" | "logout") {
+            let command_name = invocation.name.clone();
+            let command_input = invocation.raw_input.clone();
+            let command_recorded = should_record_repl_command(&command_name);
+            if command_recorded {
+                append_session_message(
+                    store,
+                    raw_messages,
+                    build_repl_command_input_message(
+                        repl_session.session_id,
+                        raw_messages.last().map(|message| message.id),
+                        command_input,
+                    ),
+                )
+                .await?;
+            }
+
+            let next_status = if command_name == "login" {
+                match run_login_onboarding_flow(
+                    terminal,
+                    cwd,
+                    *provider,
+                    active_model,
+                    repl_session.session_id,
+                    login_config.tracked_path.as_deref(),
+                )? {
+                    Some(login_outcome) => {
+                        apply_runtime_login_values(
+                            login_config,
+                            login_outcome.config_path.clone(),
+                            login_outcome.env_values,
+                        );
+                        *provider = login_outcome.provider;
+                        if let Some(default_model) = default_model_for_provider(*provider) {
+                            *active_model = default_model;
+                        }
+                        let auth = EnvironmentAuthResolver
+                            .resolve_auth(AuthRequest {
+                                provider: *provider,
+                                profile: None,
+                            })
+                            .await
+                            .ok();
+                        *live_runtime = auth.is_some() && provider_supports_live_runtime(*provider);
+                        format!(
+                            "saved login config {}",
+                            shorten_path(&login_outcome.config_path, 72)
+                        )
+                    }
+                    None => "login onboarding cancelled".to_owned(),
+                }
+            } else {
+                let mut status_parts = Vec::new();
+                if let Some(path) = login_config.tracked_path.clone() {
+                    if clear_managed_login_env_file(&path)? {
+                        status_parts.push(format!("cleared {}", shorten_path(&path, 72)));
+                    } else {
+                        status_parts.push(format!("no managed values in {}", shorten_path(&path, 72)));
+                    }
+                    restore_runtime_login_values(login_config);
+                } else {
+                    status_parts.push("no tracked login config".to_owned());
+                }
+                let _ = clear_auth_snapshot(*provider)?;
+                let auth = EnvironmentAuthResolver
+                    .resolve_auth(AuthRequest {
+                        provider: *provider,
+                        profile: None,
+                    })
+                    .await
+                    .ok();
+                *live_runtime = auth.is_some() && provider_supports_live_runtime(*provider);
+                status_parts.join(" · ")
+            };
+
+            if command_recorded {
+                append_session_message(
+                    store,
+                    raw_messages,
+                    build_repl_command_output_message(
+                        repl_session.session_id,
+                        raw_messages.last().map(|message| message.id),
+                        &command_name,
+                        next_status.clone(),
+                    ),
+                )
+                .await?;
+            }
+            *status_line = slash_command_footer_status(
+                *provider,
+                active_model,
+                repl_session.session_id,
+                *live_runtime,
+                &command_name,
+                command_recorded,
+                false,
+                &next_status,
+            );
             *status_marquee_tick = 0;
             return Ok(ReplSubmissionOutcome::Continue);
         }
@@ -322,7 +435,8 @@ async fn process_repl_submission(
         }
 
         let previous_session_id = repl_session.session_id;
-        let base_status_line = repl_status(provider, active_model, repl_session.session_id);
+        let base_status_line =
+            repl_runtime_status(*provider, active_model, repl_session.session_id, *live_runtime);
         let preview_messages = if command_recorded {
             materialize_runtime_messages(raw_messages)
         } else {
@@ -343,7 +457,7 @@ async fn process_repl_submission(
             registry,
             pending_view.clone(),
             cwd,
-            provider,
+            *provider,
             &active_model_display,
             repl_session.session_id,
             input_buffer,
@@ -363,11 +477,11 @@ async fn process_repl_submission(
                 tool_registry,
                 cwd,
                 plugin_root,
-                provider,
+                *provider,
                 active_model,
                 repl_session,
                 raw_messages,
-                live_runtime,
+                *live_runtime,
                 vim_state,
                 remote_mode,
                 ide_bridge_active,
@@ -404,9 +518,10 @@ async fn process_repl_submission(
                         .map(|path| format!("resume {}", shorten_path(path, 72)));
                 }
                 *status_line = slash_command_footer_status(
-                    provider,
+                    *provider,
                     active_model,
                     repl_session.session_id,
+                    *live_runtime,
                     &command_name,
                     command_recorded,
                     false,
@@ -425,7 +540,7 @@ async fn process_repl_submission(
                 );
                 append_session_messages(store, raw_messages, interruption_messages).await?;
                 *status_line = status_with_detail(
-                    repl_status(provider, active_model, repl_session.session_id),
+                    repl_runtime_status(*provider, active_model, repl_session.session_id, *live_runtime),
                     "Interrupted by user",
                 );
                 *status_marquee_tick = 0;
@@ -433,9 +548,10 @@ async fn process_repl_submission(
             Err(error) => {
                 let error_detail = format!("error: {error}");
                 *status_line = slash_command_footer_status(
-                    provider,
+                    *provider,
                     active_model,
                     repl_session.session_id,
+                    *live_runtime,
                     &command_name,
                     command_recorded,
                     true,
@@ -461,7 +577,8 @@ async fn process_repl_submission(
         return Ok(ReplSubmissionOutcome::Continue);
     }
 
-    let base_status_line = repl_status(provider, active_model, repl_session.session_id);
+    let base_status_line =
+        repl_runtime_status(*provider, active_model, repl_session.session_id, *live_runtime);
     let preview_messages = materialize_runtime_messages(&optimistic_messages_for_prompt(
         raw_messages,
         repl_session.session_id,
@@ -476,7 +593,7 @@ async fn process_repl_submission(
         registry,
         pending_view.clone(),
         cwd,
-        provider,
+        *provider,
         active_model,
         repl_session.session_id,
         input_buffer,
@@ -494,12 +611,12 @@ async fn process_repl_submission(
             tool_registry,
             cwd.clone(),
             plugin_root,
-            provider,
+            *provider,
             active_model.clone(),
             repl_session.session_id,
             raw_messages,
             prompt_text,
-            live_runtime,
+            *live_runtime,
             Some(pending_view.clone()),
         ),
     )
@@ -524,14 +641,14 @@ async fn process_repl_submission(
                     format!("{turn_count} steps · {:?}", stop_reason)
                 };
             *status_line = status_with_detail(
-                repl_status(provider, active_model, repl_session.session_id),
+                repl_runtime_status(*provider, active_model, repl_session.session_id, *live_runtime),
                 detail,
             );
             *status_marquee_tick = 0;
         }
         Err(error) => {
             *status_line = status_with_detail(
-                repl_status(provider, active_model, repl_session.session_id),
+                repl_runtime_status(*provider, active_model, repl_session.session_id, *live_runtime),
                 format!("error: {error}"),
             );
             *status_marquee_tick = 0;
@@ -544,7 +661,7 @@ async fn process_repl_submission(
             );
             append_session_messages(store, raw_messages, interruption_messages).await?;
             *status_line = status_with_detail(
-                repl_status(provider, active_model, repl_session.session_id),
+                repl_runtime_status(*provider, active_model, repl_session.session_id, *live_runtime),
                 "Interrupted by user",
             );
             *status_marquee_tick = 0;
@@ -553,4 +670,3 @@ async fn process_repl_submission(
 
     Ok(ReplSubmissionOutcome::Continue)
 }
-

@@ -46,6 +46,7 @@ pub(crate) async fn render_auth_command_with_resume(
     action: &str,
     resume_hint: Option<ResumeTargetHint>,
 ) -> Result<String> {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     match action {
         "login" => {
             let resolver = EnvironmentAuthResolver;
@@ -55,45 +56,49 @@ pub(crate) async fn render_auth_command_with_resume(
                     profile: None,
                 })
                 .await?;
-            let snapshot_path = if matches!(
-                provider,
-                ApiProvider::ChatGPTCodex
-                    | ApiProvider::OpenAICompatible
-                    | ApiProvider::FirstParty
-            ) {
-                Some(write_auth_snapshot(provider, &auth)?)
-            } else {
-                None
-            };
+            let config_values = managed_login_values_from_environment(provider);
+            let config_path = Some(persist_managed_login_env(&cwd, None, &config_values)?);
             Ok(serde_json::to_string_pretty(&AuthCommandReport {
                 provider: provider.to_string(),
                 status: "ready".to_owned(),
                 auth_source: auth.source,
                 hint: Some(auth_hint_for_provider(provider)),
-                snapshot_path,
+                config_path,
+                snapshot_path: None,
                 resume_session_id: None,
                 resume_transcript_path: None,
                 resume_command: None,
             })?)
         }
-        "logout" => Ok(serde_json::to_string_pretty(&AuthCommandReport {
-            provider: provider.to_string(),
-            status: if clear_auth_snapshot(provider)? {
+        "logout" => {
+            let config_path = existing_managed_login_env_path(&cwd);
+            let config_status = match config_path.as_ref() {
+                Some(path) if clear_managed_login_env_file(path)? => "cleared".to_owned(),
+                Some(_) => "no_config".to_owned(),
+                None => "no_config".to_owned(),
+            };
+            let snapshot_cleared = clear_auth_snapshot(provider)?;
+            let status = if config_status == "cleared" || snapshot_cleared {
                 "cleared".to_owned()
             } else {
-                "no_snapshot".to_owned()
-            },
-            auth_source: None,
-            hint: Some(auth_hint_for_provider(provider)),
-            snapshot_path: Some(code_agent_auth_snapshot_path()),
-            resume_session_id: resume_hint.as_ref().map(|hint| hint.session_id),
-            resume_transcript_path: resume_hint
-                .as_ref()
-                .map(|hint| hint.transcript_path.clone()),
-            resume_command: resume_hint
-                .as_ref()
-                .map(|hint| resume_command_for_session(hint.session_id)),
-        })?),
+                "no_config".to_owned()
+            };
+            Ok(serde_json::to_string_pretty(&AuthCommandReport {
+                provider: provider.to_string(),
+                status,
+                auth_source: None,
+                hint: Some(auth_hint_for_provider(provider)),
+                config_path,
+                snapshot_path: snapshot_cleared.then_some(code_agent_auth_snapshot_path()),
+                resume_session_id: resume_hint.as_ref().map(|hint| hint.session_id),
+                resume_transcript_path: resume_hint
+                    .as_ref()
+                    .map(|hint| hint.transcript_path.clone()),
+                resume_command: resume_hint
+                    .as_ref()
+                    .map(|hint| resume_command_for_session(hint.session_id)),
+            })?)
+        }
         other => Err(anyhow!("unsupported auth action: {other}")),
     }
 }

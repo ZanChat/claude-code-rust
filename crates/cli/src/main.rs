@@ -8,6 +8,8 @@
 #![allow(clippy::useless_vec)]
 mod helpers;
 use helpers::*;
+mod config_env;
+use config_env::*;
 mod commands;
 use commands::*;
 mod spinner_verbs;
@@ -41,8 +43,8 @@ use code_agent_plugins::{
 use code_agent_providers::{
     build_provider, clear_auth_snapshot, code_agent_auth_snapshot_path,
     compatibility_model_catalog, config_migration_report, get_anthropic_credential_hint,
-    get_openai_credential_hint, write_auth_snapshot, ApiProvider, AuthRequest, AuthResolver,
-    EnvironmentAuthResolver, ModelCatalog, ProviderEvent, ProviderRequest, ProviderToolDefinition,
+    get_openai_credential_hint, ApiProvider, AuthRequest, AuthResolver, EnvironmentAuthResolver,
+    ModelCatalog, ProviderEvent, ProviderRequest, ProviderToolDefinition,
 };
 use code_agent_session::{
     agent_transcript_path_for, claude_config_home_dir, compact_messages, estimate_message_tokens,

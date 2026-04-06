@@ -449,11 +449,12 @@ async fn load_plugin_report(root: PathBuf) -> Result<PluginReport> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let mut cli = parse_cli();
+    let cwd = env::current_dir()?;
+    let mut login_config = apply_managed_login_env(&cwd);
     let startup_preferences = load_startup_preferences();
     let provider_selection =
-        resolve_launch_provider(cli.provider.as_deref(), &startup_preferences)?;
+        resolve_launch_provider(cli.provider.as_deref(), &startup_preferences, &login_config)?;
     let provider = provider_selection.provider;
-    let cwd = env::current_dir()?;
     let project_dir = get_project_dir(&cwd);
     let prompt = (!cli.prompt.is_empty()).then(|| cli.prompt.join(" "));
     let tool_registry = compatibility_tool_registry();
@@ -665,6 +666,7 @@ async fn main() -> Result<()> {
                 provider_selection.source,
                 LaunchProviderSource::Default | LaunchProviderSource::Preference
             ),
+            &mut login_config,
             remote_mode_enabled(&cli),
             ide_bridge_enabled(&cli),
         )

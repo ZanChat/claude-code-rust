@@ -42,12 +42,13 @@ fn slash_command_footer_status(
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
+    live_runtime: bool,
     command_name: &str,
     command_recorded: bool,
     is_error: bool,
     detail: &str,
 ) -> String {
-    let base = repl_status(provider, active_model, session_id);
+    let base = repl_runtime_status(provider, active_model, session_id, live_runtime);
     if should_echo_command_result_in_footer(command_name, command_recorded, is_error) {
         status_with_detail(base, detail)
     } else {

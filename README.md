@@ -34,6 +34,15 @@ ccrust
 ccrust 'Refactor the auth logic in src/auth.rs'
 ```
 
+`ccrust` loads saved login config from `~/.claude/.env.ccrust` and then
+`./.claude/.env.ccrust`. Later sources override earlier ones:
+project-local config overrides user config, real environment variables override
+saved config, and CLI flags override all of them.
+
+If no provider is configured, bare `ccrust` opens onboarding automatically.
+Inside the REPL, `/login` opens the same onboarding flow and `/logout` clears
+the tracked `*.env.ccrust` config for that session.
+
 ## Supported API Providers & Authentication
 
 ### 1. Anthropic (First-Party) — Default
@@ -65,6 +74,9 @@ export OPENAI_API_KEY="your-custom-token"
 export OPENAI_BASE_URL="https://api.yourprovider.com/v1"
 ccrust --provider openai-compatible
 ```
+
+The interactive `/login` flow also includes presets for OpenAI, OpenRouter,
+Gemini, and a custom OpenAI-compatible base URL.
 
 ### 3. ChatGPT Codex
 

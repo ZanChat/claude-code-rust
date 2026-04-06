@@ -48,6 +48,7 @@ pub(crate) async fn run_interactive_repl(
     transcript_path: Option<PathBuf>,
     provider_configured: bool,
     persist_selected_provider: bool,
+    login_config: &mut ManagedLoginConfigState,
     remote_mode: bool,
     ide_bridge_active: bool,
 ) -> Result<SessionId> {
@@ -77,6 +78,7 @@ pub(crate) async fn run_interactive_repl(
     terminal.clear()?;
 
     let mut startup_preferences = load_startup_preferences();
+    let mut initial_compact_banner = None;
     let startup_screens = build_startup_screens(
         provider,
         &active_model,
@@ -125,17 +127,53 @@ pub(crate) async fn run_interactive_repl(
         live_runtime = auth.is_some() && provider_supports_live_runtime(provider);
     }
 
+    if !provider_configured {
+        if let Some(login_outcome) = run_login_onboarding_flow(
+            &mut terminal,
+            &cwd,
+            provider,
+            &active_model,
+            repl_session.session_id,
+            login_config.tracked_path.as_deref(),
+        )? {
+            apply_runtime_login_values(
+                login_config,
+                login_outcome.config_path.clone(),
+                login_outcome.env_values,
+            );
+            provider = login_outcome.provider;
+            startup_preferences.selected_provider = Some(provider);
+            save_startup_preferences(&startup_preferences)?;
+            if let Some(default_model) = default_model_for_provider(provider) {
+                active_model = default_model;
+            }
+            let auth = EnvironmentAuthResolver
+                .resolve_auth(AuthRequest {
+                    provider,
+                    profile: None,
+                })
+                .await
+                .ok();
+            live_runtime = auth.is_some() && provider_supports_live_runtime(provider);
+            initial_compact_banner = Some(format!(
+                "saved login config {}",
+                shorten_path(&login_outcome.config_path, 72)
+            ));
+        }
+    }
+
     let loop_result = async {
         let mut input_buffer = initial_input_buffer;
         let mut prompt_history = prompt_history_from_messages(raw_messages);
         let mut prompt_history_index = None;
         let mut prompt_history_draft: Option<code_agent_ui::InputBuffer> = None;
         let mut transcript_scroll = 0u16;
-        let mut status_line = repl_status(provider, &active_model, repl_session.session_id);
+        let mut status_line =
+            repl_runtime_status(provider, &active_model, repl_session.session_id, live_runtime);
         let mut status_marquee_tick = 0usize;
         let mut active_pane = PaneKind::Transcript;
         let mut selected_command_suggestion = 0usize;
-        let mut compact_banner = None;
+        let mut compact_banner = initial_compact_banner.clone();
         let mut resume_picker = None;
         let mut ide_picker = None;
         let mut connected_ide_bridge = None;
@@ -190,11 +228,11 @@ pub(crate) async fn run_interactive_repl(
                         tool_registry,
                         &cwd,
                         plugin_root,
-                        provider,
+                        &mut provider,
                         &mut active_model,
                         &mut repl_session,
                         raw_messages,
-                        live_runtime,
+                        &mut live_runtime,
                         prompt_text,
                         &mut input_buffer,
                         &mut prompt_history,
@@ -211,6 +249,7 @@ pub(crate) async fn run_interactive_repl(
                         &connected_ide_bridge,
                         &mut selected_command_suggestion,
                         &mut vim_state,
+                        login_config,
                         remote_mode,
                         ide_bridge_active,
                         &mut queued_submissions,
@@ -469,7 +508,12 @@ pub(crate) async fn run_interactive_repl(
                 match picker_action {
                     Some(ResumePickerAction::Close) => {
                         resume_picker = None;
-                        status_line = repl_status(provider, &active_model, repl_session.session_id);
+                        status_line = repl_runtime_status(
+                            provider,
+                            &active_model,
+                            repl_session.session_id,
+                            live_runtime,
+                        );
                         status_marquee_tick = 0;
                     }
                     Some(ResumePickerAction::Resume(summary)) => {
@@ -492,7 +536,12 @@ pub(crate) async fn run_interactive_repl(
                         }
                         compact_banner =
                             Some(format!("resume {}", shorten_path(&transcript_path, 72)));
-                        status_line = repl_status(provider, &active_model, repl_session.session_id);
+                        status_line = repl_runtime_status(
+                            provider,
+                            &active_model,
+                            repl_session.session_id,
+                            live_runtime,
+                        );
                         status_marquee_tick = 0;
                     }
                     None => {}
@@ -561,7 +610,12 @@ pub(crate) async fn run_interactive_repl(
                 match picker_action {
                     Some(IdePickerAction::Cancel) => {
                         ide_picker = None;
-                        status_line = repl_status(provider, &active_model, repl_session.session_id);
+                        status_line = repl_runtime_status(
+                            provider,
+                            &active_model,
+                            repl_session.session_id,
+                            live_runtime,
+                        );
                         status_marquee_tick = 0;
                     }
                     Some(IdePickerAction::Connect(Some(candidate))) => {
@@ -573,7 +627,12 @@ pub(crate) async fn run_interactive_repl(
                         connected_ide_bridge = Some(candidate);
                         ide_picker = None;
                         status_line = status_with_detail(
-                            repl_status(provider, &active_model, repl_session.session_id),
+                            repl_runtime_status(
+                                provider,
+                                &active_model,
+                                repl_session.session_id,
+                                live_runtime,
+                            ),
                             message,
                         );
                         status_marquee_tick = 0;
@@ -581,7 +640,12 @@ pub(crate) async fn run_interactive_repl(
                     Some(IdePickerAction::Connect(None)) => {
                         ide_picker = None;
                         status_line = status_with_detail(
-                            repl_status(provider, &active_model, repl_session.session_id),
+                            repl_runtime_status(
+                                provider,
+                                &active_model,
+                                repl_session.session_id,
+                                live_runtime,
+                            ),
                             "No IDE bridge detected for this workspace",
                         );
                         status_marquee_tick = 0;
@@ -1772,11 +1836,11 @@ pub(crate) async fn run_interactive_repl(
                         tool_registry,
                         &cwd,
                         plugin_root,
-                        provider,
+                        &mut provider,
                         &mut active_model,
                         &mut repl_session,
                         raw_messages,
-                        live_runtime,
+                        &mut live_runtime,
                         prompt_text,
                         &mut input_buffer,
                         &mut prompt_history,
@@ -1793,6 +1857,7 @@ pub(crate) async fn run_interactive_repl(
                         &connected_ide_bridge,
                         &mut selected_command_suggestion,
                         &mut vim_state,
+                        login_config,
                         remote_mode,
                         ide_bridge_active,
                         &mut queued_submissions,

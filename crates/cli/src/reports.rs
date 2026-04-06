@@ -86,6 +86,7 @@ pub(crate) struct AuthCommandReport {
     pub(crate) status: String,
     pub(crate) auth_source: Option<String>,
     pub(crate) hint: Option<String>,
+    pub(crate) config_path: Option<PathBuf>,
     pub(crate) snapshot_path: Option<PathBuf>,
     pub(crate) resume_session_id: Option<SessionId>,
     pub(crate) resume_transcript_path: Option<PathBuf>,

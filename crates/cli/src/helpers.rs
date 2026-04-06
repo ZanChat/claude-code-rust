@@ -190,6 +190,20 @@ pub(crate) fn repl_status(
     )
 }
 
+pub(crate) fn repl_runtime_status(
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    live_runtime: bool,
+) -> String {
+    let base = repl_status(provider, active_model, session_id);
+    if live_runtime {
+        base
+    } else {
+        status_with_detail(base, "login required · run /login")
+    }
+}
+
 pub(crate) fn repl_header_title() -> String {
     format!("ccrust v{}", env!("CARGO_PKG_VERSION"))
 }
