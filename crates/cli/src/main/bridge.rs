@@ -30,17 +30,21 @@ fn compaction_event(outcome: &CompactionOutcome) -> Option<RemoteEnvelope> {
         })
 }
 
-fn remote_envelopes_from_new_messages(
-    messages: &[Message],
-    start_index: usize,
-) -> Vec<RemoteEnvelope> {
+const BRIDGE_INITIAL_HISTORY_CAP: usize = 200;
+
+fn remote_envelopes_for_runtime_messages(messages: &[Message]) -> Vec<RemoteEnvelope> {
     let mut envelopes = Vec::new();
-    for message in messages.iter().skip(start_index) {
+    for message in messages {
+        if matches!(
+            message.role,
+            MessageRole::System | MessageRole::User | MessageRole::Assistant | MessageRole::Tool
+        ) {
+            envelopes.push(RemoteEnvelope::Message {
+                message: message.clone(),
+            });
+        }
         match message.role {
             MessageRole::Assistant => {
-                envelopes.push(RemoteEnvelope::Message {
-                    message: message.clone(),
-                });
                 for block in &message.blocks {
                     if let ContentBlock::ToolCall { call } = block {
                         envelopes.push(RemoteEnvelope::ToolCall { call: call.clone() });
@@ -60,6 +64,21 @@ fn remote_envelopes_from_new_messages(
         }
     }
     envelopes
+}
+
+fn remote_envelopes_from_new_messages(
+    messages: &[Message],
+    start_index: usize,
+) -> Vec<RemoteEnvelope> {
+    remote_envelopes_for_runtime_messages(&messages[start_index..])
+}
+
+fn capped_runtime_history(messages: &[Message]) -> Vec<Message> {
+    let runtime_messages = materialize_runtime_messages(messages);
+    let start = runtime_messages
+        .len()
+        .saturating_sub(BRIDGE_INITIAL_HISTORY_CAP);
+    runtime_messages.into_iter().skip(start).collect()
 }
 
 struct LocalBridgeHandler<'a> {
@@ -140,18 +159,16 @@ impl<'a> LocalBridgeHandler<'a> {
         outbound
     }
 
+    fn connect_history_envelopes(&self) -> Vec<RemoteEnvelope> {
+        remote_envelopes_for_runtime_messages(&capped_runtime_history(&self.raw_messages))
+    }
+
     async fn resume_session(&mut self, target: &str) -> Result<Vec<RemoteEnvelope>> {
         let (session_id, _, messages) = self.store.load_resume_target(target).await?;
         self.session_id = session_id;
         self.raw_messages = messages;
         self.pending_permission = None;
-        let runtime_messages = materialize_runtime_messages(&self.raw_messages);
-        let start = runtime_messages.len().saturating_sub(8);
-        let mut outbound = runtime_messages
-            .into_iter()
-            .skip(start)
-            .map(|message| RemoteEnvelope::Message { message })
-            .collect::<Vec<_>>();
+        let mut outbound = self.connect_history_envelopes();
         outbound.push(self.session_state_envelope());
         Ok(outbound)
     }
@@ -463,12 +480,17 @@ impl BridgeSessionHandler for LocalBridgeHandler<'_> {
         &mut self,
         _record: &ccrust_bridge::BridgeSessionRecord,
     ) -> Result<Vec<RemoteEnvelope>> {
-        Ok(vec![
-            RemoteEnvelope::Event {
-                event: AppEvent::RemoteConnected,
-            },
-            self.session_state_envelope(),
-        ])
+        let mut outbound = vec![RemoteEnvelope::Event {
+            event: AppEvent::RemoteConnected,
+        }];
+        outbound.extend(self.connect_history_envelopes());
+        if let Some(pending) = self.pending_permission.as_ref() {
+            outbound.push(RemoteEnvelope::PermissionRequest {
+                request: pending.request.clone(),
+            });
+        }
+        outbound.push(self.session_state_envelope());
+        Ok(outbound)
     }
 
     async fn on_envelope(&mut self, envelope: &RemoteEnvelope) -> Result<Vec<RemoteEnvelope>> {
@@ -617,4 +639,3 @@ impl BridgeSessionHandler for LocalBridgeHandler<'_> {
         }
     }
 }
-

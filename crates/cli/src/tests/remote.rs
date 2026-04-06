@@ -354,6 +354,53 @@ async fn local_bridge_handler_runs_prompt_turns() {
 }
 
 #[tokio::test]
+async fn local_bridge_handler_replays_runtime_history_on_connect() {
+    let store =
+        ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("bridge-connect")));
+    let tool_registry = compatibility_tool_registry();
+    let session_id = SessionId::new_v4();
+    let user_message =
+        build_text_message(session_id, MessageRole::User, "sync me".to_owned(), None);
+    let assistant_message = build_text_message(
+        session_id,
+        MessageRole::Assistant,
+        "history arrived".to_owned(),
+        Some(user_message.id),
+    );
+    let mut handler = LocalBridgeHandler {
+        store: &store,
+        tool_registry: &tool_registry,
+        cwd: env::temp_dir(),
+        provider: ApiProvider::FirstParty,
+        active_model: "claude-sonnet-4-6".to_owned(),
+        session_id,
+        raw_messages: vec![user_message, assistant_message],
+        live_runtime: false,
+        allow_remote_tools: true,
+        pending_permission: None,
+        voice_streams: BTreeMap::new(),
+    };
+
+    let envelopes = handler
+        .on_connect(&ccrust_bridge::BridgeSessionRecord::default())
+        .await
+        .unwrap();
+
+    assert!(envelopes.iter().any(
+        |envelope| matches!(envelope, RemoteEnvelope::Event { event } if *event == ccrust_core::AppEvent::RemoteConnected)
+    ));
+    assert!(envelopes.iter().any(
+        |envelope| matches!(envelope, RemoteEnvelope::Message { message } if message.role == MessageRole::User && message_text(message).contains("sync me"))
+    ));
+    assert!(envelopes.iter().any(
+        |envelope| matches!(envelope, RemoteEnvelope::Message { message } if message.role == MessageRole::Assistant && message_text(message).contains("history arrived"))
+    ));
+    assert!(envelopes.iter().any(
+        |envelope| matches!(envelope, RemoteEnvelope::SessionState { state } if state.message_count == 2)
+    ));
+}
+
+#[tokio::test]
 async fn local_bridge_handler_supports_assistant_and_voice_inputs() {
     let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
         "bridge-assistant",
