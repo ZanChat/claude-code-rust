@@ -64,10 +64,11 @@ pub enum StatusLevel {
 
 impl StatusLevel {
     fn style(self) -> Style {
+        let theme = UiTheme::current();
         match self {
-            Self::Info => Style::default().fg(Color::Cyan),
-            Self::Warning => Style::default().fg(Color::Yellow),
-            Self::Error => Style::default().fg(Color::Red),
+            Self::Info => Style::default().fg(theme.info_color()),
+            Self::Warning => Style::default().fg(theme.warning_color()),
+            Self::Error => Style::default().fg(theme.error_color()),
         }
     }
 }

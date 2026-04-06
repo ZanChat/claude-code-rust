@@ -11,6 +11,24 @@ struct ResolvedPromptCommand {
     argument_names: Vec<String>,
 }
 
+const BUILTIN_REVIEW_PROMPT: &str = r#"
+You are an expert code reviewer. Follow these steps:
+
+1. If no PR number is provided in the args, run `gh pr list` to show open PRs
+2. If a PR number is provided, run `gh pr view <number>` to get PR details
+3. Run `gh pr diff <number>` to get the diff
+4. Analyze the changes and provide a concise, thorough review that covers:
+   - what the PR changes
+   - correctness and regression risk
+   - code quality and project conventions
+   - test coverage and missing validation
+   - security or performance concerns
+
+Keep the review direct and actionable.
+
+PR number: $ARGUMENTS
+"#;
+
 fn strip_matching_quotes(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.len() >= 2 {
@@ -237,7 +255,15 @@ fn resolve_prompt_command_definition(
     plugin_root: Option<&PathBuf>,
 ) -> Option<ResolvedPromptCommand> {
     if spec.source == CommandSource::BuiltIn {
-        return None;
+        return match spec.name.as_str() {
+            "review" => Some(ResolvedPromptCommand {
+                content: BUILTIN_REVIEW_PROMPT.to_owned(),
+                base_dir: None,
+                plugin_root: PathBuf::new(),
+                argument_names: Vec::new(),
+            }),
+            _ => None,
+        };
     }
 
     let root = resolve_plugin_root_with_override(plugin_root, None, cwd);

@@ -23,7 +23,7 @@ fn header_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
             &mut lines,
             subtitle,
             width,
-            Style::default().fg(Color::DarkGray),
+            UiTheme::current().muted_style(),
         );
     }
 
@@ -36,7 +36,7 @@ fn header_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
             &mut lines,
             context,
             width,
-            Style::default().fg(Color::DarkGray),
+            UiTheme::current().muted_style(),
         );
     }
 
@@ -54,7 +54,7 @@ fn header_widget(state: &UiState, width: u16) -> Paragraph<'static> {
 fn status_line(state: &UiState) -> Line<'static> {
     if let Some(prompt) = &state.permission_prompt {
         return Line::from(vec![
-            Span::styled("permission ", Style::default().fg(Color::Yellow)),
+            Span::styled("permission ", UiTheme::current().warning_style()),
             Span::raw(format!(
                 "{} -> {} / {}",
                 prompt.tool_name, prompt.allow_once_label, prompt.deny_label
@@ -322,14 +322,14 @@ fn footer_widget(
                 Span::raw(left),
                 Span::styled(
                     cursor_char,
-                    Style::default().bg(Color::White).fg(Color::Black),
+                    UiTheme::current().cursor_style(),
                 ),
                 Span::raw(right),
             ])
         } else {
             Line::from(vec![
                 Span::raw(format!("/ {search_text}")),
-                Span::styled(" ", Style::default().bg(Color::White)),
+                Span::styled(" ", UiTheme::current().cursor_style()),
             ])
         };
 
@@ -349,7 +349,7 @@ fn footer_widget(
     );
     let secondary = Line::from(Span::styled(
         marquee_text(&secondary_text, width, state.status_marquee_tick),
-        Style::default().fg(Color::DarkGray),
+        UiTheme::current().muted_style(),
     ));
 
     Paragraph::new(vec![primary, secondary]).wrap(Wrap { trim: false })
@@ -402,7 +402,7 @@ fn input_prompt_line(state: &UiState) -> Line<'static> {
                 if !matched.is_empty() {
                     spans.push(Span::styled(
                         matched,
-                        Style::default().bg(Color::Cyan).fg(Color::Black),
+                        UiTheme::current().accent_detail_style(),
                     ));
                 }
                 if !right.is_empty() {
@@ -423,7 +423,7 @@ fn input_prompt_line(state: &UiState) -> Line<'static> {
             Span::raw(left),
             Span::styled(
                 cursor_char,
-                Style::default().bg(Color::White).fg(Color::Black),
+                UiTheme::current().cursor_style(),
             ),
             Span::raw(right),
         ]);
@@ -431,7 +431,7 @@ fn input_prompt_line(state: &UiState) -> Line<'static> {
 
     Line::from(vec![
         Span::raw(format!("> {text}")),
-        Span::styled(" ", Style::default().bg(Color::White)),
+        Span::styled(" ", UiTheme::current().cursor_style()),
     ])
 }
 
@@ -462,10 +462,7 @@ fn command_suggestions_widget(state: &UiState) -> Paragraph<'static> {
         .map(|(index, entry)| {
             let selected = state.selected_command_suggestion == Some(index);
             let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                UiTheme::current().accent_highlight_style()
             } else {
                 Style::default()
             };
@@ -499,7 +496,7 @@ fn choice_list_lines(choice_list: &ChoiceListState) -> Vec<Line<'static>> {
             .subtitle
             .clone()
             .unwrap_or_else(|| "Enter to select · Esc to cancel".to_owned()),
-        Style::default().fg(Color::DarkGray),
+        UiTheme::current().muted_style(),
     )));
     lines.push(Line::from(""));
 
@@ -527,17 +524,14 @@ fn choice_list_lines(choice_list: &ChoiceListState) -> Vec<Line<'static>> {
         let is_selected = index == selected;
         let prefix = if is_selected { "> " } else { "  " };
         let item_style = if is_selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            UiTheme::current().accent_highlight_style()
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
         let detail_style = if is_selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            UiTheme::current().accent_detail_style()
         } else {
-            Style::default().fg(Color::DarkGray)
+            UiTheme::current().muted_style()
         };
 
         let mut spans = vec![Span::styled(format!("{prefix}{}", item.label), item_style)];
@@ -566,7 +560,7 @@ fn choice_list_lines(choice_list: &ChoiceListState) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!("{} of {}", selected + 1, choice_list.items.len()),
-            Style::default().fg(Color::DarkGray),
+            UiTheme::current().muted_style(),
         )));
     }
 
@@ -641,7 +635,7 @@ fn render_overlay(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     frame.render_widget(Clear, sheet_area);
     frame.render_widget(
         Paragraph::new(Line::from("▔".repeat(sheet_area.width as usize)))
-            .style(Style::default().fg(Color::Yellow)),
+            .style(UiTheme::current().warning_style()),
         divider_area,
     );
     if content_area.width > 0 && content_area.height > 0 {

@@ -454,6 +454,7 @@ async fn load_plugin_report(root: PathBuf) -> Result<PluginReport> {
 async fn main() -> Result<()> {
     let mut cli = parse_cli();
     let cwd = env::current_dir()?;
+    apply_saved_ui_theme_preference();
     let mut login_config = apply_managed_login_env(&cwd);
     let startup_preferences = load_startup_preferences();
     let provider_selection =
@@ -585,9 +586,11 @@ async fn main() -> Result<()> {
     };
     let (session_id, transcript_path, mut existing_messages) =
         choose_active_session(&cli, explicit_resume)?;
+    let command_settings = load_command_settings();
     let active_model = cli
         .model
         .clone()
+        .or_else(|| preferred_model_for_provider(provider, &command_settings))
         .or_else(|| {
             compatibility_model_catalog(provider)
                 .list_models()

@@ -1162,3 +1162,395 @@ async fn repl_mcp_command_lists_parsed_servers_and_auth() {
     assert!(status.contains("\"oauth_device\""));
     assert!(status.contains("\"client_id\": \"client-123\""));
 }
+
+#[tokio::test]
+async fn builtin_review_command_executes_builtin_prompt() {
+    let root = temp_session_root("repl-builtin-review");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "review".to_owned(),
+            args: vec!["123".to_owned()],
+            raw_input: "/review 123".to_owned(),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(status.contains("1 steps"));
+    assert!(raw_messages.iter().any(|message| {
+        message.role == MessageRole::User
+            && message_text(message).contains("You are an expert code reviewer")
+            && message_text(message).contains("PR number: 123")
+    }));
+}
+
+#[test]
+fn resolve_prompt_command_prompt_supports_builtin_review() {
+    let root = temp_session_root("builtin-review-prompt");
+    let registry = compatibility_command_registry();
+    let session_id = SessionId::new_v4();
+
+    let prompt = resolve_prompt_command_prompt(
+        &registry,
+        &CommandInvocation {
+            name: "review".to_owned(),
+            args: vec!["456".to_owned()],
+            raw_input: "/review 456".to_owned(),
+        },
+        &root,
+        None,
+        session_id,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(prompt.contains("gh pr list"));
+    assert!(prompt.contains("PR number: 456"));
+}
+
+#[test]
+fn settings_commands_persist_preferences_and_effort_env() {
+    let home = temp_session_root("command-settings-home");
+    let home_path = home.display().to_string();
+
+    with_env_vars(
+        &[
+            ("CLAUDE_CONFIG_DIR", Some(&home_path)),
+            ("REASONING_MODEL_THINK", None),
+            ("COMPLETION_MODEL_THINK", None),
+        ],
+        || {
+            let theme = render_theme_command(&CommandInvocation {
+                name: "theme".to_owned(),
+                args: vec!["dark-ansi".to_owned()],
+                raw_input: "/theme dark-ansi".to_owned(),
+            })
+            .unwrap();
+            assert!(theme.contains("Dark mode (ANSI colors only)"));
+
+            let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+            let fast = render_fast_command(
+                &CommandInvocation {
+                    name: "fast".to_owned(),
+                    args: vec!["on".to_owned()],
+                    raw_input: "/fast on".to_owned(),
+                },
+                ApiProvider::OpenAICompatible,
+                &active_model,
+            )
+            .unwrap();
+            if let Some(model) = fast.next_model.as_ref() {
+                active_model = model.clone();
+            }
+            assert!(fast.message.contains("Fast mode enabled"));
+            assert_eq!(active_model, DEFAULT_OPENAI_COMPLETION_MODEL);
+
+            let effort = render_effort_command(
+                Path::new("."),
+                &CommandInvocation {
+                    name: "effort".to_owned(),
+                    args: vec!["max".to_owned()],
+                    raw_input: "/effort max".to_owned(),
+                },
+            )
+            .unwrap();
+            assert_eq!(effort, "Effort level set to max.");
+            assert_eq!(env::var("REASONING_MODEL_THINK").unwrap(), "xhigh");
+            assert_eq!(env::var("COMPLETION_MODEL_THINK").unwrap(), "xhigh");
+
+            let chrome = render_chrome_command(&CommandInvocation {
+                name: "chrome".to_owned(),
+                args: vec!["on".to_owned()],
+                raw_input: "/chrome on".to_owned(),
+            })
+            .unwrap();
+            assert!(chrome.contains("enabled by default"));
+
+            let advisor = render_advisor_command(&CommandInvocation {
+                name: "advisor".to_owned(),
+                args: vec!["opus".to_owned()],
+                raw_input: "/advisor opus".to_owned(),
+            })
+            .unwrap();
+            assert_eq!(advisor, "Advisor set to opus.");
+
+            let settings = load_command_settings();
+            assert_eq!(settings.theme.as_deref(), Some("dark-ansi"));
+            assert!(settings.fast_mode);
+            assert_eq!(settings.advisor_model.as_deref(), Some("opus"));
+            assert!(settings.chrome_default_enabled);
+
+            let env_file = fs::read_to_string(user_ccrust_env_path()).unwrap();
+            assert!(env_file.contains("REASONING_MODEL_THINK=xhigh"));
+            assert!(env_file.contains("COMPLETION_MODEL_THINK=xhigh"));
+        },
+    );
+}
+
+#[test]
+fn fast_command_reports_when_current_provider_does_not_apply_it() {
+    let current = render_fast_command(
+        &CommandInvocation {
+            name: "fast".to_owned(),
+            args: vec![],
+            raw_input: "/fast".to_owned(),
+        },
+        ApiProvider::FirstParty,
+        "claude-sonnet-4-6",
+    )
+    .unwrap();
+    assert!(current
+        .message
+        .contains("chatgpt-codex and openai-compatible"));
+
+    let enabled = render_fast_command(
+        &CommandInvocation {
+            name: "fast".to_owned(),
+            args: vec!["on".to_owned()],
+            raw_input: "/fast on".to_owned(),
+        },
+        ApiProvider::FirstParty,
+        "claude-sonnet-4-6",
+    )
+    .unwrap();
+    assert!(enabled
+        .message
+        .contains("enabled for supported OpenAI-family sessions"));
+    assert!(enabled.next_model.is_none());
+}
+
+#[tokio::test]
+async fn rename_tag_and_rewind_commands_persist_session_state() {
+    let root = temp_session_root("session-metadata-commands");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+    let mut raw_messages = vec![
+        build_text_message(
+            session_id,
+            MessageRole::User,
+            "Inspect auth flow".to_owned(),
+            None,
+        ),
+        build_text_message(
+            session_id,
+            MessageRole::Assistant,
+            "Auth flow looks stable.".to_owned(),
+            None,
+        ),
+        build_text_message(
+            session_id,
+            MessageRole::User,
+            "Check bridge handoff".to_owned(),
+            None,
+        ),
+        build_text_message(
+            session_id,
+            MessageRole::Assistant,
+            "Bridge handoff needs work.".to_owned(),
+            None,
+        ),
+    ];
+    for message in &raw_messages {
+        store.append_message(session_id, message).await.unwrap();
+    }
+
+    let rename = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "rename".to_owned(),
+            args: vec!["Auth handoff".to_owned()],
+            raw_input: "/rename Auth handoff".to_owned(),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rename, "Session renamed to: Auth handoff");
+
+    let tag = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "tag".to_owned(),
+            args: vec!["bugfix".to_owned()],
+            raw_input: "/tag bugfix".to_owned(),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(tag, "Tagged session with #bugfix.");
+
+    let session_report = render_session_command(&store, session_id).await.unwrap();
+    let session_json: serde_json::Value = serde_json::from_str(&session_report).unwrap();
+    assert_eq!(session_json["custom_title"], "Auth handoff");
+    assert_eq!(session_json["agent_name"], "Auth handoff");
+    assert_eq!(session_json["tag"], "bugfix");
+
+    let rewind = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "rewind".to_owned(),
+            args: vec!["3".to_owned()],
+            raw_input: "/rewind 3".to_owned(),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(rewind.contains("Rewound to before turn 2"));
+    assert_eq!(raw_messages.len(), 2);
+    assert_eq!(store.load_session(session_id).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn targeted_command_outputs_do_not_use_placeholder_copy() {
+    let root = temp_session_root("command-placeholder-copy");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+    let mut raw_messages = vec![build_text_message(
+        session_id,
+        MessageRole::User,
+        "Inspect auth flow".to_owned(),
+        None,
+    )];
+
+    let cases = vec![
+        CommandInvocation {
+            name: "theme".to_owned(),
+            args: vec![],
+            raw_input: "/theme".to_owned(),
+        },
+        CommandInvocation {
+            name: "fast".to_owned(),
+            args: vec![],
+            raw_input: "/fast".to_owned(),
+        },
+        CommandInvocation {
+            name: "effort".to_owned(),
+            args: vec![],
+            raw_input: "/effort".to_owned(),
+        },
+        CommandInvocation {
+            name: "mobile".to_owned(),
+            args: vec![],
+            raw_input: "/mobile".to_owned(),
+        },
+        CommandInvocation {
+            name: "desktop".to_owned(),
+            args: vec![],
+            raw_input: "/desktop".to_owned(),
+        },
+        CommandInvocation {
+            name: "chrome".to_owned(),
+            args: vec![],
+            raw_input: "/chrome".to_owned(),
+        },
+        CommandInvocation {
+            name: "advisor".to_owned(),
+            args: vec![],
+            raw_input: "/advisor".to_owned(),
+        },
+    ];
+    let banned = [
+        "compatibility-surface",
+        "compatibility state",
+        "not persisted yet",
+        "intentionally deferred",
+    ];
+
+    for invocation in cases {
+        let output = handle_repl_slash_command(
+            &registry,
+            invocation.clone(),
+            &store,
+            &tool_registry,
+            &root,
+            None,
+            ApiProvider::OpenAICompatible,
+            &mut active_model,
+            &mut repl_session,
+            &mut raw_messages,
+            false,
+            &mut vim_state,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let lowered = output.to_ascii_lowercase();
+        for needle in banned {
+            assert!(
+                !lowered.contains(needle),
+                "unexpected placeholder copy '{needle}' in /{} output: {output}",
+                invocation.name
+            );
+        }
+    }
+}

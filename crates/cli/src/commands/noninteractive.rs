@@ -21,15 +21,35 @@ pub(crate) async fn handle_slash_command(
         "status" => println!("{}", render_status_command(provider, active_model, session_id, live_runtime, cwd)?),
         "ide" => println!("{}", render_ide_command(cwd, ide_bridge_enabled(cli), ide_bridge_address(cli))?),
         "statusline" => println!("{}", render_statusline_command(provider, active_model, session_id)?),
-        "theme" => println!("{}", render_theme_command()?),
+        "theme" => println!("{}", render_theme_command(&invocation)?),
         "vim" => println!("{}", render_vim_command(false)?),
         "plan" => println!("{}", render_plan_command(cwd, &invocation)?),
-        "fast" => println!("{}", render_simple_compat_command("fast", "Fast mode uses the same model family with lower latency-focused behavior.")?),
+        "fast" => println!("{}", render_fast_command(&invocation, provider, active_model)?.message),
         "passes" => println!("{}", render_simple_compat_command("passes", "Pass-count tuning is not yet modeled separately in the Rust runtime.")?),
-        "effort" => println!("{}", render_simple_compat_command("effort", "Reasoning effort tuning remains compatibility-surface only in the current build.")?),
+        "effort" => println!("{}", render_effort_command(cwd, &invocation)?),
+        "tag" => println!("{}", render_tag_command(store, session_id, &invocation).await?),
+        "rename" => {
+            let messages = if raw_messages.is_empty() {
+                store.load_session(session_id).await.unwrap_or_default()
+            } else {
+                raw_messages.to_vec()
+            };
+            println!("{}", render_rename_command(store, session_id, &invocation, &messages).await?);
+        }
+        "rewind" => {
+            let mut messages = if raw_messages.is_empty() {
+                store.load_session(session_id).await.unwrap_or_default()
+            } else {
+                raw_messages.to_vec()
+            };
+            println!("{}", render_rewind_command(store, session_id, &invocation, &mut messages).await?);
+        }
         "skills" => println!("{}", render_skills_command(cwd, cli.plugin_root.as_ref()).await?),
         "reload-plugins" => println!("{}", render_skills_command(cwd, cli.plugin_root.as_ref()).await?),
         "hooks" => println!("{}", render_hooks_command(cwd, cli.plugin_root.as_ref())?),
+        "mobile" => println!("{}", render_mobile_command(store, session_id).await?),
+        "desktop" => println!("{}", render_desktop_command(store, session_id).await?),
+        "chrome" => println!("{}", render_chrome_command(&invocation)?),
         "output-style" => println!("{}", render_output_style_command()?),
         "files" => println!("{}", render_files_command(raw_messages, cwd)?),
         "diff" => println!("{}", render_diff_command(raw_messages)?),
@@ -90,6 +110,7 @@ pub(crate) async fn handle_slash_command(
             if path.exists() {
                 fs::remove_file(&path)?;
             }
+            let _ = delete_session_metadata_for_path(&path)?;
             println!("{}", json!({ "cleared": path }));
         }
         "compact" => {
@@ -226,6 +247,7 @@ pub(crate) async fn handle_slash_command(
                 .await?
             );
         }
+        "advisor" => println!("{}", render_advisor_command(&invocation)?),
         "remote-control" => {
             println!(
                 "{}",

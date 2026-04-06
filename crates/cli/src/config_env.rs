@@ -150,6 +150,20 @@ fn write_env_file(path: &Path, values: &BTreeMap<String, String>) -> Result<()> 
     Ok(())
 }
 
+fn managed_env_candidate_paths(cwd: &Path, preferred_path: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = preferred_path {
+        candidates.push(path.to_path_buf());
+    }
+    if let Some(path) = existing_managed_login_env_path(cwd) {
+        candidates.push(path);
+    }
+    candidates.push(user_ccrust_env_path());
+    candidates.push(project_ccrust_env_path(cwd));
+    candidates.dedup();
+    candidates
+}
+
 pub(crate) fn apply_managed_login_env(cwd: &Path) -> ManagedLoginConfigState {
     let user_path = user_ccrust_env_path();
     let project_path = project_ccrust_env_path(cwd);
@@ -233,14 +247,7 @@ pub(crate) fn persist_managed_login_env(
     preferred_path: Option<&Path>,
     values: &BTreeMap<String, String>,
 ) -> Result<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(path) = preferred_path {
-        candidates.push(path.to_path_buf());
-    }
-    candidates.push(user_ccrust_env_path());
-    candidates.push(project_ccrust_env_path(cwd));
-    candidates.dedup();
-
+    let candidates = managed_env_candidate_paths(cwd, preferred_path);
     let mut last_error = None;
     for path in candidates {
         let mut current = read_env_file(&path);
@@ -264,6 +271,50 @@ pub(crate) fn persist_managed_login_env(
             .map(|error| error.to_string())
             .unwrap_or_else(|| "no writable paths".to_owned())
     ))
+}
+
+pub(crate) fn persist_managed_env_updates(
+    cwd: &Path,
+    preferred_path: Option<&Path>,
+    updates: &BTreeMap<String, Option<String>>,
+) -> Result<PathBuf> {
+    let candidates = managed_env_candidate_paths(cwd, preferred_path);
+    let mut last_error = None;
+
+    for path in candidates {
+        let mut current = read_env_file(&path);
+        for (key, value) in updates {
+            match value.as_deref().filter(|value| !value.trim().is_empty()) {
+                Some(value) => {
+                    current.insert(key.clone(), value.to_owned());
+                }
+                None => {
+                    current.remove(key);
+                }
+            }
+        }
+
+        match write_env_file(&path, &current) {
+            Ok(()) => return Ok(path),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(anyhow!(
+        "failed to write managed env updates: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no writable paths".to_owned())
+    ))
+}
+
+pub(crate) fn apply_managed_env_updates(updates: &BTreeMap<String, Option<String>>) {
+    for (key, value) in updates {
+        match value.as_deref().filter(|value| !value.trim().is_empty()) {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
+    }
 }
 
 pub(crate) fn clear_managed_login_env_file(path: &Path) -> Result<bool> {

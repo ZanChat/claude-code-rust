@@ -8,6 +8,8 @@
 #![allow(clippy::useless_vec)]
 mod helpers;
 use helpers::*;
+mod command_state;
+use command_state::*;
 mod config_env;
 use config_env::*;
 mod commands;

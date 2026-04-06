@@ -1111,3 +1111,109 @@ async fn repl_ide_command_reports_bridge_state() {
     assert!(!disconnected.contains("\"status\": \"connected\""));
     assert!(connected.contains("\"status\": \"connected\""));
 }
+
+#[test]
+fn command_pickers_queue_real_theme_fast_and_effort_commands() {
+    let home = temp_session_root("picker-settings-home");
+    let home_path = home.display().to_string();
+
+    with_env_var("CLAUDE_CONFIG_DIR", Some(&home_path), || {
+        let theme_picker = repl_theme_picker_state();
+        assert_eq!(theme_picker.title, "Theme");
+        match &theme_picker.items[0].action {
+            ReplCommandPickerAction::QueueInput { input, .. } => {
+                assert_eq!(input, "/theme auto");
+            }
+            other => panic!("expected queue input action, got {other:?}"),
+        }
+
+        let fast_picker = repl_fast_picker_state(DEFAULT_OPENAI_REASONING_MODEL);
+        assert_eq!(fast_picker.title, "Fast mode");
+        match &fast_picker.items[0].action {
+            ReplCommandPickerAction::QueueInput { input, .. } => {
+                assert_eq!(input, "/fast on");
+            }
+            other => panic!("expected queue input action, got {other:?}"),
+        }
+
+        let effort_picker = repl_effort_picker_state();
+        assert_eq!(effort_picker.title, "Effort");
+        assert!(effort_picker.items.iter().any(|entry| matches!(
+            entry.action,
+            ReplCommandPickerAction::QueueInput { ref input, .. } if input == "/effort max"
+        )));
+    });
+}
+
+#[test]
+fn rewind_picker_lists_user_turns_from_latest_to_oldest() {
+    let session_id = SessionId::new_v4();
+    let messages = vec![
+        build_text_message(
+            session_id,
+            MessageRole::User,
+            "first prompt".to_owned(),
+            None,
+        ),
+        build_text_message(
+            session_id,
+            MessageRole::Assistant,
+            "first reply".to_owned(),
+            None,
+        ),
+        build_text_message(
+            session_id,
+            MessageRole::User,
+            "second prompt".to_owned(),
+            None,
+        ),
+        build_text_message(
+            session_id,
+            MessageRole::Assistant,
+            "second reply".to_owned(),
+            None,
+        ),
+    ];
+
+    let picker = repl_rewind_picker_state(&messages);
+
+    assert_eq!(picker.title, "Rewind");
+    assert_eq!(picker.items.len(), 2);
+    assert_eq!(picker.items[0].item.label, "Turn 2");
+    assert_eq!(
+        picker.items[0].item.detail.as_deref(),
+        Some("second prompt")
+    );
+    match &picker.items[0].action {
+        ReplCommandPickerAction::QueueInput { input, .. } => {
+            assert_eq!(input, "/rewind 3");
+        }
+        other => panic!("expected queue input action, got {other:?}"),
+    }
+}
+
+#[test]
+fn resume_picker_item_prefers_saved_title_and_tag() {
+    let root = temp_session_root("resume-picker-metadata");
+    let transcript_path = root.join("session.jsonl");
+    write_test_file(&transcript_path, "");
+    update_session_metadata_for_path(&transcript_path, |metadata| {
+        metadata.custom_title = Some("Auth handoff".to_owned());
+        metadata.tag = Some("bugfix".to_owned());
+    })
+    .unwrap();
+
+    let item = resume_picker_item(&SessionSummary {
+        session_id: SessionId::new_v4(),
+        transcript_path,
+        modified_at_unix_ms: 0,
+        message_count: 4,
+        first_prompt: "fallback prompt".to_owned(),
+    });
+
+    assert!(item.label.contains("Auth handoff"));
+    assert!(item
+        .detail
+        .as_deref()
+        .is_some_and(|value| value.contains("#bugfix")));
+}

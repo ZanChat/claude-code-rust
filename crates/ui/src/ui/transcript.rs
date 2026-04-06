@@ -146,6 +146,11 @@ pub struct RatatuiApp {
 
 impl RatatuiApp {
     pub fn new(title: impl Into<String>) -> Self {
+        Self::new_with_theme(title, UiTheme::current())
+    }
+
+    pub fn new_with_theme(title: impl Into<String>, theme: UiTheme) -> Self {
+        UiTheme::set_current(theme);
         Self {
             title: title.into(),
         }
@@ -432,32 +437,9 @@ fn line_width(text: &str) -> usize {
 }
 
 fn role_style(role: &str) -> Style {
-    match role {
-        "user" => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        "command" => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        "assistant" => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        "command_output" => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        "tool" => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        "task" => Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
-        "setup" => Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
-        _ => Style::default()
-            .fg(Color::Blue)
-            .add_modifier(Modifier::BOLD),
-    }
+    Style::default()
+        .fg(UiTheme::current().role_color(role))
+        .add_modifier(Modifier::BOLD)
 }
 
 fn role_label(role: &str) -> &'static str {
@@ -647,21 +629,15 @@ fn highlight_line_range(
 }
 
 fn search_highlight_style() -> Style {
-    Style::default()
-        .fg(Color::White)
-        .bg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD)
+    UiTheme::current().search_highlight_style()
 }
 
 fn message_action_highlight_style() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
+    UiTheme::current().accent_highlight_style()
 }
 
 fn selection_highlight_style() -> Style {
-    Style::default().fg(Color::Black).bg(Color::Yellow)
+    UiTheme::current().selection_highlight_style()
 }
 
 fn normalize_selection(
@@ -798,10 +774,9 @@ fn group_header_lines(group: &TranscriptGroup, width: u16) -> Vec<Line<'static>>
 
     let mut lines = Vec::new();
     let icon = if group.expanded { "▼" } else { "▶" };
-    let title_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let subtitle_style = Style::default().fg(Color::DarkGray);
+    let theme = UiTheme::current();
+    let title_style = theme.title_style();
+    let subtitle_style = theme.muted_style();
 
     for segment in wrap_plain_text(&format!("{icon} {}", group.title), width.max(1) as usize) {
         lines.push(Line::from(Span::styled(segment, title_style)));
@@ -827,15 +802,14 @@ fn group_header_lines(group: &TranscriptGroup, width: u16) -> Vec<Line<'static>>
 
 fn single_item_group_header_lines(group: &TranscriptGroup, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let theme = UiTheme::current();
     let icon_style = if group.expanded {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
+        theme.title_style()
     } else {
-        Style::default().fg(Color::DarkGray)
+        theme.muted_style()
     };
     let summary_style = Style::default().add_modifier(Modifier::DIM);
-    let hint_style = Style::default().fg(Color::DarkGray);
+    let hint_style = theme.muted_style();
 
     let content_width = width.saturating_sub(2).max(1) as usize;
     for (index, segment) in wrap_plain_text(&group.title, content_width)
@@ -878,8 +852,8 @@ fn single_item_group_header_lines(group: &TranscriptGroup, width: u16) -> Vec<Li
 fn single_item_group_detail_style(role: &str) -> Style {
     match role {
         "history_tool_call" => Style::default().add_modifier(Modifier::BOLD),
-        "history_tool_error" => Style::default().fg(Color::Red),
-        _ => Style::default().fg(Color::DarkGray),
+        "history_tool_error" => Style::default().fg(UiTheme::current().error_color()),
+        _ => UiTheme::current().muted_style(),
     }
 }
 
@@ -928,7 +902,7 @@ fn empty_transcript_render_lines(state: &UiState, width: u16) -> Vec<TranscriptR
         return vec![regular_render_line(
             Line::from(Span::styled(
                 "Transcript",
-                Style::default().fg(Color::DarkGray),
+                UiTheme::current().muted_style(),
             )),
             None,
             "Transcript",
@@ -947,7 +921,7 @@ fn empty_transcript_render_lines(state: &UiState, width: u16) -> Vec<TranscriptR
         regular_render_line(
             Line::from(Span::styled(
                 "Type a prompt below or start with / to browse commands.",
-                Style::default().fg(Color::DarkGray),
+                UiTheme::current().muted_style(),
             )),
             None,
             "Type a prompt below or start with / to browse commands.",
@@ -1420,11 +1394,14 @@ fn sticky_prompt_widget(
     let text = last_user_prompt_excerpt(state, width, transcript_scroll)?;
     Some(
         Paragraph::new(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(text, Style::default().fg(Color::White)),
+            Span::styled("▸ ", UiTheme::current().muted_style()),
+            Span::styled(
+                text,
+                Style::default().fg(UiTheme::current().search_foreground_color()),
+            ),
         ]))
         .wrap(Wrap { trim: true })
-        .style(Style::default().bg(Color::DarkGray)),
+        .style(Style::default().bg(UiTheme::current().search_background_color())),
     )
 }
 
@@ -1442,10 +1419,7 @@ fn scroll_pill_widget(transcript_scroll: u16) -> Option<Paragraph<'static>> {
     Some(
         Paragraph::new(Line::from(Span::styled(
             label,
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            UiTheme::current().accent_highlight_style(),
         )))
         .alignment(Alignment::Center),
     )

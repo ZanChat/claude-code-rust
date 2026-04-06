@@ -435,53 +435,136 @@ fn build_command_choice_list(picker: &ReplCommandPickerState) -> ChoiceListState
 }
 
 fn repl_theme_picker_state() -> ReplCommandPickerState {
-    let rust_theme_note =
-        "Rust UI currently follows your terminal colors instead of persisting TS theme presets."
-            .to_owned();
-    let items = vec![
-        (
-            "Auto (match terminal)",
-            "Follow your terminal palette automatically.",
-        ),
-        ("Dark mode", "Use the default dark Claude Code palette."),
-        ("Light mode", "Use the default light Claude Code palette."),
-        (
-            "Dark mode (colorblind-friendly)",
-            "Dark palette adjusted for colorblind accessibility.",
-        ),
-        (
-            "Light mode (colorblind-friendly)",
-            "Light palette adjusted for colorblind accessibility.",
-        ),
-        (
-            "Dark mode (ANSI colors only)",
-            "Dark palette restricted to ANSI-safe colors.",
-        ),
-        (
-            "Light mode (ANSI colors only)",
-            "Light palette restricted to ANSI-safe colors.",
-        ),
-    ]
-    .into_iter()
-    .map(|(label, detail)| ReplCommandPickerEntry {
-        item: ChoiceListItem {
-            label: label.to_owned(),
-            detail: Some(detail.to_owned()),
-            secondary: Some(rust_theme_note.clone()),
-        },
-        action: ReplCommandPickerAction::Status {
-            status: format!("{label} is not persisted yet; the Rust UI keeps your terminal theme."),
-            banner: Some(rust_theme_note.clone()),
-        },
-    })
-    .collect();
+    let settings = load_command_settings();
+    let current = settings.theme.as_deref().unwrap_or("auto");
+    let selected = THEME_PRESETS
+        .iter()
+        .position(|preset| preset.value == current)
+        .unwrap_or_default();
+    let items = THEME_PRESETS
+        .iter()
+        .map(|preset| ReplCommandPickerEntry {
+            item: ChoiceListItem {
+                label: preset.label.to_owned(),
+                detail: Some(preset.description.to_owned()),
+                secondary: Some(format!("Saved value: {}", preset.value)),
+            },
+            action: ReplCommandPickerAction::QueueInput {
+                input: format!("/theme {}", preset.value),
+                status: format!("Saving theme: {}", preset.label),
+            },
+        })
+        .collect();
 
     ReplCommandPickerState {
         title: "Theme".to_owned(),
-        subtitle: Some("Enter to inspect parity notes · Esc to close".to_owned()),
+        subtitle: Some("Enter to save · Esc to close".to_owned()),
+        items,
+        selected,
+        empty_message: Some("No theme presets available.".to_owned()),
+    }
+}
+
+fn repl_fast_picker_state(active_model: &str) -> ReplCommandPickerState {
+    let settings = load_command_settings();
+    let items = vec![
+        ReplCommandPickerEntry {
+            item: ChoiceListItem {
+                label: "Enable fast mode".to_owned(),
+                detail: Some("Persist fast mode and prefer the faster default model.".to_owned()),
+                secondary: Some(format!("Current model: {active_model}")),
+            },
+            action: ReplCommandPickerAction::QueueInput {
+                input: "/fast on".to_owned(),
+                status: "Enabling fast mode".to_owned(),
+            },
+        },
+        ReplCommandPickerEntry {
+            item: ChoiceListItem {
+                label: "Disable fast mode".to_owned(),
+                detail: Some("Keep the standard model selection for future sessions.".to_owned()),
+                secondary: Some(format!("Current model: {active_model}")),
+            },
+            action: ReplCommandPickerAction::QueueInput {
+                input: "/fast off".to_owned(),
+                status: "Disabling fast mode".to_owned(),
+            },
+        },
+    ];
+
+    ReplCommandPickerState {
+        title: "Fast mode".to_owned(),
+        subtitle: Some("Enter to save · Esc to close".to_owned()),
+        items,
+        selected: if settings.fast_mode { 0 } else { 1 },
+        empty_message: Some("Fast mode options are unavailable.".to_owned()),
+    }
+}
+
+fn repl_effort_picker_state() -> ReplCommandPickerState {
+    let current = env::var("REASONING_MODEL_THINK")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "auto".to_owned());
+    let options = [
+        ("low", "Low", "Quick, lightweight reasoning."),
+        ("medium", "Medium", "Balanced reasoning depth."),
+        ("high", "High", "Deeper reasoning for tougher tasks."),
+        ("max", "Max", "Use the highest reasoning effort level."),
+        ("auto", "Auto", "Clear overrides and use the default level."),
+    ];
+    let selected = options
+        .iter()
+        .position(|(value, _, _)| {
+            (*value == "max" && current == "xhigh") || *value == current
+        })
+        .unwrap_or(options.len().saturating_sub(1));
+    let items = options
+        .into_iter()
+        .map(|(value, label, detail)| ReplCommandPickerEntry {
+            item: ChoiceListItem {
+                label: label.to_owned(),
+                detail: Some(detail.to_owned()),
+                secondary: Some(format!("Saved value: {value}")),
+            },
+            action: ReplCommandPickerAction::QueueInput {
+                input: format!("/effort {value}"),
+                status: format!("Setting effort to {label}"),
+            },
+        })
+        .collect();
+
+    ReplCommandPickerState {
+        title: "Effort".to_owned(),
+        subtitle: Some("Enter to save · Esc to close".to_owned()),
+        items,
+        selected,
+        empty_message: Some("Effort levels are unavailable.".to_owned()),
+    }
+}
+
+fn repl_rewind_picker_state(raw_messages: &[Message]) -> ReplCommandPickerState {
+    let items = rewind_candidates(raw_messages)
+        .into_iter()
+        .map(|candidate| ReplCommandPickerEntry {
+            item: ChoiceListItem {
+                label: format!("Turn {}", candidate.turn_number),
+                detail: Some(candidate.preview.clone()),
+                secondary: Some(format!("Message index {}", candidate.raw_index)),
+            },
+            action: ReplCommandPickerAction::QueueInput {
+                input: format!("/rewind {}", candidate.raw_index),
+                status: format!("Rewinding to turn {}", candidate.turn_number),
+            },
+        })
+        .collect();
+
+    ReplCommandPickerState {
+        title: "Rewind".to_owned(),
+        subtitle: Some("Enter to rewind · Esc to close".to_owned()),
         items,
         selected: 0,
-        empty_message: Some("No theme presets available.".to_owned()),
+        empty_message: Some("No conversation turns are available to rewind.".to_owned()),
     }
 }
 

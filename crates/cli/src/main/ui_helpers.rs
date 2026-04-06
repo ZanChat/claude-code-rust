@@ -13,14 +13,24 @@ fn optimistic_messages_for_command(
 }
 
 pub(crate) fn resume_picker_item(summary: &SessionSummary) -> ChoiceListItem {
+    let metadata = load_session_metadata_for_path(&summary.transcript_path);
     let prompt = preview_lines_from_text(summary.first_prompt.clone(), 1, 56).join(" ");
+    let title = metadata
+        .display_title()
+        .map(|value| preview_lines_from_text(value.to_owned(), 1, 56).join(" "));
+    let label = format!(
+        "s:{}  {}",
+        short_session_id(summary.session_id),
+        title.unwrap_or(prompt)
+    );
+    let mut detail_parts = vec![format!("{} messages", summary.message_count)];
+    if let Some(tag) = metadata.tag.as_deref().filter(|value| !value.trim().is_empty()) {
+        detail_parts.push(format!("#{tag}"));
+    }
+    detail_parts.push(shorten_path(&summary.transcript_path, 64));
     ChoiceListItem {
-        label: format!("s:{}  {prompt}", short_session_id(summary.session_id)),
-        detail: Some(format!(
-            "{} messages · {}",
-            summary.message_count,
-            shorten_path(&summary.transcript_path, 64)
-        )),
+        label,
+        detail: Some(detail_parts.join(" · ")),
         secondary: None,
     }
 }

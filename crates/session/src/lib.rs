@@ -79,10 +79,12 @@ impl TranscriptCodec for JsonlTranscriptCodec {
 
         let mut messages = Vec::new();
         for line in content.lines().filter(|line| !line.trim().is_empty()) {
-            let message = serde_json::from_str::<Message>(line).with_context(|| {
+            let value = serde_json::from_str::<serde_json::Value>(line).with_context(|| {
                 format!("failed to decode transcript line in {}", path.display())
             })?;
-            messages.push(message);
+            if let Ok(message) = serde_json::from_value::<Message>(value) {
+                messages.push(message);
+            }
         }
 
         Ok(messages)

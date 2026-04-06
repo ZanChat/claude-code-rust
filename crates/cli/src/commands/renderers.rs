@@ -16,6 +16,7 @@ pub(crate) async fn render_session_command(
     session_id: SessionId,
 ) -> Result<String> {
     let transcript_path = store.transcript_path(session_id).await?;
+    let metadata = load_session_metadata_for_path(&transcript_path);
     let messages = store.load_session(session_id).await.unwrap_or_default();
     let runtime_messages = materialize_runtime_messages(&messages);
     let first_prompt = runtime_messages
@@ -25,6 +26,9 @@ pub(crate) async fn render_session_command(
         session_id,
         session_root: store.root_dir().to_path_buf(),
         transcript_path,
+        custom_title: metadata.custom_title,
+        agent_name: metadata.agent_name,
+        tag: metadata.tag,
         message_count: messages.len(),
         runtime_message_count: runtime_messages.len(),
         first_prompt,
@@ -40,6 +44,7 @@ pub(crate) fn render_status_command(
     live_runtime: bool,
     cwd: &Path,
 ) -> Result<String> {
+    let settings = load_command_settings();
     Ok(serde_json::to_string_pretty(&json!({
         "provider": provider,
         "model": active_model,
@@ -47,6 +52,10 @@ pub(crate) fn render_status_command(
         "runtime": if live_runtime { "live" } else { "offline" },
         "task_count": task_store_for(cwd).list_tasks()?.len(),
         "question_count": task_store_for(cwd).list_questions()?.len(),
+        "theme": settings.theme,
+        "fast_mode": settings.fast_mode,
+        "advisor_model": settings.advisor_model,
+        "chrome_default_enabled": settings.chrome_default_enabled,
     }))?)
 }
 
@@ -58,6 +67,153 @@ pub(crate) fn render_statusline_command(
     Ok(serde_json::to_string_pretty(&json!({
         "statusline": repl_status(provider, active_model, session_id),
     }))?)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FastCommandOutcome {
+    pub(crate) message: String,
+    pub(crate) next_model: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RewindCandidate {
+    pub(crate) raw_index: usize,
+    pub(crate) turn_number: usize,
+    pub(crate) preview: String,
+}
+
+fn usage_line(command: &str, args: &str) -> String {
+    format!("Usage: /{command} {args}")
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn rewindable_user_text(message: &Message) -> Option<String> {
+    if message.role != MessageRole::User {
+        return None;
+    }
+
+    let text = collapse_whitespace(&message_text(message));
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return None;
+    }
+
+    Some(trimmed.to_owned())
+}
+
+pub(crate) fn rewind_candidates(raw_messages: &[Message]) -> Vec<RewindCandidate> {
+    let mut turn_number = 0usize;
+    let mut candidates = raw_messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            let text = rewindable_user_text(message)?;
+            turn_number += 1;
+            Some(RewindCandidate {
+                raw_index: index + 1,
+                turn_number,
+                preview: preview_lines_from_text(text, 1, 72).join(" "),
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.reverse();
+    candidates
+}
+
+fn suggested_session_title(raw_messages: &[Message]) -> Option<String> {
+    raw_messages
+        .iter()
+        .rev()
+        .filter_map(rewindable_user_text)
+        .next()
+        .map(|text| preview_lines_from_text(text, 1, 64).join(" "))
+}
+
+fn write_transcript_messages(path: &Path, messages: &[Message]) -> Result<()> {
+    if messages.is_empty() {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut output = String::new();
+    for message in messages {
+        output.push_str(&serde_json::to_string(message)?);
+        output.push('\n');
+    }
+    fs::write(path, output)?;
+    Ok(())
+}
+
+async fn persist_rewound_session(
+    store: &ActiveSessionStore,
+    session_id: SessionId,
+    raw_messages: &[Message],
+) -> Result<PathBuf> {
+    let transcript_path = store.transcript_path(session_id).await?;
+    write_transcript_messages(&transcript_path, raw_messages)?;
+    Ok(transcript_path)
+}
+
+fn effort_display_name(value: &str) -> &str {
+    match value {
+        "xhigh" => "max",
+        other => other,
+    }
+}
+
+fn current_effort_summary() -> String {
+    let reasoning = env::var("REASONING_MODEL_THINK")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let completion = env::var("COMPLETION_MODEL_THINK")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    match (reasoning.as_deref(), completion.as_deref()) {
+        (None, None) => "Effort level: auto (reasoning=max, completion=max)".to_owned(),
+        (Some(reasoning), Some(completion)) if reasoning == completion => {
+            format!("Current effort level: {}", effort_display_name(reasoning))
+        }
+        (Some(reasoning), Some(completion)) => format!(
+            "Current effort level: reasoning={} · completion={}",
+            effort_display_name(reasoning),
+            effort_display_name(completion)
+        ),
+        (Some(reasoning), None) => format!(
+            "Current effort level: reasoning={} · completion=auto",
+            effort_display_name(reasoning)
+        ),
+        (None, Some(completion)) => format!(
+            "Current effort level: reasoning=auto · completion={}",
+            effort_display_name(completion)
+        ),
+    }
+}
+
+async fn handoff_lines(
+    store: &ActiveSessionStore,
+    session_id: SessionId,
+) -> Result<(PathBuf, SessionMetadata, Vec<String>)> {
+    let transcript_path = store.transcript_path(session_id).await?;
+    let metadata = load_session_metadata_for_path(&transcript_path);
+    let mut lines = vec![format!("Session: {session_id}")];
+    if let Some(title) = metadata.display_title() {
+        lines.push(format!("Title: {title}"));
+    }
+    if let Some(tag) = metadata.tag.as_deref().filter(|value| !value.trim().is_empty()) {
+        lines.push(format!("Tag: #{tag}"));
+    }
+    lines.push(format!("Transcript: {}", transcript_path.display()));
+    Ok((transcript_path, metadata, lines))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -424,14 +580,335 @@ fn format_agent_task_record(task: &TaskRecord) -> String {
     lines.join("\n")
 }
 
-pub(crate) fn render_theme_command() -> Result<String> {
-    Ok([
-        "Theme".to_owned(),
-        "Rust UI currently follows your terminal colors instead of persisting TS theme presets."
-            .to_owned(),
-        "Available TS presets: auto, dark, light, dark-daltonized, light-daltonized, dark-ansi, light-ansi.".to_owned(),
-    ]
-    .join("\n"))
+pub(crate) fn render_theme_command(invocation: &CommandInvocation) -> Result<String> {
+    let current_settings = load_command_settings();
+    let current_preset = current_settings
+        .theme
+        .as_deref()
+        .and_then(theme_preset)
+        .unwrap_or(&THEME_PRESETS[0]);
+    let Some(arg) = invocation.args.first().map(String::as_str) else {
+        return Ok([
+            format!("Current theme: {}", current_preset.label),
+            usage_line(
+                "theme",
+                "[auto|dark|light|dark-daltonized|light-daltonized|dark-ansi|light-ansi]",
+            ),
+        ]
+        .join("\n"));
+    };
+
+    let Some(theme_value) = normalize_theme_preset(arg) else {
+        return Ok([
+            format!("Unknown theme preset: {arg}"),
+            usage_line(
+                "theme",
+                "[auto|dark|light|dark-daltonized|light-daltonized|dark-ansi|light-ansi]",
+            ),
+        ]
+        .join("\n"));
+    };
+
+    let preset = theme_preset(theme_value).unwrap_or(&THEME_PRESETS[0]);
+    update_command_settings(|settings| settings.theme = Some(theme_value.to_owned()))?;
+    apply_ui_theme_preference(Some(theme_value));
+    Ok(format!("Theme preference saved as {}.", preset.label))
+}
+
+pub(crate) fn render_fast_command(
+    invocation: &CommandInvocation,
+    provider: ApiProvider,
+    active_model: &str,
+) -> Result<FastCommandOutcome> {
+    let settings = load_command_settings();
+    let provider_supports_fast_mode = matches!(
+        provider,
+        ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible
+    );
+    let Some(arg) = invocation.args.first().map(|value| value.trim().to_ascii_lowercase()) else {
+        let status = if settings.fast_mode && !provider_supports_fast_mode {
+            "ON (inactive for current provider)"
+        } else if settings.fast_mode {
+            "ON"
+        } else {
+            "OFF"
+        };
+        let provider_note = if provider_supports_fast_mode {
+            String::new()
+        } else {
+            format!(
+                "\nSaved fast-mode preferences only affect chatgpt-codex and openai-compatible sessions."
+            )
+        };
+        return Ok(FastCommandOutcome {
+            message: format!(
+                "Fast mode: {status}\nCurrent model: {active_model}{provider_note}\n{}",
+                usage_line("fast", "[on|off]")
+            ),
+            next_model: None,
+        });
+    };
+
+    let enable = match arg.as_str() {
+        "on" | "enable" => true,
+        "off" | "disable" => false,
+        _ => {
+            return Ok(FastCommandOutcome {
+                message: usage_line("fast", "[on|off]"),
+                next_model: None,
+            });
+        }
+    };
+
+    let settings = update_command_settings(|settings| settings.fast_mode = enable)?;
+    let next_model = preferred_model_for_provider(provider, &settings)
+        .filter(|model| enable && model != active_model);
+    let message = if let Some(model) = next_model.as_deref() {
+        format!("Fast mode enabled. Switched to {model} for this session.")
+    } else if enable {
+        if provider_supports_fast_mode {
+            "Fast mode enabled.".to_owned()
+        } else {
+            "Fast mode enabled for supported OpenAI-family sessions. The current provider does not change models for fast mode.".to_owned()
+        }
+    } else {
+        "Fast mode disabled.".to_owned()
+    };
+
+    Ok(FastCommandOutcome { message, next_model })
+}
+
+pub(crate) fn render_effort_command(cwd: &Path, invocation: &CommandInvocation) -> Result<String> {
+    let Some(arg) = invocation.args.first().map(|value| value.trim().to_ascii_lowercase()) else {
+        return Ok([
+            current_effort_summary(),
+            usage_line("effort", "[low|medium|high|max|auto]"),
+        ]
+        .join("\n"));
+    };
+
+    let updates = match arg.as_str() {
+        "auto" | "unset" => BTreeMap::from([
+            ("REASONING_MODEL_THINK".to_owned(), None),
+            ("COMPLETION_MODEL_THINK".to_owned(), None),
+        ]),
+        "low" | "medium" | "high" => BTreeMap::from([
+            ("REASONING_MODEL_THINK".to_owned(), Some(arg.clone())),
+            ("COMPLETION_MODEL_THINK".to_owned(), Some(arg.clone())),
+        ]),
+        "max" | "xhigh" => BTreeMap::from([
+            ("REASONING_MODEL_THINK".to_owned(), Some("xhigh".to_owned())),
+            ("COMPLETION_MODEL_THINK".to_owned(), Some("xhigh".to_owned())),
+        ]),
+        _ => {
+            return Ok([
+                format!("Invalid effort level: {arg}"),
+                usage_line("effort", "[low|medium|high|max|auto]"),
+            ]
+            .join("\n"));
+        }
+    };
+
+    persist_managed_env_updates(cwd, None, &updates)?;
+    apply_managed_env_updates(&updates);
+
+    Ok(match arg.as_str() {
+        "auto" | "unset" => "Effort level set to auto.".to_owned(),
+        "xhigh" => "Effort level set to max.".to_owned(),
+        other => format!("Effort level set to {other}."),
+    })
+}
+
+pub(crate) async fn render_tag_command(
+    store: &ActiveSessionStore,
+    session_id: SessionId,
+    invocation: &CommandInvocation,
+) -> Result<String> {
+    let Some(arg) = invocation_argument_string(invocation) else {
+        return Ok([
+            usage_line("tag", "<tag-name>"),
+            "Run the same tag again to remove it from the current session.".to_owned(),
+        ]
+        .join("\n"));
+    };
+
+    let normalized = normalize_session_tag(&arg);
+    if normalized.is_empty() {
+        return Ok("Tag name cannot be empty.".to_owned());
+    }
+
+    let transcript_path = store.transcript_path(session_id).await?;
+    let current = load_session_metadata_for_path(&transcript_path);
+    if current.tag.as_deref() == Some(normalized.as_str()) {
+        update_session_metadata_for_path(&transcript_path, |metadata| metadata.tag = None)?;
+        return Ok(format!("Removed tag #{normalized}."));
+    }
+
+    let previous = current.tag;
+    update_session_metadata_for_path(&transcript_path, |metadata| {
+        metadata.tag = Some(normalized.clone());
+    })?;
+    Ok(match previous {
+        Some(previous) if !previous.trim().is_empty() => {
+            format!("Updated session tag from #{previous} to #{normalized}.")
+        }
+        _ => format!("Tagged session with #{normalized}."),
+    })
+}
+
+pub(crate) async fn render_rename_command(
+    store: &ActiveSessionStore,
+    session_id: SessionId,
+    invocation: &CommandInvocation,
+    raw_messages: &[Message],
+) -> Result<String> {
+    let transcript_path = store.transcript_path(session_id).await?;
+    let new_name = if let Some(arg) = invocation_argument_string(invocation) {
+        collapse_whitespace(&arg)
+    } else {
+        suggested_session_title(raw_messages).ok_or_else(|| {
+            anyhow!("Could not generate a name yet. Usage: /rename <name>")
+        })?
+    };
+
+    if new_name.trim().is_empty() {
+        return Ok("Session name cannot be empty.".to_owned());
+    }
+
+    update_session_metadata_for_path(&transcript_path, |metadata| {
+        metadata.custom_title = Some(new_name.clone());
+        metadata.agent_name = Some(new_name.clone());
+    })?;
+    Ok(format!("Session renamed to: {new_name}"))
+}
+
+pub(crate) async fn render_rewind_command(
+    store: &ActiveSessionStore,
+    session_id: SessionId,
+    invocation: &CommandInvocation,
+    raw_messages: &mut Vec<Message>,
+) -> Result<String> {
+    let candidates = rewind_candidates(raw_messages);
+    if candidates.is_empty() {
+        return Ok("No conversation turns are available to rewind.".to_owned());
+    }
+
+    let Some(arg) = invocation.args.first() else {
+        return Ok([
+            "Use the /rewind picker to choose a turn, or run /rewind <message-index>."
+                .to_owned(),
+            format!(
+                "Latest turn: {} ({})",
+                candidates[0].turn_number, candidates[0].preview
+            ),
+        ]
+        .join("\n"));
+    };
+
+    let Ok(raw_index) = arg.parse::<usize>() else {
+        return Ok("/rewind expects a numeric message index from the picker.".to_owned());
+    };
+    let Some(candidate) = candidates.iter().find(|candidate| candidate.raw_index == raw_index) else {
+        return Ok(format!("No rewind target found for message index {raw_index}."));
+    };
+
+    raw_messages.truncate(candidate.raw_index.saturating_sub(1));
+    let transcript_path = persist_rewound_session(store, session_id, raw_messages).await?;
+    Ok(format!(
+        "Rewound to before turn {}: {}\nTranscript: {}",
+        candidate.turn_number,
+        candidate.preview,
+        transcript_path.display()
+    ))
+}
+
+pub(crate) async fn render_mobile_command(
+    store: &ActiveSessionStore,
+    session_id: SessionId,
+) -> Result<String> {
+    let (_, _, mut lines) = handoff_lines(store, session_id).await?;
+    lines.insert(0, "Mobile handoff".to_owned());
+    lines.push(String::new());
+    lines.push(format!("iOS: {IOS_APP_URL}"));
+    lines.push(format!("Android: {ANDROID_APP_URL}"));
+    Ok(lines.join("\n"))
+}
+
+pub(crate) async fn render_desktop_command(
+    store: &ActiveSessionStore,
+    session_id: SessionId,
+) -> Result<String> {
+    let (_, _, mut lines) = handoff_lines(store, session_id).await?;
+    lines.insert(0, "Desktop handoff".to_owned());
+    lines.insert(1, format!("Resume: {}", resume_command_for_session(session_id)));
+    Ok(lines.join("\n"))
+}
+
+pub(crate) fn render_chrome_command(invocation: &CommandInvocation) -> Result<String> {
+    let current_settings = load_command_settings();
+    let Some(arg) = invocation.args.first().map(|value| value.trim().to_ascii_lowercase()) else {
+        return Ok([
+            format!(
+                "Claude in Chrome default: {}",
+                if current_settings.chrome_default_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
+            format!("Install: {CHROME_EXTENSION_URL}"),
+            format!("Permissions: {CHROME_PERMISSIONS_URL}"),
+            format!("Reconnect: {CHROME_RECONNECT_URL}"),
+            usage_line("chrome", "[on|off|install|permissions|reconnect]"),
+        ]
+        .join("\n"));
+    };
+
+    match arg.as_str() {
+        "on" | "enable" => {
+            update_command_settings(|settings| settings.chrome_default_enabled = true)?;
+            Ok("Claude in Chrome is enabled by default.".to_owned())
+        }
+        "off" | "disable" => {
+            update_command_settings(|settings| settings.chrome_default_enabled = false)?;
+            Ok("Claude in Chrome is disabled by default.".to_owned())
+        }
+        "install" => Ok(format!("Open the extension page:\n{CHROME_EXTENSION_URL}")),
+        "permissions" => Ok(format!(
+            "Open the permissions page:\n{CHROME_PERMISSIONS_URL}"
+        )),
+        "reconnect" => Ok(format!("Open the reconnect page:\n{CHROME_RECONNECT_URL}")),
+        _ => Ok(usage_line("chrome", "[on|off|install|permissions|reconnect]")),
+    }
+}
+
+pub(crate) fn render_advisor_command(invocation: &CommandInvocation) -> Result<String> {
+    let current_settings = load_command_settings();
+    let Some(arg) = invocation_argument_string(invocation) else {
+        return Ok(match current_settings.advisor_model {
+            Some(model) => format!(
+                "Advisor: {model}\nUse /advisor unset to disable or /advisor <model> to change it."
+            ),
+            None => "Advisor: not set\nUse /advisor <model> to enable it.".to_owned(),
+        });
+    };
+
+    let normalized = collapse_whitespace(&arg).to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok("Advisor model cannot be empty.".to_owned());
+    }
+
+    if matches!(normalized.as_str(), "unset" | "off") {
+        let previous = current_settings.advisor_model;
+        update_command_settings(|settings| settings.advisor_model = None)?;
+        return Ok(match previous {
+            Some(model) => format!("Advisor disabled (was {model})."),
+            None => "Advisor already unset.".to_owned(),
+        });
+    }
+
+    update_command_settings(|settings| settings.advisor_model = Some(normalized.clone()))?;
+    Ok(format!("Advisor set to {normalized}."))
 }
 
 pub(crate) fn render_vim_command(enabled: bool) -> Result<String> {

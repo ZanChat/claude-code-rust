@@ -316,3 +316,55 @@ fn compaction_reduces_runtime_size() {
         outcome.summary_message.id
     );
 }
+
+#[tokio::test]
+async fn read_messages_skips_non_message_json_entries() {
+    let dir = make_temp_dir("transcript-sidecars");
+    let path = dir.join("session.jsonl");
+
+    let first = Message::new(
+        MessageRole::User,
+        vec![ContentBlock::Text {
+            text: "first prompt".to_owned(),
+        }],
+    );
+    let second = Message::new(
+        MessageRole::Assistant,
+        vec![ContentBlock::Text {
+            text: "second reply".to_owned(),
+        }],
+    );
+
+    fs::write(
+        &path,
+        format!(
+            "{}\n{{\"type\":\"session-config\",\"version\":1}}\n{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let messages = JsonlTranscriptCodec.read_messages(&path).await.unwrap();
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, MessageRole::User);
+    assert_eq!(messages[1].role, MessageRole::Assistant);
+}
+
+#[tokio::test]
+async fn read_messages_still_errors_on_invalid_json() {
+    let dir = make_temp_dir("transcript-invalid-json");
+    let path = dir.join("session.jsonl");
+
+    fs::write(&path, "{\"role\":\"user\",\"content\":[]}\n{invalid-json\n").unwrap();
+
+    let error = JsonlTranscriptCodec.read_messages(&path).await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to decode transcript line in"),
+        "unexpected error: {error}"
+    );
+}

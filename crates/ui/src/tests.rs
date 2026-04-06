@@ -7,6 +7,7 @@ use super::{
     PermissionPromptState, PromptHistorySearchState, PromptSelectionState, RatatuiApp, StatusLevel,
     TaskUiEntry, TranscriptGroup, TranscriptItem, TranscriptLine, TranscriptMessageActionsState,
     TranscriptSearchState, TranscriptSelectionPoint, TranscriptSelectionState, UiMouseAction,
+    UiTheme,
 };
 use ccrust_core::{
     compatibility_command_registry, ContentBlock, Message, MessageRole, TaskStatus, TokenUsage,
@@ -969,6 +970,37 @@ fn prompt_history_search_highlights_current_match() {
 
     assert!(line.spans.iter().any(|span| {
         span.content.as_ref() == "beta" && span.style.bg == Some(super::Color::Cyan)
+    }));
+}
+
+#[test]
+fn light_theme_changes_role_and_prompt_selection_colors() {
+    let mut state = RatatuiApp::new_with_theme("light-theme", UiTheme::Light).initial_state();
+    state.transcript_lines = vec![TranscriptLine {
+        role: "user".to_owned(),
+        text: "selected row".to_owned(),
+        author_label: None,
+        token_label: None,
+    }];
+
+    let transcript_lines = transcript_visual_lines(&state, 80);
+    assert_eq!(
+        transcript_lines[0].line.spans[0].style.fg,
+        Some(Color::Blue)
+    );
+
+    state.show_input = true;
+    state.input_buffer.replace("abcdef");
+    state.prompt_selection = Some(PromptSelectionState {
+        anchor: 1,
+        focus: 4,
+    });
+
+    let prompt_line = input_prompt_line(&state);
+    assert!(prompt_line.spans.iter().any(|span| {
+        span.content.as_ref() == "bcd"
+            && span.style.bg == Some(Color::Rgb(180, 213, 255))
+            && span.style.fg == Some(Color::Black)
     }));
 }
 

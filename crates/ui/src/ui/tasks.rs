@@ -8,62 +8,61 @@ fn task_kind_label(kind: &str) -> Option<&str> {
 }
 
 fn task_status_visual(task: &TaskUiEntry) -> (&'static str, Style, Style) {
+    let theme = UiTheme::current();
     match task.status {
-        TaskStatus::Pending => ("○", Style::default().fg(Color::DarkGray), Style::default()),
+        TaskStatus::Pending => ("○", theme.muted_style(), Style::default()),
         TaskStatus::Running => (
             "●",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.info_color())
                 .add_modifier(Modifier::BOLD),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         TaskStatus::WaitingForInput => (
             "◆",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.warning_color())
                 .add_modifier(Modifier::BOLD),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.warning_color())
                 .add_modifier(Modifier::BOLD),
         ),
         TaskStatus::Completed if task.is_recent_completion => (
             "✓",
             Style::default()
-                .fg(Color::Green)
+                .fg(theme.success_color())
                 .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Green),
+            Style::default().fg(theme.success_color()),
         ),
         TaskStatus::Completed => (
             "✓",
-            Style::default().fg(Color::Green),
+            Style::default().fg(theme.success_color()),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(theme.muted_color())
                 .add_modifier(Modifier::DIM),
         ),
         TaskStatus::Failed => (
             "✕",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error_color()).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.error_color()),
         ),
         TaskStatus::Cancelled => (
             "◌",
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(theme.task_color()),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(theme.muted_color())
                 .add_modifier(Modifier::DIM),
         ),
     }
 }
 
 fn task_header_line(task: &TaskUiEntry, render_as_root: bool) -> Line<'static> {
+    let theme = UiTheme::current();
     let (icon, icon_style, title_style) = task_status_visual(task);
     let mut spans = Vec::new();
 
     if !render_as_root && !task.tree_prefix.is_empty() {
-        spans.push(Span::styled(
-            task.tree_prefix.clone(),
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled(task.tree_prefix.clone(), theme.muted_style()));
     }
 
     spans.push(Span::styled(format!("{icon} "), icon_style));
@@ -76,7 +75,7 @@ fn task_header_line(task: &TaskUiEntry, render_as_root: bool) -> Line<'static> {
     {
         spans.push(Span::styled(
             format!(" (@{owner})"),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.info_color()),
         ));
     }
 
@@ -89,15 +88,12 @@ fn task_header_line(task: &TaskUiEntry, render_as_root: bool) -> Line<'static> {
             .join(", ");
         spans.push(Span::styled(
             format!("  ➤ blocked by {blockers}"),
-            Style::default().fg(Color::DarkGray),
+            theme.muted_style(),
         ));
     }
 
     if let Some(kind) = task_kind_label(&task.kind) {
-        spans.push(Span::styled(
-            format!("  [{kind}]"),
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled(format!("  [{kind}]"), theme.muted_style()));
     }
 
     Line::from(spans)
@@ -186,7 +182,7 @@ fn hidden_task_summary(tasks: &[TaskUiEntry]) -> Option<Line<'static>> {
 
     Some(Line::from(Span::styled(
         format!("… +{}", parts.join(", ")),
-        Style::default().fg(Color::DarkGray),
+        UiTheme::current().muted_style(),
     )))
 }
 
@@ -217,7 +213,7 @@ fn task_lines(state: &UiState, max_items: usize, detailed: bool) -> Vec<Line<'st
                 lines.extend(indented_detail_lines(
                     detail,
                     &task.detail_prefix,
-                    Style::default().fg(Color::DarkGray),
+                    UiTheme::current().muted_style(),
                 ));
             }
         }
@@ -232,16 +228,14 @@ fn task_lines(state: &UiState, max_items: usize, detailed: bool) -> Vec<Line<'st
             lines.push(Line::from(vec![
                 Span::styled(
                     "ASK  ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                    UiTheme::current().warning_bold_style(),
                 ),
                 Span::raw(question.prompt.clone()),
             ]));
             if !question.choices.is_empty() {
                 lines.push(Line::from(Span::styled(
                     format!("  choices: {}", question.choices.join(", ")),
-                    Style::default().fg(Color::DarkGray),
+                    UiTheme::current().muted_style(),
                 )));
             }
         }
@@ -300,23 +294,20 @@ fn progress_line(state: &UiState) -> Option<Line<'static>> {
         Span::styled(
             format!("{} ", progress_spinner_frame(state.status_marquee_tick)),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(UiTheme::current().info_color())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             spinner_headline(verb),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(UiTheme::current().info_color())
                 .add_modifier(Modifier::BOLD),
         ),
     ];
 
     if let Some(detail) = detail {
-        spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(
-            detail.to_owned(),
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled(" · ", UiTheme::current().muted_style()));
+        spans.push(Span::styled(detail.to_owned(), UiTheme::current().muted_style()));
     }
 
     Some(Line::from(spans))
@@ -328,16 +319,14 @@ fn permission_lines(state: &UiState) -> Vec<Line<'static>> {
             Line::from(vec![
                 Span::styled(
                     "ASK  ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                    UiTheme::current().warning_bold_style(),
                 ),
                 Span::raw(prompt.tool_name.clone()),
             ]),
             Line::from(prompt.summary.clone()),
             Line::from(Span::styled(
                 format!("{} / {}", prompt.allow_once_label, prompt.deny_label),
-                Style::default().fg(Color::DarkGray),
+                UiTheme::current().muted_style(),
             )),
         ]
     } else {
@@ -352,9 +341,7 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::styled(
                 "compact  ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                UiTheme::current().warning_bold_style(),
             ),
             Span::raw(text.clone()),
         ]));
@@ -402,7 +389,7 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
                 } else {
                     &task.detail_prefix
                 },
-                Style::default().fg(Color::DarkGray),
+                UiTheme::current().muted_style(),
             ));
         }
     }
@@ -411,11 +398,9 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::styled(
                 "queue  ",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
+                UiTheme::current().muted_style().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(queued_input.clone(), Style::default().fg(Color::DarkGray)),
+            Span::styled(queued_input.clone(), UiTheme::current().muted_style()),
         ]));
     }
     if state.queued_inputs.len() > 3 {
@@ -424,7 +409,7 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
                 "queue  +{} more follow-up messages",
                 state.queued_inputs.len() - 3
             ),
-            Style::default().fg(Color::DarkGray),
+            UiTheme::current().muted_style(),
         )));
     }
 
@@ -432,9 +417,7 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::styled(
                 "ASK  ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                UiTheme::current().warning_bold_style(),
             ),
             Span::raw(question.prompt.clone()),
         ]));
@@ -445,9 +428,7 @@ fn activity_lines(state: &UiState) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::styled(
                     "wait  ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                    UiTheme::current().warning_bold_style(),
                 ),
                 Span::raw(prompt.summary.clone()),
             ]));

@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 
 pub mod vim;
 
+include!("ui/theme.rs");
 include!("ui/types.rs");
 include!("ui/transcript.rs");
 include!("ui/tasks.rs");

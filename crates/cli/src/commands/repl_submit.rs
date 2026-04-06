@@ -108,6 +108,7 @@ pub(crate) async fn handle_repl_slash_command(
             if transcript_path.exists() {
                 fs::remove_file(&transcript_path)?;
             }
+            let _ = delete_session_metadata_for_path(&transcript_path)?;
             raw_messages.clear();
             Ok(format!("cleared session {}", repl_session.session_id))
         }
@@ -161,7 +162,7 @@ pub(crate) async fn handle_repl_slash_command(
             cwd,
         ),
         "statusline" => render_statusline_command(provider, active_model, repl_session.session_id),
-        "theme" => render_theme_command(),
+        "theme" => render_theme_command(&invocation),
         "vim" => {
             vim_state.enabled = !vim_state.enabled;
             if vim_state.enabled {
@@ -172,23 +173,33 @@ pub(crate) async fn handle_repl_slash_command(
             render_vim_command(vim_state.enabled)
         }
         "plan" => render_plan_command(cwd, &invocation),
-        "fast" => render_simple_compat_command(
-            "fast",
-            "Fast mode uses the same model family with lower latency-focused behavior.",
-        ),
+        "fast" => {
+            let outcome = render_fast_command(&invocation, provider, active_model)?;
+            if let Some(model) = outcome.next_model {
+                *active_model = model;
+            }
+            Ok(outcome.message)
+        }
         "passes" => render_simple_compat_command(
             "passes",
             "Pass-count tuning is not yet modeled separately in the Rust runtime.",
         ),
-        "effort" => render_simple_compat_command(
-            "effort",
-            "Reasoning effort tuning remains compatibility-surface only in the current build.",
-        ),
+        "effort" => render_effort_command(cwd, &invocation),
+        "tag" => render_tag_command(store, repl_session.session_id, &invocation).await,
+        "rename" => {
+            render_rename_command(store, repl_session.session_id, &invocation, raw_messages).await
+        }
+        "rewind" => {
+            render_rewind_command(store, repl_session.session_id, &invocation, raw_messages).await
+        }
         "remote-env" => render_simple_compat_command(
             "remote-env",
             "Remote environment reporting currently flows through bridge and session status surfaces.",
         ),
         "export" => render_export_command(store, repl_session.session_id),
+        "mobile" => render_mobile_command(store, repl_session.session_id).await,
+        "desktop" => render_desktop_command(store, repl_session.session_id).await,
+        "chrome" => render_chrome_command(&invocation),
         "tasks" => render_tasks_command(&invocation, cwd),
         "agents" => {
             render_agents_command(
@@ -217,6 +228,7 @@ pub(crate) async fn handle_repl_slash_command(
             )
             .await
         }
+        "advisor" => render_advisor_command(&invocation),
         "voice" => Ok("voice features are intentionally deferred in this build".to_owned()),
         "exit" | "quit" => Ok("exit".to_owned()),
         other => Err(anyhow!("unknown registered REPL command: {other}")),
@@ -317,6 +329,9 @@ async fn process_repl_submission(
                 "agents" => Some(repl_agents_picker_state(cwd)?),
                 "skills" | "reload-plugins" => Some(repl_skills_picker_state(cwd, plugin_root).await?),
                 "theme" => Some(repl_theme_picker_state()),
+                "fast" => Some(repl_fast_picker_state(active_model)),
+                "effort" => Some(repl_effort_picker_state()),
+                "rewind" => Some(repl_rewind_picker_state(raw_messages)),
                 "hooks" => Some(repl_hooks_picker_state(cwd, plugin_root)),
                 _ => None,
             };
