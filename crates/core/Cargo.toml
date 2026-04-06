@@ -1,5 +1,5 @@
 [package]
-name = "code-agent-core"
+name = "ccrust-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

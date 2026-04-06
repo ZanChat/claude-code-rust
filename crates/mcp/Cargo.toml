@@ -1,12 +1,12 @@
 [package]
-name = "code-agent-mcp"
+name = "ccrust-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-code-agent-core = { path = "../core" }
+code_agent_core = { package = "ccrust-core", path = "../core" }
 futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true

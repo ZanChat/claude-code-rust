@@ -1,5 +1,5 @@
 [package]
-name = "code-agent-rust"
+name = "ccrust"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,14 +11,14 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-code-agent-bridge = { path = "../bridge" }
-code-agent-core = { path = "../core" }
-code-agent-mcp = { path = "../mcp" }
-code-agent-plugins = { path = "../plugins" }
-code-agent-providers = { path = "../providers" }
-code-agent-session = { path = "../session" }
-code-agent-tools = { path = "../tools" }
-code-agent-ui = { path = "../ui" }
+code_agent_bridge = { package = "ccrust-bridge", path = "../bridge" }
+code_agent_core = { package = "ccrust-core", path = "../core" }
+code_agent_mcp = { package = "ccrust-mcp", path = "../mcp" }
+code_agent_plugins = { package = "ccrust-plugins", path = "../plugins" }
+code_agent_providers = { package = "ccrust-providers", path = "../providers" }
+code_agent_session = { package = "ccrust-session", path = "../session" }
+code_agent_tools = { package = "ccrust-tools", path = "../tools" }
+code_agent_ui = { package = "ccrust-ui", path = "../ui" }
 crossterm.workspace = true
 ratatui.workspace = true
 serde.workspace = true

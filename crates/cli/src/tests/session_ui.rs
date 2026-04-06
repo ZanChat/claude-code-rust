@@ -839,7 +839,7 @@ fn message_action_copy_prefers_tool_primary_input() {
                 id: "tool-call-1".to_owned(),
                 name: "run_in_terminal".to_owned(),
                 input_json: json!({
-                    "command": "cargo test -p code-agent-ui"
+                    "command": "cargo test -p ccrust-ui"
                 })
                 .to_string(),
                 thought_signature: None,
@@ -855,7 +855,7 @@ fn message_action_copy_prefers_tool_primary_input() {
     );
     assert_eq!(
         message_action_copy_text(&assistant_tool_call).as_deref(),
-        Some("cargo test -p code-agent-ui")
+        Some("cargo test -p ccrust-ui")
     );
 }
 

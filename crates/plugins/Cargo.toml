@@ -1,5 +1,5 @@
 [package]
-name = "code-agent-plugins"
+name = "ccrust-plugins"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-code-agent-core = { path = "../core" }
+code_agent_core = { package = "ccrust-core", path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

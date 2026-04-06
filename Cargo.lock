@@ -90,24 +90,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "cfg-if"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
-name = "cfg_aliases"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
-
-[[package]]
-name = "code-agent-bridge"
+name = "ccrust"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "code-agent-core",
+ "ccrust-bridge",
+ "ccrust-core",
+ "ccrust-mcp",
+ "ccrust-plugins",
+ "ccrust-providers",
+ "ccrust-session",
+ "ccrust-tools",
+ "ccrust-ui",
+ "crossterm",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "ccrust-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ccrust-core",
  "futures-util",
  "serde",
  "serde_json",
@@ -116,7 +126,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-agent-core"
+name = "ccrust-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -126,11 +136,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-agent-mcp"
+name = "ccrust-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "code-agent-core",
+ "ccrust-core",
  "futures-util",
  "reqwest",
  "serde",
@@ -140,24 +150,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-agent-plugins"
+name = "ccrust-plugins"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "code-agent-core",
+ "ccrust-core",
  "serde",
  "serde_json",
  "tokio",
 ]
 
 [[package]]
-name = "code-agent-providers"
+name = "ccrust-providers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "code-agent-core",
+ "ccrust-core",
  "hex",
  "hmac",
  "percent-encoding",
@@ -170,21 +180,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-agent-rust"
+name = "ccrust-session"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "code-agent-bridge",
- "code-agent-core",
- "code-agent-mcp",
- "code-agent-plugins",
- "code-agent-providers",
- "code-agent-session",
- "code-agent-tools",
- "code-agent-ui",
- "crossterm",
- "ratatui",
+ "ccrust-core",
  "serde",
  "serde_json",
  "tokio",
@@ -192,27 +193,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-agent-session"
+name = "ccrust-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "code-agent-core",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "code-agent-tools"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "code-agent-core",
- "code-agent-mcp",
- "code-agent-plugins",
+ "ccrust-core",
+ "ccrust-mcp",
+ "ccrust-plugins",
  "reqwest",
  "schemars",
  "serde",
@@ -222,15 +210,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "code-agent-ui"
+name = "ccrust-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "code-agent-core",
+ "ccrust-core",
  "crossterm",
  "ratatui",
  "serde",
 ]
+
+[[package]]
+name = "cfg-if"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cfg_aliases"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "compact_str"
