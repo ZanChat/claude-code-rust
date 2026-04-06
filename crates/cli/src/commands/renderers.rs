@@ -281,17 +281,113 @@ pub(crate) fn render_diff_command(raw_messages: &[Message]) -> Result<String> {
 
 pub(crate) fn render_usage_command(raw_messages: &[Message]) -> Result<String> {
     let runtime_messages = materialize_runtime_messages(raw_messages);
-    let total = runtime_messages
-        .iter()
-        .filter_map(|message| message.metadata.usage.as_ref())
-        .fold((0u64, 0u64), |(input, output), usage| {
-            (input + usage.input_tokens, output + usage.output_tokens)
-        });
-    Ok(serde_json::to_string_pretty(&json!({
-        "input_tokens": total.0,
-        "output_tokens": total.1,
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut cache_creation_input_tokens = 0u64;
+    let mut cache_read_input_tokens = 0u64;
+    let mut latest_prompt_metrics = None;
+    let mut per_provider = BTreeMap::new();
+
+    for message in &runtime_messages {
+        if let Some(metrics) = parse_runtime_prompt_metrics(message) {
+            latest_prompt_metrics = Some(metrics);
+        }
+
+        let Some(usage) = message.metadata.usage.as_ref() else {
+            continue;
+        };
+        input_tokens += usage.input_tokens;
+        output_tokens += usage.output_tokens;
+        cache_creation_input_tokens += usage.cache_creation_input_tokens;
+        cache_read_input_tokens += usage.cache_read_input_tokens;
+
+        let provider_name = message
+            .metadata
+            .provider
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        let provider_totals = per_provider
+            .entry(provider_name)
+            .or_insert((0u64, 0u64, 0u64, 0u64, 0u64));
+        provider_totals.0 += usage.input_tokens;
+        provider_totals.1 += usage.output_tokens;
+        provider_totals.2 += usage.cache_creation_input_tokens;
+        provider_totals.3 += usage.cache_read_input_tokens;
+        provider_totals.4 += 1;
+    }
+
+    let total_input_related_tokens =
+        input_tokens + cache_creation_input_tokens + cache_read_input_tokens;
+    let cache_hit_rate = if total_input_related_tokens == 0 {
+        0.0
+    } else {
+        ((cache_read_input_tokens as f64 / total_input_related_tokens as f64) * 1000.0).round()
+            / 1000.0
+    };
+
+    let per_provider = per_provider
+        .into_iter()
+        .map(
+            |(
+                provider,
+                (
+                    provider_input,
+                    provider_output,
+                    provider_cache_creation,
+                    provider_cache_read,
+                    response_count,
+                ),
+            )| {
+                let provider_total_input =
+                    provider_input + provider_cache_creation + provider_cache_read;
+                let provider_cache_hit_rate = if provider_total_input == 0 {
+                    0.0
+                } else {
+                    ((provider_cache_read as f64 / provider_total_input as f64) * 1000.0).round()
+                        / 1000.0
+                };
+                (
+                    provider,
+                    json!({
+                        "input_tokens": provider_input,
+                        "output_tokens": provider_output,
+                        "cache_creation_input_tokens": provider_cache_creation,
+                        "cache_read_input_tokens": provider_cache_read,
+                        "cache_hit_rate": provider_cache_hit_rate,
+                        "response_count": response_count,
+                    }),
+                )
+            },
+        )
+        .collect::<BTreeMap<_, _>>();
+
+    let mut report = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "cache_hit_rate": cache_hit_rate,
         "message_count": runtime_messages.len(),
-    }))?)
+        "providers": per_provider,
+    });
+
+    if let Some(metrics) = latest_prompt_metrics {
+        report["latest_prompt"] = json!({
+            "static_chars": metrics.static_chars,
+            "semi_static_chars": metrics.semi_static_chars,
+            "dynamic_chars": metrics.dynamic_chars,
+        });
+        if prompt_cache_debug_enabled() {
+            report["latest_prompt"]["hashes"] = json!({
+                "static": metrics.static_hash,
+                "semi_static": metrics.semi_static_hash,
+                "dynamic": metrics.dynamic_hash,
+                "semi_static_fingerprint": metrics.semi_static_fingerprint,
+            });
+        }
+    }
+
+    Ok(serde_json::to_string_pretty(&report)?)
 }
 
 pub(crate) fn render_export_command(
@@ -999,4 +1095,3 @@ pub(crate) async fn render_remote_control_command(
         }))?),
     }
 }
-

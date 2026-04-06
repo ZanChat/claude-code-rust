@@ -6,8 +6,9 @@ use super::{
     provider_base_url, provider_descriptor, refresh_codex_access_token, resolve_api_provider,
     resolve_provider_model, sign_bedrock_request, ApiProvider, AuthMaterial, AuthRequest,
     AuthResolver, EchoProvider, EnvironmentAuthResolver, HttpProvider, ModelCatalog,
-    OpenAIAuthSource, OpenAITokenFreshness, ProviderRequest, ProviderToolDefinition,
-    DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
+    OpenAIAuthSource, OpenAITokenFreshness, PromptBlockStability, PromptCacheScope,
+    ProviderRequest, ProviderToolDefinition, SystemPromptBlock, DEFAULT_OPENAI_COMPLETION_MODEL,
+    DEFAULT_OPENAI_REASONING_MODEL,
 };
 use ccrust_core::{ContentBlock, Message, MessageRole, ToolCall};
 use serde_json::json;
@@ -560,13 +561,82 @@ fn serializes_openai_chat_tool_call_thought_signature() {
             },
         }],
     );
+    let request = ProviderRequest {
+        model: DEFAULT_OPENAI_REASONING_MODEL.to_owned(),
+        system_prompt: vec![SystemPromptBlock::new(
+            "System rules",
+            PromptBlockStability::Static,
+            Some(PromptCacheScope::Global),
+        )],
+        messages: vec![assistant],
+        ..ProviderRequest::default()
+    };
 
-    let encoded = super::openai_chat_messages(&[assistant]);
+    let encoded = super::openai_chat_messages(&request);
 
     assert_eq!(
-        encoded[0]["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
+        encoded[1]["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
         "signature-a"
     );
+}
+
+#[test]
+fn serializes_anthropic_system_blocks_with_cache_metadata() {
+    let request = ProviderRequest {
+        model: "claude-sonnet-4-6".to_owned(),
+        system_prompt: vec![
+            SystemPromptBlock::new(
+                "Static instructions",
+                PromptBlockStability::Static,
+                Some(PromptCacheScope::Global),
+            ),
+            SystemPromptBlock::new(
+                "Repo instructions",
+                PromptBlockStability::SemiStatic,
+                Some(PromptCacheScope::Org),
+            ),
+            SystemPromptBlock::new("Dynamic environment", PromptBlockStability::Dynamic, None),
+        ],
+        messages: vec![Message::new(
+            MessageRole::User,
+            vec![ContentBlock::Text {
+                text: "hello".to_owned(),
+            }],
+        )],
+        ..ProviderRequest::default()
+    };
+
+    let payload = super::build_anthropic_payload(ApiProvider::FirstParty, &request, None);
+
+    assert!(payload["system"].is_array());
+    assert_eq!(payload["system"][0]["text"], "Static instructions");
+    assert_eq!(payload["system"][0]["cache_control"]["scope"], "global");
+    assert_eq!(payload["system"][1]["cache_control"]["scope"], "org");
+    assert!(payload["system"][2].get("cache_control").is_none());
+}
+
+#[test]
+fn serializes_bedrock_system_blocks_without_scope() {
+    let request = ProviderRequest {
+        model: "claude-sonnet-4-6".to_owned(),
+        system_prompt: vec![SystemPromptBlock::new(
+            "Static instructions",
+            PromptBlockStability::Static,
+            Some(PromptCacheScope::Global),
+        )],
+        messages: vec![Message::new(
+            MessageRole::User,
+            vec![ContentBlock::Text {
+                text: "hello".to_owned(),
+            }],
+        )],
+        ..ProviderRequest::default()
+    };
+
+    let payload = super::build_anthropic_payload(ApiProvider::Bedrock, &request, None);
+
+    assert_eq!(payload["system"][0]["cache_control"]["type"], "ephemeral");
+    assert!(payload["system"][0]["cache_control"].get("scope").is_none());
 }
 
 #[test]
@@ -790,6 +860,14 @@ async fn sends_openai_responses_requests() {
     );
     let request = ProviderRequest {
         model: "gpt-5.4".to_owned(),
+        system_prompt: vec![
+            SystemPromptBlock::new(
+                "Static instructions",
+                PromptBlockStability::Static,
+                Some(PromptCacheScope::Global),
+            ),
+            SystemPromptBlock::new("Dynamic environment", PromptBlockStability::Dynamic, None),
+        ],
         messages: vec![Message::new(
             MessageRole::User,
             vec![ContentBlock::Text {
@@ -817,6 +895,10 @@ async fn sends_openai_responses_requests() {
     );
     assert_eq!(body["model"], "gpt-5.4");
     assert_eq!(body["stream"], true);
+    assert_eq!(
+        body["instructions"],
+        "Static instructions\n\nDynamic environment"
+    );
     assert_eq!(body["input"][0]["role"], "user");
     assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
     assert_eq!(body["tools"][0]["type"], "function");
@@ -849,6 +931,11 @@ async fn retries_openai_compatible_chat_completions_send_failures() {
     );
     let request = ProviderRequest {
         model: "gemini-3.1-pro-preview".to_owned(),
+        system_prompt: vec![SystemPromptBlock::new(
+            "Gemini instructions",
+            PromptBlockStability::Static,
+            Some(PromptCacheScope::Global),
+        )],
         messages: vec![Message::new(
             MessageRole::User,
             vec![ContentBlock::Text {
@@ -873,7 +960,9 @@ async fn retries_openai_compatible_chat_completions_send_failures() {
         captured.headers.get("authorization").map(String::as_str),
         Some("Bearer compat-key")
     );
-    assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(body["messages"][0]["role"], "system");
+    assert_eq!(body["messages"][0]["content"], "Gemini instructions");
+    assert_eq!(body["messages"][1]["role"], "user");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -898,6 +987,11 @@ async fn sends_chatgpt_codex_responses_requests() {
     );
     let request = ProviderRequest {
         model: "gpt-5.3-codex".to_owned(),
+        system_prompt: vec![SystemPromptBlock::new(
+            "Codex instructions",
+            PromptBlockStability::Static,
+            Some(PromptCacheScope::Global),
+        )],
         messages: vec![Message::new(
             MessageRole::User,
             vec![ContentBlock::Text {
@@ -919,6 +1013,7 @@ async fn sends_chatgpt_codex_responses_requests() {
         Some("Bearer codex-token")
     );
     assert_eq!(body["model"], "gpt-5.3-codex");
+    assert_eq!(body["instructions"], "Codex instructions");
     assert_eq!(body["stream"], true);
     assert_eq!(body["input"][0]["role"], "user");
 }

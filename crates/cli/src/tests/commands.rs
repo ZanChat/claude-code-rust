@@ -643,13 +643,54 @@ fn runtime_system_prompt_loads_instruction_and_mcp_sections() {
         "gemini-3.1-pro-preview",
         None,
     );
+    let prompt_text = prompt.as_text();
 
-    assert!(prompt.contains("You are Claude Code"));
-    assert!(prompt.contains("Do NOT use bash when a relevant dedicated tool exists"));
-    assert!(prompt.contains("To read files use file_read"));
-    assert!(prompt.contains("Model: gemini-3.1-pro-preview"));
-    assert!(prompt.contains("Use bun."));
-    assert!(prompt.contains("Read the docs resources before falling back to shell commands."));
+    assert_eq!(prompt.blocks.len(), 3);
+    assert!(prompt_text.contains("You are Claude Code"));
+    assert!(prompt_text.contains("Do NOT use bash when a relevant dedicated tool exists"));
+    assert!(prompt_text.contains("To read files use file_read"));
+    assert!(prompt_text.contains("Model: gemini-3.1-pro-preview"));
+    assert!(prompt_text.contains("Use bun."));
+    assert!(prompt_text.contains("Read the docs resources before falling back to shell commands."));
+}
+
+#[test]
+fn usage_command_reports_cache_tokens_and_prompt_metrics() {
+    let session_id = SessionId::new_v4();
+    let mut assistant =
+        build_text_message(session_id, MessageRole::Assistant, "done".to_owned(), None);
+    assistant.metadata.provider = Some("openai-compatible".to_owned());
+    assistant.metadata.usage = Some(ccrust_core::TokenUsage {
+        input_tokens: 10,
+        output_tokens: 2,
+        cache_creation_input_tokens: 4,
+        cache_read_input_tokens: 6,
+    });
+    apply_runtime_prompt_metrics(
+        &mut assistant,
+        &RuntimeSystemPromptMetrics {
+            static_chars: 100,
+            semi_static_chars: 40,
+            dynamic_chars: 20,
+            static_hash: "static-hash".to_owned(),
+            semi_static_hash: "semi-hash".to_owned(),
+            dynamic_hash: "dynamic-hash".to_owned(),
+            semi_static_fingerprint: "semi-fingerprint".to_owned(),
+        },
+    );
+
+    let report = render_usage_command(&[assistant]).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&report).unwrap();
+
+    assert_eq!(json["input_tokens"], 10);
+    assert_eq!(json["output_tokens"], 2);
+    assert_eq!(json["cache_creation_input_tokens"], 4);
+    assert_eq!(json["cache_read_input_tokens"], 6);
+    assert_eq!(json["cache_hit_rate"], 0.3);
+    assert_eq!(json["providers"]["openai-compatible"]["response_count"], 1);
+    assert_eq!(json["latest_prompt"]["static_chars"], 100);
+    assert_eq!(json["latest_prompt"]["semi_static_chars"], 40);
+    assert_eq!(json["latest_prompt"]["dynamic_chars"], 20);
 }
 
 #[test]

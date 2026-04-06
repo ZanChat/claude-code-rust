@@ -70,8 +70,8 @@ impl HttpProvider {
             "messages": anthropic_messages(&request.messages),
         });
 
-        if let Some(system) = anthropic_system_prompt(&request.messages) {
-            payload["system"] = Value::String(system);
+        if let Some(system) = anthropic_system_prompt_value(self.provider, &request) {
+            payload["system"] = system;
         }
         // Wire Claude thinking config into the API payload.
         match &request.thinking {
@@ -304,6 +304,7 @@ impl HttpProvider {
     ) -> Result<Box<dyn ProviderStream>> {
         let model = resolve_provider_model(ApiProvider::Bedrock, &request.model);
         let mut payload = build_anthropic_payload(
+            ApiProvider::Bedrock,
             &request,
             Some((
                 "anthropic_version",
@@ -346,6 +347,7 @@ impl HttpProvider {
         let model = resolve_provider_model(ApiProvider::Vertex, &request.model);
         let url = vertex_predict_url(&self.base_url, &model)?;
         let mut payload = build_anthropic_payload(
+            ApiProvider::Vertex,
             &request,
             Some((
                 "anthropic_version",
@@ -385,6 +387,7 @@ impl HttpProvider {
         let mut request = request;
         request.model = model;
         let payload = build_anthropic_payload(
+            ApiProvider::Foundry,
             &request,
             Some(("anthropic_version", Value::String("2023-06-01".to_owned()))),
         );
@@ -670,6 +673,7 @@ pub(crate) fn openai_compatible_uses_official_base_url() -> bool {
 }
 
 pub(crate) fn build_anthropic_payload(
+    provider: ApiProvider,
     request: &ProviderRequest,
     extra_body_field: Option<(&str, Value)>,
 ) -> Value {
@@ -680,8 +684,8 @@ pub(crate) fn build_anthropic_payload(
         "messages": anthropic_messages(&request.messages),
     });
 
-    if let Some(system) = anthropic_system_prompt(&request.messages) {
-        payload["system"] = Value::String(system);
+    if let Some(system) = anthropic_system_prompt_value(provider, request) {
+        payload["system"] = system;
     }
     if !request.tools.is_empty() {
         payload["tools"] = Value::Array(
@@ -1173,6 +1177,74 @@ pub(crate) fn anthropic_system_prompt(messages: &[Message]) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
+fn structured_system_prompt_text(blocks: &[SystemPromptBlock]) -> Option<String> {
+    let parts = blocks
+        .iter()
+        .map(|block| block.text.trim())
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+fn request_system_prompt_text(request: &ProviderRequest) -> Option<String> {
+    if request.system_prompt.is_empty() {
+        anthropic_system_prompt(&request.messages)
+    } else {
+        structured_system_prompt_text(&request.system_prompt)
+    }
+}
+
+fn anthropic_prompt_cache_control(
+    provider: ApiProvider,
+    block: &SystemPromptBlock,
+) -> Option<Value> {
+    let scope = block.cache_scope?;
+    match provider {
+        ApiProvider::FirstParty => Some(json!({
+            "type": "ephemeral",
+            "scope": match scope {
+                PromptCacheScope::Global => "global",
+                PromptCacheScope::Org => "org",
+            },
+        })),
+        ApiProvider::Bedrock | ApiProvider::Vertex | ApiProvider::Foundry => {
+            Some(json!({ "type": "ephemeral" }))
+        }
+        ApiProvider::OpenAICompatible | ApiProvider::ChatGPTCodex => None,
+    }
+}
+
+fn anthropic_system_prompt_block(provider: ApiProvider, block: &SystemPromptBlock) -> Value {
+    let mut value = json!({
+        "type": "text",
+        "text": block.text,
+    });
+    if let Some(cache_control) = anthropic_prompt_cache_control(provider, block) {
+        value["cache_control"] = cache_control;
+    }
+    value
+}
+
+fn anthropic_system_prompt_value(
+    provider: ApiProvider,
+    request: &ProviderRequest,
+) -> Option<Value> {
+    if request.system_prompt.is_empty() {
+        return anthropic_system_prompt(&request.messages).map(Value::String);
+    }
+
+    let blocks = request
+        .system_prompt
+        .iter()
+        .filter(|block| !block.text.trim().is_empty())
+        .map(|block| anthropic_system_prompt_block(provider, block))
+        .collect::<Vec<_>>();
+
+    (!blocks.is_empty()).then(|| Value::Array(blocks))
+}
+
 pub(crate) fn anthropic_messages(messages: &[Message]) -> Vec<Value> {
     let mut encoded = Vec::new();
 
@@ -1241,7 +1313,7 @@ pub(crate) fn build_openai_responses_payload(
 ) -> Value {
     let mut payload = json!({
         "model": request.model,
-        "instructions": anthropic_system_prompt(&request.messages)
+        "instructions": request_system_prompt_text(request)
             .unwrap_or_else(|| "You are Codex.".to_owned()),
         "input": openai_responses_input(&request.messages),
         "stream": true,
@@ -1289,7 +1361,7 @@ pub(crate) fn build_openai_responses_payload(
 pub(crate) fn build_openai_chat_completions_payload(request: &ProviderRequest) -> Value {
     let mut payload = json!({
         "model": request.model,
-        "messages": openai_chat_messages(&request.messages),
+        "messages": openai_chat_messages(request),
         "stream": false,
     });
 
@@ -1324,12 +1396,21 @@ pub(crate) fn build_openai_chat_completions_payload(request: &ProviderRequest) -
     payload
 }
 
-pub(crate) fn openai_chat_messages(messages: &[Message]) -> Vec<Value> {
+pub(crate) fn openai_chat_messages(request: &ProviderRequest) -> Vec<Value> {
     let mut encoded = Vec::new();
+    if let Some(system_prompt) = request_system_prompt_text(request) {
+        encoded.push(json!({
+            "role": "system",
+            "content": system_prompt,
+        }));
+    }
 
-    for message in messages {
+    for message in &request.messages {
         match message.role {
             MessageRole::System => {
+                if !request.system_prompt.is_empty() {
+                    continue;
+                }
                 let text = message_text(message);
                 if !text.trim().is_empty() {
                     encoded.push(json!({

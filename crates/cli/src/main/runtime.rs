@@ -90,6 +90,7 @@ async fn run_agent_turns(
     let provider_tools = tool_definitions(tool_registry);
     let system_prompt =
         build_runtime_system_prompt(&cwd, tool_registry, provider, &model, plugin_root);
+    maybe_log_runtime_prompt_drift(messages, &system_prompt.metrics);
     let tool_context = ToolContext {
         session_id: Some(session_id),
         cwd: cwd.clone(),
@@ -114,11 +115,11 @@ async fn run_agent_turns(
         );
         let provider_client = resolve_provider_client(provider, auth_configured).await?;
         let parent_id = messages.last().map(|message| message.id);
-        let request_messages = provider_request_messages(&system_prompt, messages);
         let mut stream = provider_client
             .start_stream(ProviderRequest {
                 model: model.clone(),
-                messages: request_messages,
+                system_prompt: system_prompt.blocks.clone(),
+                messages: messages.clone(),
                 tools: provider_tools.clone(),
                 ..ProviderRequest::default()
             })
@@ -140,6 +141,7 @@ async fn run_agent_turns(
                         provider,
                         &model,
                         latest_usage.clone(),
+                        &system_prompt.metrics,
                     );
                     let mut preview_messages = messages.clone();
                     preview_messages.push(preview_message);
@@ -165,6 +167,7 @@ async fn run_agent_turns(
                         provider,
                         &model,
                         latest_usage.clone(),
+                        &system_prompt.metrics,
                     );
                     let mut preview_messages = messages.clone();
                     preview_messages.push(preview_message);
@@ -200,6 +203,7 @@ async fn run_agent_turns(
             provider,
             &model,
             latest_usage.clone(),
+            &system_prompt.metrics,
         );
         store.append_message(session_id, &assistant_message).await?;
         messages.push(assistant_message.clone());

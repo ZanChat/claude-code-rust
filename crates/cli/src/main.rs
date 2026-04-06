@@ -44,7 +44,8 @@ use ccrust_providers::{
     build_provider, clear_auth_snapshot, code_agent_auth_snapshot_path,
     compatibility_model_catalog, config_migration_report, get_anthropic_credential_hint,
     get_openai_credential_hint, ApiProvider, AuthRequest, AuthResolver, EnvironmentAuthResolver,
-    ModelCatalog, ProviderEvent, ProviderRequest, ProviderToolDefinition,
+    ModelCatalog, PromptBlockStability, PromptCacheScope, ProviderEvent, ProviderRequest,
+    ProviderToolDefinition, SystemPromptBlock,
 };
 use ccrust_session::{
     agent_transcript_path_for, claude_config_home_dir, compact_messages, estimate_message_tokens,

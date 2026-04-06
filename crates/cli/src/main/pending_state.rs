@@ -169,11 +169,13 @@ fn provider_assistant_message(
     provider: ApiProvider,
     model: &str,
     usage: Option<ccrust_core::TokenUsage>,
+    prompt_metrics: &RuntimeSystemPromptMetrics,
 ) -> Message {
     let mut assistant_message = build_assistant_message(session_id, parent_id, text, tool_calls);
     assistant_message.metadata.provider = Some(provider.to_string());
     assistant_message.metadata.model = Some(model.to_owned());
     assistant_message.metadata.usage = usage;
+    apply_runtime_prompt_metrics(&mut assistant_message, prompt_metrics);
     assistant_message
 }
 

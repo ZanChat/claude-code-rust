@@ -137,10 +137,48 @@ pub enum ThinkingConfig {
     Disabled,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptBlockStability {
+    Static,
+    SemiStatic,
+    Dynamic,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheScope {
+    Global,
+    Org,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SystemPromptBlock {
+    pub text: String,
+    pub stability: PromptBlockStability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<PromptCacheScope>,
+}
+
+impl SystemPromptBlock {
+    pub fn new(
+        text: impl Into<String>,
+        stability: PromptBlockStability,
+        cache_scope: Option<PromptCacheScope>,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            stability,
+            cache_scope,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProviderRequest {
     pub model: String,
+    #[serde(default)]
+    pub system_prompt: Vec<SystemPromptBlock>,
     pub messages: Vec<Message>,
     pub tools: Vec<ProviderToolDefinition>,
     pub extra_headers: BTreeMap<String, String>,
