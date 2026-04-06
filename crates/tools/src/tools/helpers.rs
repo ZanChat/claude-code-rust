@@ -6,6 +6,15 @@ fn input_string(input: &Value, key: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("missing string field '{key}'"))
 }
 
+fn input_string_any(input: &Value, keys: &[&str]) -> Result<String> {
+    optional_string_any(input, keys).ok_or_else(|| {
+        anyhow!(
+            "missing string field '{}'",
+            keys.first().copied().unwrap_or("value")
+        )
+    })
+}
+
 fn input_string_or(input: &Value, key: &str, default: &str) -> String {
     input
         .get(key)
@@ -24,6 +33,26 @@ fn input_u64_or(input: &Value, key: &str, default: u64) -> u64 {
 
 fn optional_string(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn optional_string_any(input: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| optional_string(input, key))
+}
+
+async fn invoke_tool_alias(
+    tool_name: &str,
+    input: Value,
+    context: &ToolContext,
+) -> Result<ToolOutput> {
+    compatibility_tool_registry()
+        .invoke(
+            ToolCallRequest {
+                tool_name: tool_name.to_owned(),
+                input,
+            },
+            context,
+        )
+        .await
 }
 
 fn shell_command_input(input: &Value) -> Result<String> {
@@ -86,6 +115,186 @@ struct TerminalCaptureToolInput {
     command: Option<String>,
     id: Option<String>,
     shell: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_task_output_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_tool_search_max_results() -> u64 {
+    5
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct EmptyToolInput {}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct GrepToolInput {
+    pattern: String,
+    path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct GlobToolInput {
+    pattern: String,
+    base: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct AgentCompatInput {
+    action: Option<String>,
+    description: Option<String>,
+    title: Option<String>,
+    prompt: Option<String>,
+    instruction: Option<String>,
+    #[serde(alias = "taskId")]
+    task_id: Option<String>,
+    #[serde(default)]
+    run_inline: bool,
+    #[serde(default, alias = "run_in_background")]
+    run_in_background: bool,
+    name: Option<String>,
+    subagent_type: Option<String>,
+    model: Option<String>,
+    team_name: Option<String>,
+    mode: Option<String>,
+    isolation: Option<String>,
+    cwd: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct TaskStopToolInput {
+    #[serde(alias = "taskId", alias = "shell_id")]
+    task_id: String,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct TaskOutputToolInput {
+    #[serde(alias = "taskId")]
+    task_id: String,
+    #[serde(default = "default_true")]
+    block: bool,
+    #[serde(default = "default_task_output_timeout_ms")]
+    timeout: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct TodoWriteCompatInput {
+    items: Option<Vec<Value>>,
+    todos: Option<Vec<Value>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct SendMessageCompatInput {
+    #[serde(alias = "target")]
+    to: String,
+    summary: Option<String>,
+    message: Value,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct AskUserQuestionOptionInput {
+    label: String,
+    description: String,
+    preview: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct AskUserQuestionItemInput {
+    question: String,
+    header: String,
+    options: Vec<AskUserQuestionOptionInput>,
+    #[serde(default, alias = "multiSelect")]
+    multi_select: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct AskUserQuestionCompatInput {
+    questions: Option<Vec<AskUserQuestionItemInput>>,
+    prompt: Option<String>,
+    #[serde(default)]
+    choices: Vec<String>,
+    #[serde(default)]
+    context: BTreeMap<String, String>,
+    #[serde(alias = "taskId")]
+    task_id: Option<String>,
+    answers: Option<BTreeMap<String, String>>,
+    annotations: Option<Value>,
+    metadata: Option<Value>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct McpResourceListToolInput {
+    server: String,
+    plugin_root: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct McpResourceReadToolInput {
+    server: String,
+    uri: String,
+    plugin_root: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct NotebookEditCompatInput {
+    #[serde(alias = "path", alias = "filePath")]
+    notebook_path: String,
+    cell_id: Option<String>,
+    new_source: Option<String>,
+    cell_type: Option<String>,
+    edit_mode: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct SkillToolInput {
+    skill: String,
+    args: Option<String>,
+    plugin_root: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct ToolSearchToolInput {
+    query: String,
+    #[serde(
+        default = "default_tool_search_max_results",
+        alias = "maxResults",
+        alias = "max_results"
+    )]
+    max_results: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct ExitPlanModeToolInput {
+    plan: Option<String>,
+    #[serde(alias = "planFilePath")]
+    plan_file_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct EnterWorktreeToolInput {
+    name: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct ExitWorktreeToolInput {
+    action: String,
+    #[serde(default, alias = "discardChanges")]
+    discard_changes: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+struct SendUserMessageToolInput {
+    message: String,
+    title: Option<String>,
+    #[serde(default)]
+    attachments: Vec<String>,
+    status: Option<String>,
 }
 
 fn string_list_field(input: &Value, key: &str) -> Result<Vec<String>> {

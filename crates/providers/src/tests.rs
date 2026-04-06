@@ -616,6 +616,35 @@ fn serializes_anthropic_system_blocks_with_cache_metadata() {
 }
 
 #[test]
+fn openai_chat_messages_do_not_duplicate_legacy_system_messages() {
+    let request = ProviderRequest {
+        model: DEFAULT_OPENAI_REASONING_MODEL.to_owned(),
+        messages: vec![
+            Message::new(
+                MessageRole::System,
+                vec![ContentBlock::Text {
+                    text: "Legacy system prompt".to_owned(),
+                }],
+            ),
+            Message::new(
+                MessageRole::User,
+                vec![ContentBlock::Text {
+                    text: "hello".to_owned(),
+                }],
+            ),
+        ],
+        ..ProviderRequest::default()
+    };
+
+    let encoded = super::openai_chat_messages(&request);
+
+    assert_eq!(encoded.len(), 2);
+    assert_eq!(encoded[0]["role"], "system");
+    assert_eq!(encoded[0]["content"], "Legacy system prompt");
+    assert_eq!(encoded[1]["role"], "user");
+}
+
+#[test]
 fn serializes_bedrock_system_blocks_without_scope() {
     let request = ProviderRequest {
         model: "claude-sonnet-4-6".to_owned(),

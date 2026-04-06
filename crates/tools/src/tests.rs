@@ -26,10 +26,37 @@ fn exposes_expected_compatibility_tools() {
         .map(|spec| spec.name.as_str())
         .collect::<Vec<_>>();
 
-    assert!(names.contains(&"file_read"));
-    assert!(names.contains(&"bash"));
-    assert!(names.contains(&"mcp"));
-    assert!(names.contains(&"agent"));
+    for expected in [
+        "file_read",
+        "bash",
+        "mcp",
+        "agent",
+        "Read",
+        "Edit",
+        "Write",
+        "NotebookEdit",
+        "Bash",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "Agent",
+        "TaskOutput",
+        "TodoWrite",
+        "TaskStop",
+        "SendMessage",
+        "SendUserMessage",
+        "AskUserQuestion",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "EnterWorktree",
+        "ExitWorktree",
+        "Skill",
+        "ToolSearch",
+        "ListMcpResourcesTool",
+        "ReadMcpResourceTool",
+    ] {
+        assert!(names.contains(&expected), "missing tool {expected}");
+    }
     assert!(specs.iter().any(|spec| spec.kind == ToolKind::Task));
 }
 
@@ -103,6 +130,58 @@ async fn reads_and_writes_files_via_registry() {
 }
 
 #[tokio::test]
+async fn ts_named_file_tools_round_trip_via_registry() {
+    let cwd = make_temp_dir("ts-file-tools");
+    let registry = compatibility_tool_registry();
+    let context = ToolContext {
+        cwd,
+        ..ToolContext::default()
+    };
+
+    registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "Write".to_owned(),
+                input: json!({
+                    "path": "notes/example.txt",
+                    "content": "alpha beta"
+                }),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+
+    registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "Edit".to_owned(),
+                input: json!({
+                    "path": "notes/example.txt",
+                    "old_string": "beta",
+                    "new_string": "gamma"
+                }),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+
+    let read = registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "Read".to_owned(),
+                input: json!({ "path": "notes/example.txt" }),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(read.content, "alpha gamma");
+}
+
+#[tokio::test]
 async fn bash_tool_accepts_string_and_alias_inputs() {
     let cwd = make_temp_dir("bash");
     let registry = compatibility_tool_registry();
@@ -136,6 +215,170 @@ async fn bash_tool_accepts_string_and_alias_inputs() {
     assert_eq!(alias.content, "alias-shell-input");
     assert!(!raw.is_error);
     assert!(!alias.is_error);
+}
+
+#[tokio::test]
+async fn task_output_reads_completed_task_output() {
+    let cwd = make_temp_dir("task-output");
+    let registry = compatibility_tool_registry();
+    let context = ToolContext {
+        cwd,
+        ..ToolContext::default()
+    };
+
+    let created = registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "task_create".to_owned(),
+                input: json!({
+                    "kind": "agent",
+                    "title": "compat task"
+                }),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+    let task_id = created.metadata["id"].as_str().unwrap().to_owned();
+
+    registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "task_update".to_owned(),
+                input: json!({
+                    "taskId": task_id,
+                    "status": "completed",
+                    "output": "task output body"
+                }),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+
+    let output = registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "TaskOutput".to_owned(),
+                input: json!({
+                    "taskId": task_id,
+                    "block": false
+                }),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.content, "task output body");
+    assert_eq!(output.metadata["retrieval_status"], "success");
+}
+
+#[tokio::test]
+async fn tool_search_supports_keyword_and_select_queries() {
+    let registry = compatibility_tool_registry();
+
+    let keyword = registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "ToolSearch".to_owned(),
+                input: json!({
+                    "query": "notebook"
+                }),
+            },
+            &ToolContext::default(),
+        )
+        .await
+        .unwrap();
+    let selected = registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "ToolSearch".to_owned(),
+                input: json!({
+                    "query": "select:Read,Write"
+                }),
+            },
+            &ToolContext::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(keyword.content.contains("NotebookEdit"));
+    assert_eq!(selected.content, "Read\nWrite");
+}
+
+#[tokio::test]
+async fn skill_tool_reads_legacy_skill_prompt() {
+    let cwd = make_temp_dir("skill");
+    let skill_dir = cwd.join(".claude").join("skills").join("demo");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "name: demo\n\nUse the demo skill.",
+    )
+    .unwrap();
+
+    let registry = compatibility_tool_registry();
+    let output = registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "Skill".to_owned(),
+                input: json!({
+                    "skill": "demo"
+                }),
+            },
+            &ToolContext {
+                cwd,
+                ..ToolContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(output.content.contains("Use the demo skill."));
+    assert_eq!(output.metadata["skill"], "demo");
+}
+
+#[tokio::test]
+async fn ask_user_question_accepts_ts_question_shape() {
+    let cwd = make_temp_dir("ask-user-question");
+    let registry = compatibility_tool_registry();
+    let context = ToolContext {
+        cwd,
+        ..ToolContext::default()
+    };
+
+    let output = registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "AskUserQuestion".to_owned(),
+                input: json!({
+                    "questions": [{
+                        "question": "Which approach should we use?",
+                        "header": "Approach",
+                        "options": [
+                            {
+                                "label": "A",
+                                "description": "Use approach A"
+                            },
+                            {
+                                "label": "B",
+                                "description": "Use approach B"
+                            }
+                        ]
+                    }]
+                }),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+
+    assert!(output.content.starts_with("question recorded "));
+    assert_eq!(
+        output.metadata["questions"][0]["question"],
+        "Which approach should we use?"
+    );
 }
 
 #[tokio::test]

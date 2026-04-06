@@ -655,6 +655,105 @@ fn runtime_system_prompt_loads_instruction_and_mcp_sections() {
 }
 
 #[test]
+fn runtime_system_prompt_prioritizes_project_instructions_and_caps_budget() {
+    let home = temp_session_root("runtime-system-prompt-home");
+    let home_path = home.display().to_string();
+
+    with_env_var("CLAUDE_CONFIG_DIR", Some(&home_path), || {
+        let root = temp_session_root("runtime-system-prompt-budget");
+        let cwd = root.join("workspace/app");
+        fs::create_dir_all(&cwd).unwrap();
+
+        write_test_file(&cwd.join("CLAUDE.md"), "# App Rules\nMOST_SPECIFIC_RULE\n");
+        write_test_file(
+            &cwd.join("CLAUDE.local.md"),
+            &format!("# App Local Rules\n{}\n", "APP_LOCAL_RULE ".repeat(400)),
+        );
+        write_test_file(
+            &root.join("workspace/CLAUDE.md"),
+            &format!("# Workspace Rules\n{}\n", "WORKSPACE_RULE ".repeat(400)),
+        );
+        write_test_file(
+            &root.join("CLAUDE.md"),
+            &format!("# Root Rules\n{}\n", "ROOT_RULE ".repeat(400)),
+        );
+        write_test_file(&home.join("CLAUDE.md"), "# Home Rules\nHOME_RULE\n");
+
+        let prompt = build_runtime_system_prompt(
+            &cwd,
+            &compatibility_tool_registry(),
+            ApiProvider::OpenAICompatible,
+            "gemini-3.1-pro-preview",
+            None,
+        );
+        let semi_static = prompt
+            .blocks
+            .iter()
+            .find(|block| block.stability == ccrust_providers::PromptBlockStability::SemiStatic)
+            .expect("semi-static block should exist");
+
+        assert!(semi_static.text.contains("MOST_SPECIFIC_RULE"));
+        assert!(semi_static.text.contains("WORKSPACE_RULE"));
+        assert!(semi_static.text.contains("[truncated]"));
+        assert!(!semi_static.text.contains("HOME_RULE"));
+        assert!(semi_static.text.chars().count() <= crate::MAX_INSTRUCTION_TOTAL_CHARS);
+    });
+}
+
+#[test]
+fn runtime_system_prompt_caps_mcp_instruction_budget() {
+    let home = temp_session_root("runtime-system-prompt-mcp-home");
+    let home_path = home.display().to_string();
+
+    with_env_var("CLAUDE_CONFIG_DIR", Some(&home_path), || {
+        let root = temp_session_root("runtime-system-prompt-mcp-budget");
+        write_test_file(
+            &root.join(".claude-plugin/plugin.json"),
+            &format!(
+                r#"{{
+                  "name": "review-tools",
+                  "mcpServers": {{
+                    "alpha": {{
+                      "url": "https://example.com/alpha",
+                      "instructions": "{}"
+                    }},
+                    "beta": {{
+                      "url": "https://example.com/beta",
+                      "instructions": "{}"
+                    }},
+                    "gamma": {{
+                      "url": "https://example.com/gamma",
+                      "instructions": "{}"
+                    }}
+                  }}
+                }}"#,
+                "ALPHA_RULE ".repeat(220),
+                "BETA_RULE ".repeat(220),
+                "GAMMA_RULE ".repeat(220),
+            ),
+        );
+
+        let prompt = build_runtime_system_prompt(
+            &root,
+            &compatibility_tool_registry(),
+            ApiProvider::OpenAICompatible,
+            "gemini-3.1-pro-preview",
+            None,
+        );
+        let semi_static = prompt
+            .blocks
+            .iter()
+            .find(|block| block.stability == ccrust_providers::PromptBlockStability::SemiStatic)
+            .expect("semi-static block should exist");
+
+        assert!(semi_static.text.contains("alpha"));
+        assert!(semi_static.text.contains("beta"));
+        assert!(semi_static.text.contains("[truncated]"));
+        assert!(semi_static.text.chars().count() <= crate::MAX_MCP_TOTAL_CHARS);
+    });
+}
+
+#[test]
 fn usage_command_reports_cache_tokens_and_prompt_metrics() {
     let session_id = SessionId::new_v4();
     let mut assistant =

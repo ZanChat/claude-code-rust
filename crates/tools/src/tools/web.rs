@@ -1,6 +1,9 @@
 #[derive(Clone, Debug)]
 struct WebFetchTool;
 
+#[derive(Clone, Debug)]
+struct WebFetchCompatTool;
+
 #[async_trait]
 impl Tool for WebFetchTool {
     fn spec(&self) -> ToolSpec {
@@ -51,8 +54,29 @@ impl Tool for WebFetchTool {
     }
 }
 
+#[async_trait]
+impl Tool for WebFetchCompatTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "WebFetch".to_owned(),
+            description: "Fetch remote documents and APIs.".to_owned(),
+            kind: ToolKind::Network,
+            input_schema: RootSchema::default(),
+            read_only: true,
+            needs_permission: true,
+        }
+    }
+
+    async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
+        invoke_tool_alias("web_fetch", input, context).await
+    }
+}
+
 #[derive(Clone, Debug)]
 struct WebSearchTool;
+
+#[derive(Clone, Debug)]
+struct WebSearchCompatTool;
 
 fn collect_search_results(value: &Value, results: &mut Vec<Value>) {
     if let Some(url) = value.get("FirstURL").and_then(Value::as_str) {
@@ -131,6 +155,24 @@ impl Tool for WebSearchTool {
             is_error: !status.is_success(),
             metadata: json!({ "query": query, "results": results }),
         })
+    }
+}
+
+#[async_trait]
+impl Tool for WebSearchCompatTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "WebSearch".to_owned(),
+            description: "Search the web for context and sources.".to_owned(),
+            kind: ToolKind::Network,
+            input_schema: RootSchema::default(),
+            read_only: true,
+            needs_permission: true,
+        }
+    }
+
+    async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
+        invoke_tool_alias("web_search", input, context).await
     }
 }
 

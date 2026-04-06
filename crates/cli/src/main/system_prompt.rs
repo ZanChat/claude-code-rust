@@ -2,6 +2,7 @@ const MAX_INSTRUCTION_TOTAL_CHARS: usize = 6_000;
 const MAX_INSTRUCTION_FILE_CHARS: usize = 2_000;
 const MAX_MCP_TOTAL_CHARS: usize = 2_000;
 const MAX_MCP_SERVER_CHARS: usize = 1_000;
+const TRUNCATED_MARKER: &str = "\n\n[truncated]";
 
 const PROMPT_STATIC_CHARS_ATTRIBUTE: &str = "prompt_static_chars";
 const PROMPT_SEMI_STATIC_CHARS_ATTRIBUTE: &str = "prompt_semi_static_chars";
@@ -66,13 +67,25 @@ fn file_exists(path: &Path) -> bool {
 }
 
 fn bounded_prompt_text(text: &str, limit: usize) -> (String, usize) {
+    if limit == 0 {
+        return (String::new(), 0);
+    }
+
     let char_count = text.chars().count();
     if char_count <= limit {
         return (text.to_owned(), char_count);
     }
 
-    let mut truncated = text.chars().take(limit).collect::<String>();
-    truncated.push_str("\n\n[truncated]");
+    let marker_chars = TRUNCATED_MARKER.chars().count();
+    if limit <= marker_chars {
+        let truncated = TRUNCATED_MARKER.chars().take(limit).collect::<String>();
+        let consumed = truncated.chars().count();
+        return (truncated, consumed);
+    }
+
+    let prefix_len = limit - marker_chars;
+    let mut truncated = text.chars().take(prefix_len).collect::<String>();
+    truncated.push_str(TRUNCATED_MARKER);
     (truncated, limit)
 }
 
@@ -133,43 +146,60 @@ fn instruction_source_fingerprint(cwd: &Path) -> String {
         .join("|")
 }
 
-fn take_prompt_budget(text: &str, per_item_limit: usize, remaining: &mut usize) -> Option<String> {
-    if *remaining == 0 {
-        return None;
+fn build_bounded_prompt_block<I>(
+    wrapper: &str,
+    sections: I,
+    total_limit: usize,
+    per_item_limit: usize,
+) -> String
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let wrapper_chars = wrapper.chars().count();
+    if wrapper_chars >= total_limit {
+        return String::new();
     }
 
-    let budget = per_item_limit.min(*remaining);
-    if budget == 0 {
-        return None;
-    }
+    let mut remaining = total_limit - wrapper_chars;
+    let mut rendered_sections = Vec::new();
 
-    let (bounded, consumed) = bounded_prompt_text(text, budget);
-    if consumed == 0 {
-        return None;
-    }
-    *remaining = (*remaining).saturating_sub(consumed);
-    Some(bounded)
-}
-
-fn instruction_sections(cwd: &Path) -> Vec<String> {
-    let mut remaining = MAX_INSTRUCTION_TOTAL_CHARS;
-    let mut sections = Vec::new();
-
-    for path in ordered_instruction_file_paths(cwd) {
-        if remaining == 0 {
+    for (heading, content) in sections {
+        let separator_chars = if rendered_sections.is_empty() { 0 } else { 2 };
+        let section_prefix = format!("## {heading}\n");
+        let section_prefix_chars = section_prefix.chars().count();
+        let required_prefix_chars = separator_chars + section_prefix_chars;
+        if required_prefix_chars >= remaining {
             break;
         }
-        let Some(content) = safe_read_text(&path) else {
+
+        let content_budget = per_item_limit.min(remaining - required_prefix_chars);
+        let (bounded, consumed) = bounded_prompt_text(&content, content_budget);
+        if consumed == 0 {
             continue;
-        };
-        let Some(bounded) = take_prompt_budget(&content, MAX_INSTRUCTION_FILE_CHARS, &mut remaining)
-        else {
-            continue;
-        };
-        sections.push(format!("## {}\n{}", path.display(), bounded));
+        }
+
+        remaining -= required_prefix_chars + consumed;
+        rendered_sections.push(format!("{section_prefix}{bounded}"));
     }
 
-    sections
+    if rendered_sections.is_empty() {
+        String::new()
+    } else {
+        format!("{wrapper}{}", rendered_sections.join("\n\n"))
+    }
+}
+
+fn instruction_block_text(cwd: &Path) -> String {
+    build_bounded_prompt_block(
+        "# Loaded Instructions\n",
+        ordered_instruction_file_paths(cwd)
+            .into_iter()
+            .filter_map(|path| {
+                safe_read_text(&path).map(|content| (path.display().to_string(), content))
+            }),
+        MAX_INSTRUCTION_TOTAL_CHARS,
+        MAX_INSTRUCTION_FILE_CHARS,
+    )
 }
 
 fn load_plugin_manifest_sync(root: &Path) -> Option<PluginManifest> {
@@ -185,35 +215,32 @@ fn plugin_manifest_fingerprint(cwd: &Path, plugin_root: Option<&PathBuf>) -> Str
         .unwrap_or_else(|| format!("{}:missing", manifest_path.display()))
 }
 
-fn mcp_instruction_sections(cwd: &Path, plugin_root: Option<&PathBuf>) -> Vec<String> {
+fn mcp_instruction_block_text(cwd: &Path, plugin_root: Option<&PathBuf>) -> String {
     let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
     let Some(manifest) = load_plugin_manifest_sync(&root) else {
-        return Vec::new();
+        return String::new();
     };
 
-    let mut remaining = MAX_MCP_TOTAL_CHARS;
     let mut sections = parse_mcp_server_configs(&manifest.mcp_servers)
         .into_values()
         .collect::<Vec<_>>();
     sections.sort_by(|left, right| left.name.cmp(&right.name));
 
-    sections
-        .into_iter()
-        .filter_map(|config| {
-            if remaining == 0 {
-                return None;
-            }
-
+    build_bounded_prompt_block(
+        "# MCP Server Instructions\nThe following MCP servers have provided instructions for how to use their tools and resources:\n\n",
+        sections.into_iter().filter_map(|config| {
             let instructions = config
                 .metadata
                 .get("instructions")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            let bounded = take_prompt_budget(instructions, MAX_MCP_SERVER_CHARS, &mut remaining)?;
-            Some(format!("## {}\n{}", config.name, bounded))
-        })
-        .collect()
+                .filter(|value| !value.is_empty())?
+                .to_owned();
+            Some((config.name, instructions))
+        }),
+        MAX_MCP_TOTAL_CHARS,
+        MAX_MCP_SERVER_CHARS,
+    )
 }
 
 fn build_static_prompt_text(enabled_tools: &BTreeSet<String>) -> String {
@@ -235,20 +262,14 @@ fn build_static_prompt_text(enabled_tools: &BTreeSet<String>) -> String {
 fn build_semi_static_prompt_text(cwd: &Path, plugin_root: Option<&PathBuf>) -> String {
     let mut sections = Vec::new();
 
-    let instruction_sections = instruction_sections(cwd);
-    if !instruction_sections.is_empty() {
-        sections.push(format!(
-            "# Loaded Instructions\n{}",
-            instruction_sections.join("\n\n")
-        ));
+    let instruction_block = instruction_block_text(cwd);
+    if !instruction_block.is_empty() {
+        sections.push(instruction_block);
     }
 
-    let mcp_sections = mcp_instruction_sections(cwd, plugin_root);
-    if !mcp_sections.is_empty() {
-        sections.push(format!(
-            "# MCP Server Instructions\nThe following MCP servers have provided instructions for how to use their tools and resources:\n\n{}",
-            mcp_sections.join("\n\n")
-        ));
+    let mcp_block = mcp_instruction_block_text(cwd, plugin_root);
+    if !mcp_block.is_empty() {
+        sections.push(mcp_block);
     }
 
     sections.join("\n\n")

@@ -155,12 +155,8 @@ fn build_repl_ui_state_adds_session_and_total_usage_to_header_context() {
     let app = ccrust_ui::RatatuiApp::new("repl");
     let registry = compatibility_command_registry();
     let session_id = SessionId::new_v4();
-    let mut assistant = build_text_message(
-        session_id,
-        MessageRole::Assistant,
-        "Done.".to_owned(),
-        None,
-    );
+    let mut assistant =
+        build_text_message(session_id, MessageRole::Assistant, "Done.".to_owned(), None);
     assistant.metadata.usage = Some(ccrust_core::TokenUsage {
         input_tokens: 12,
         output_tokens: 4,

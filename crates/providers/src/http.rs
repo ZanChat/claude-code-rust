@@ -1398,7 +1398,8 @@ pub(crate) fn build_openai_chat_completions_payload(request: &ProviderRequest) -
 
 pub(crate) fn openai_chat_messages(request: &ProviderRequest) -> Vec<Value> {
     let mut encoded = Vec::new();
-    if let Some(system_prompt) = request_system_prompt_text(request) {
+    let injected_system_prompt = request_system_prompt_text(request);
+    if let Some(system_prompt) = injected_system_prompt.as_ref() {
         encoded.push(json!({
             "role": "system",
             "content": system_prompt,
@@ -1408,7 +1409,7 @@ pub(crate) fn openai_chat_messages(request: &ProviderRequest) -> Vec<Value> {
     for message in &request.messages {
         match message.role {
             MessageRole::System => {
-                if !request.system_prompt.is_empty() {
+                if injected_system_prompt.is_some() {
                     continue;
                 }
                 let text = message_text(message);
