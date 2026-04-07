@@ -1386,6 +1386,53 @@ async fn pending_btw_side_question_uses_immediate_side_channel() {
 }
 
 #[test]
+fn pending_btw_side_question_runs_on_dedicated_runtime() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let root = temp_session_root("pending-btw-dedicated-runtime");
+        let tool_registry = compatibility_tool_registry();
+        let system_prompt = build_runtime_system_prompt(
+            &root,
+            &tool_registry,
+            ApiProvider::OpenAICompatible,
+            DEFAULT_OPENAI_REASONING_MODEL,
+            None,
+        );
+        let session_id = SessionId::new_v4();
+        let messages = vec![build_text_message(
+            session_id,
+            MessageRole::User,
+            "main task is still running".to_owned(),
+            None,
+        )];
+
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::spawn_pending_btw_side_question(
+                ApiProvider::OpenAICompatible,
+                DEFAULT_OPENAI_REASONING_MODEL.to_owned(),
+                session_id,
+                system_prompt.blocks,
+                messages,
+                "what changed?".to_owned(),
+                false,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(answer.contains("what changed?"));
+        assert!(answer.contains("side question"));
+    });
+}
+
+#[test]
 fn pending_btw_provider_request_does_not_hard_cap_debug_output() {
     let session_id = SessionId::new_v4();
     let request = pending_btw_provider_request(

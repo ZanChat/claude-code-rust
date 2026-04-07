@@ -1345,8 +1345,8 @@ where
                                             active_model,
                                             plugin_root,
                                         );
-                                        side_question_task = Some(tokio::spawn(
-                                            run_pending_btw_side_question(
+                                        side_question_task = Some(
+                                            spawn_pending_btw_side_question(
                                                 provider,
                                                 active_model.to_owned(),
                                                 session_id,
@@ -1357,7 +1357,7 @@ where
                                                 question,
                                                 auth_configured,
                                             ),
-                                        ));
+                                        );
                                     } else {
                                         compact_banner =
                                             Some("Usage: /btw <question>".to_owned());
@@ -1477,6 +1477,33 @@ CRITICAL CONSTRAINTS:
 - If you do not know, say so briefly.</system-reminder>
 
 "#;
+
+pub(crate) fn spawn_pending_btw_side_question(
+    provider: ApiProvider,
+    active_model: String,
+    session_id: SessionId,
+    system_prompt: Vec<SystemPromptBlock>,
+    context_messages: Vec<Message>,
+    question: String,
+    auth_configured: bool,
+) -> tokio::task::JoinHandle<Result<String>> {
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| anyhow!("failed to start /btw runtime: {error}"))?;
+
+        runtime.block_on(run_pending_btw_side_question(
+            provider,
+            active_model,
+            session_id,
+            system_prompt,
+            context_messages,
+            question,
+            auth_configured,
+        ))
+    })
+}
 
 fn pending_btw_question(invocation: &CommandInvocation) -> Option<String> {
     let question = invocation.args.join(" ").trim().to_owned();

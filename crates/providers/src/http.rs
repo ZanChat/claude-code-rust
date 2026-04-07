@@ -1,6 +1,6 @@
 use super::*;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use std::env;
 
@@ -46,6 +46,92 @@ pub struct HttpProvider {
     auth: AuthMaterial,
     client: reqwest::Client,
     base_url: String,
+}
+
+struct GeminiSseStream {
+    response: reqwest::Response,
+    buffer: String,
+    pending: VecDeque<ProviderEvent>,
+    completed: bool,
+    saw_tool_call: bool,
+}
+
+impl GeminiSseStream {
+    fn new(response: reqwest::Response) -> Self {
+        Self {
+            response,
+            buffer: String::new(),
+            pending: VecDeque::new(),
+            completed: false,
+            saw_tool_call: false,
+        }
+    }
+
+    fn drain_buffer(&mut self, finalize: bool) -> Result<()> {
+        while let Some(separator_index) = self.buffer.find("\n\n") {
+            let raw_event = self.buffer[..separator_index].to_owned();
+            self.buffer = self.buffer[separator_index + 2..].to_owned();
+            if let Some(value) = parse_gemini_sse_event(&raw_event)? {
+                let events = provider_events_from_gemini_sse_chunk(
+                    &value,
+                    &mut self.saw_tool_call,
+                    &mut self.completed,
+                )?;
+                self.pending.extend(events);
+            }
+            if self.completed {
+                self.buffer.clear();
+                return Ok(());
+            }
+        }
+
+        if finalize {
+            let trailing = self.buffer.trim().to_owned();
+            self.buffer.clear();
+            if !trailing.is_empty() {
+                if let Some(value) = parse_gemini_sse_event(&trailing)? {
+                    let events = provider_events_from_gemini_sse_chunk(
+                        &value,
+                        &mut self.saw_tool_call,
+                        &mut self.completed,
+                    )?;
+                    self.pending.extend(events);
+                }
+            }
+            if !self.completed {
+                return Err(anyhow!("gemini stream completed without a finish reason"));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ProviderStream for GeminiSseStream {
+    async fn next_event(&mut self) -> Result<Option<ProviderEvent>> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+            if self.completed {
+                return Ok(None);
+            }
+
+            match self.response.chunk().await? {
+                Some(chunk) => {
+                    self.buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    if self.buffer.contains("\r\n") {
+                        self.buffer = self.buffer.replace("\r\n", "\n");
+                    }
+                    self.drain_buffer(false)?;
+                }
+                None => {
+                    self.drain_buffer(true)?;
+                }
+            }
+        }
+    }
 }
 
 impl HttpProvider {
@@ -139,19 +225,21 @@ impl HttpProvider {
         request: ProviderRequest,
     ) -> Result<Box<dyn ProviderStream>> {
         let model = resolve_provider_model(ApiProvider::Gemini, &request.model);
-        let url = gemini_generate_content_url(&self.base_url, &model);
+        let url = gemini_stream_generate_content_url(&self.base_url, &model);
         let payload = build_gemini_generate_content_payload(&request);
+        let mut headers = self.gemini_headers(&request.extra_headers)?;
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
 
         let response = self
             .client
             .post(url)
-            .headers(self.gemini_headers(&request.extra_headers)?)
+            .headers(headers)
             .json(&payload)
             .send()
             .await?;
         let status = response.status();
-        let body = response.text().await?;
         if !status.is_success() {
+            let body = response.text().await?;
             let summary = format!(
                 "gemini request failed with status {}: {}",
                 status,
@@ -161,10 +249,7 @@ impl HttpProvider {
             return Err(ProviderRequestError::new(summary, transcript_message).into());
         }
 
-        let value: Value = serde_json::from_str(&body)?;
-        Ok(Box::new(StaticProviderStream::new(
-            events_from_gemini_response(&value)?,
-        )))
+        Ok(Box::new(GeminiSseStream::new(response)))
     }
 
     async fn start_openai_responses_stream(
@@ -1828,10 +1913,10 @@ pub(crate) fn openai_chat_messages(request: &ProviderRequest) -> Vec<Value> {
     encoded
 }
 
-fn gemini_generate_content_url(base_url: &str, model: &str) -> String {
+fn gemini_stream_generate_content_url(base_url: &str, model: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     let encoded_model = utf8_percent_encode(model, URI_COMPONENT_ENCODE_SET).to_string();
-    format!("{trimmed}/models/{encoded_model}:generateContent")
+    format!("{trimmed}/models/{encoded_model}:streamGenerateContent?alt=sse")
 }
 
 fn gemini_thinking_budget_for_effort(effort: &str) -> u64 {
@@ -2149,6 +2234,169 @@ fn gemini_usage(value: &Value) -> Option<TokenUsage> {
     })
 }
 
+fn parse_gemini_sse_event(raw_event: &str) -> Result<Option<Value>> {
+    let data_lines = raw_event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>();
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+
+    let payload = data_lines.join("\n");
+    let trimmed = payload.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return Ok(None);
+    }
+
+    Ok(Some(serde_json::from_str(trimmed)?))
+}
+
+fn provider_events_from_gemini_sse_chunk(
+    value: &Value,
+    saw_tool_call: &mut bool,
+    completed: &mut bool,
+) -> Result<Vec<ProviderEvent>> {
+    if let Some(block_reason) = value
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        return Err(anyhow!("gemini request blocked: {block_reason}"));
+    }
+
+    let candidate = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first());
+    let mut events = Vec::new();
+    let mut chunk_saw_tool_call = false;
+
+    if let Some(parts) = candidate
+        .and_then(|candidate| candidate.get("content"))
+        .and_then(|content| content.get("parts"))
+        .and_then(Value::as_array)
+    {
+        for (index, part) in parts.iter().enumerate() {
+            if let Some(function_call) = part.get("functionCall") {
+                let name = function_call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("gemini functionCall missing name"))?
+                    .to_owned();
+                let id = function_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("gemini_call_{index}"));
+                let args = function_call
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                events.push(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: id.clone(),
+                        name,
+                        input_json: serde_json::to_string(&args)?,
+                        thought_signature: part
+                            .get("thoughtSignature")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .filter(|value| !value.trim().is_empty()),
+                    },
+                });
+                events.push(ProviderEvent::ToolCallBoundary { id });
+                chunk_saw_tool_call = true;
+                *saw_tool_call = true;
+                continue;
+            }
+
+            if part
+                .get("thought")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            if let Some(text) = part
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+            {
+                events.push(ProviderEvent::MessageDelta {
+                    text: text.to_owned(),
+                });
+            }
+        }
+    }
+
+    let finish_reason = candidate
+        .and_then(|candidate| candidate.get("finishReason"))
+        .and_then(Value::as_str);
+
+    if events.is_empty() && finish_reason.is_some() {
+        if let Some(text) = candidate
+            .and_then(|candidate| candidate.get("finishMessage"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        {
+            events.push(ProviderEvent::MessageDelta {
+                text: text.to_owned(),
+            });
+        }
+    }
+
+    if let Some(usage) = gemini_usage(value) {
+        events.push(ProviderEvent::Usage { usage });
+    }
+
+    if finish_reason.is_some() {
+        *completed = true;
+        events.push(ProviderEvent::Stop {
+            reason: if *saw_tool_call || chunk_saw_tool_call {
+                "tool_use".to_owned()
+            } else if finish_reason == Some("MAX_TOKENS") {
+                "max_tokens".to_owned()
+            } else {
+                "end_turn".to_owned()
+            },
+        });
+    }
+
+    Ok(events)
+}
+
+#[cfg(test)]
+pub(crate) fn events_from_gemini_sse_body(body: &str) -> Result<Vec<ProviderEvent>> {
+    let normalized = body.replace("\r\n", "\n");
+    let mut saw_tool_call = false;
+    let mut completed = false;
+    let mut events = Vec::new();
+
+    for raw_event in normalized.split("\n\n") {
+        if raw_event.trim().is_empty() {
+            continue;
+        }
+        if let Some(value) = parse_gemini_sse_event(raw_event)? {
+            events.extend(provider_events_from_gemini_sse_chunk(
+                &value,
+                &mut saw_tool_call,
+                &mut completed,
+            )?);
+        }
+    }
+
+    if !completed {
+        return Err(anyhow!("gemini stream completed without a finish reason"));
+    }
+
+    Ok(events)
+}
+
+#[cfg(test)]
 pub(crate) fn events_from_gemini_response(value: &Value) -> Result<Vec<ProviderEvent>> {
     if let Some(block_reason) = value
         .get("promptFeedback")

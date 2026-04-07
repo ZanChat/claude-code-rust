@@ -1,17 +1,17 @@
 use super::{
     codex_auth_file_path, collect_provider_response, collect_provider_text,
     compatibility_model_catalog, decode_jwt_claims, events_from_anthropic_response,
-    events_from_gemini_response, events_from_openai_response, events_from_openai_sse_body,
-    get_anthropic_auth_material, get_gemini_auth_status, get_gemini_base_url,
-    get_gemini_completion_model, get_gemini_credential_hint, get_gemini_reasoning_model,
-    get_openai_api_mode, get_openai_auth_status, get_openai_credential_hint,
-    get_openai_family_capabilities, get_openai_transport_mode, get_token_freshness,
-    is_openai_provider, provider_base_url, provider_descriptor, refresh_codex_access_token,
-    resolve_api_provider, resolve_provider_model, sign_bedrock_request, ApiProvider, AuthMaterial,
-    AuthRequest, AuthResolver, EchoProvider, EnvironmentAuthResolver, HttpProvider, ModelCatalog,
-    OpenAIApiMode, OpenAIAuthSource, OpenAIFamilyCapabilities, OpenAITokenFreshness,
-    OpenAITransportMode, PromptBlockStability, PromptCacheScope, ProviderRequest,
-    ProviderRequestError, ProviderToolDefinition, SystemPromptBlock,
+    events_from_gemini_response, events_from_gemini_sse_body, events_from_openai_response,
+    events_from_openai_sse_body, get_anthropic_auth_material, get_gemini_auth_status,
+    get_gemini_base_url, get_gemini_completion_model, get_gemini_credential_hint,
+    get_gemini_reasoning_model, get_openai_api_mode, get_openai_auth_status,
+    get_openai_credential_hint, get_openai_family_capabilities, get_openai_transport_mode,
+    get_token_freshness, is_openai_provider, provider_base_url, provider_descriptor,
+    refresh_codex_access_token, resolve_api_provider, resolve_provider_model, sign_bedrock_request,
+    ApiProvider, AuthMaterial, AuthRequest, AuthResolver, EchoProvider, EnvironmentAuthResolver,
+    HttpProvider, ModelCatalog, OpenAIApiMode, OpenAIAuthSource, OpenAIFamilyCapabilities,
+    OpenAITokenFreshness, OpenAITransportMode, PromptBlockStability, PromptCacheScope,
+    ProviderRequest, ProviderRequestError, ProviderToolDefinition, SystemPromptBlock,
     DEFAULT_GEMINI_COMPLETION_MODEL, DEFAULT_GEMINI_REASONING_MODEL,
     DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
 };
@@ -135,6 +135,15 @@ fn write_json_response(stream: &mut TcpStream, body_string: &str) {
     stream.write_all(response.as_bytes()).unwrap();
 }
 
+fn write_sse_response(stream: &mut TcpStream, body_string: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body_string.len(),
+        body_string
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
 fn write_json_response_with_status(stream: &mut TcpStream, status_line: &str, body_string: &str) {
     let response = format!(
         "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -171,6 +180,21 @@ async fn spawn_json_server_with_status(
         let (mut stream, _) = listener.accept().unwrap();
         let captured = read_captured_http_request(&mut stream);
         write_json_response_with_status(&mut stream, status_line, &body_string);
+        captured
+    });
+
+    (format!("http://{address}"), handle)
+}
+
+async fn spawn_sse_server(
+    response_body: String,
+) -> (String, std::thread::JoinHandle<CapturedHttpRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let captured = read_captured_http_request(&mut stream);
+        write_sse_response(&mut stream, &response_body);
         captured
     });
 
@@ -879,6 +903,63 @@ fn parses_native_gemini_tool_call_thought_signature() {
 }
 
 #[test]
+fn parses_native_gemini_sse_text_stream() {
+    let body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello \"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Gemini\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":9,\"candidatesTokenCount\":3}}\n\n"
+    );
+
+    let events = events_from_gemini_sse_body(body).unwrap();
+
+    assert!(matches!(
+        &events[0],
+        super::ProviderEvent::MessageDelta { text } if text == "Hello "
+    ));
+    assert!(matches!(
+        &events[1],
+        super::ProviderEvent::MessageDelta { text } if text == "Gemini"
+    ));
+    assert!(matches!(
+        &events[2],
+        super::ProviderEvent::Usage { usage } if usage.input_tokens == 9
+    ));
+    assert!(matches!(
+        &events[3],
+        super::ProviderEvent::Stop { reason } if reason == "end_turn"
+    ));
+}
+
+#[test]
+fn parses_native_gemini_sse_tool_call_stream() {
+    let body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_123\",\"name\":\"file_read\",\"args\":{\"path\":\"src/main.rs\"}},\"thoughtSignature\":\"signature-a\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":0,\"thoughtsTokenCount\":2}}\n\n"
+    );
+
+    let events = events_from_gemini_sse_body(body).unwrap();
+
+    assert!(matches!(
+        &events[0],
+        super::ProviderEvent::ToolCall { call }
+            if call.id == "call_123"
+                && call.name == "file_read"
+                && call.thought_signature.as_deref() == Some("signature-a")
+    ));
+    assert!(matches!(
+        &events[1],
+        super::ProviderEvent::ToolCallBoundary { id } if id == "call_123"
+    ));
+    assert!(matches!(
+        &events[2],
+        super::ProviderEvent::Usage { usage } if usage.input_tokens == 11
+    ));
+    assert!(matches!(
+        &events[3],
+        super::ProviderEvent::Stop { reason } if reason == "tool_use"
+    ));
+}
+
+#[test]
 fn serializes_anthropic_system_blocks_with_cache_metadata() {
     let request = ProviderRequest {
         model: "claude-sonnet-4-6".to_owned(),
@@ -1298,33 +1379,13 @@ async fn retries_openai_compatible_chat_completions_send_failures() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sends_native_gemini_generate_content_requests() {
+async fn sends_native_gemini_stream_generate_content_requests() {
     let _guard = ENV_LOCK.lock().await;
 
-    let (base_url, server) = spawn_json_server(json!({
-        "candidates": [{
-            "content": {
-                "parts": [
-                    { "text": "Need to inspect the file." },
-                    {
-                        "functionCall": {
-                            "id": "call_123",
-                            "name": "file_read",
-                            "args": { "path": "src/main.rs" }
-                        },
-                        "thoughtSignature": "signature-a"
-                    }
-                ]
-            },
-            "finishReason": "STOP"
-        }],
-        "usageMetadata": {
-            "promptTokenCount": 11,
-            "candidatesTokenCount": 5,
-            "thoughtsTokenCount": 2
-        }
-    }))
-    .await;
+    let body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Need to inspect the file.\"},{\"functionCall\":{\"id\":\"call_123\",\"name\":\"file_read\",\"args\":{\"path\":\"src/main.rs\"}},\"thoughtSignature\":\"signature-a\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":5,\"thoughtsTokenCount\":2}}\n\n"
+    );
+    let (base_url, server) = spawn_sse_server(body.to_owned()).await;
     let provider = HttpProvider::with_base_url(
         ApiProvider::Gemini,
         AuthMaterial {
@@ -1385,7 +1446,11 @@ async fn sends_native_gemini_generate_content_requests() {
     assert_eq!(captured.method, "POST");
     assert_eq!(
         captured.path,
-        format!("/v1beta/models/{DEFAULT_GEMINI_REASONING_MODEL}:generateContent")
+        format!("/v1beta/models/{DEFAULT_GEMINI_REASONING_MODEL}:streamGenerateContent?alt=sse")
+    );
+    assert_eq!(
+        captured.headers.get("accept").map(String::as_str),
+        Some("text/event-stream")
     );
     assert_eq!(
         captured.headers.get("x-goog-api-key").map(String::as_str),
@@ -1457,7 +1522,7 @@ async fn gemini_http_errors_preserve_full_response_for_transcript() {
 
     assert_eq!(
         captured.path,
-        format!("/v1beta/models/{DEFAULT_GEMINI_REASONING_MODEL}:generateContent")
+        format!("/v1beta/models/{DEFAULT_GEMINI_REASONING_MODEL}:streamGenerateContent?alt=sse")
     );
     assert!(error
         .to_string()
