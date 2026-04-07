@@ -27,12 +27,13 @@ use ccrust_ui::{CommandPaletteEntry, PanePreview, UiState};
 use ccrust_core::SessionId;
 
 use ccrust_providers::{
-    compatibility_model_catalog, get_anthropic_auth_material, get_openai_api_mode,
-    get_openai_auth_status, get_openai_completion_model, get_openai_completion_think_level,
-    get_openai_family_capabilities, get_openai_reasoning_model, get_openai_reasoning_think_level,
-    get_openai_transport_mode, is_openai_provider, provider_descriptor,
-    read_provider_auth_snapshot, ApiProvider, ModelCatalog, OpenAIApiMode, OpenAIAuthSource,
-    OpenAITransportMode,
+    compatibility_model_catalog, get_anthropic_auth_material, get_gemini_auth_status,
+    get_gemini_base_url, get_gemini_completion_model, get_gemini_reasoning_model,
+    get_openai_api_mode, get_openai_auth_status, get_openai_completion_model,
+    get_openai_completion_think_level, get_openai_family_capabilities, get_openai_reasoning_model,
+    get_openai_reasoning_think_level, get_openai_transport_mode, is_openai_provider,
+    provider_descriptor, read_provider_auth_snapshot, ApiProvider, ModelCatalog, OpenAIApiMode,
+    OpenAIAuthSource, OpenAITransportMode,
 };
 
 use anyhow::Result;
@@ -94,6 +95,8 @@ pub(crate) enum OpenAICompatiblePreset {
 struct LoginConfigDraft {
     provider: ApiProvider,
     anthropic_api_key: String,
+    gemini_api_key: String,
+    gemini_base_url: String,
     openai_api_key: String,
     openai_base_url: String,
     openai_api_mode: OpenAIApiMode,
@@ -267,6 +270,28 @@ fn provider_auth_status(provider: ApiProvider) -> (bool, Option<String>) {
                 return (
                     true,
                     Some(openai_auth_source_label(status.source).to_owned()),
+                );
+            }
+            let snapshot = read_provider_auth_snapshot(provider);
+            (
+                snapshot.is_some(),
+                snapshot
+                    .and_then(|material| material.source.filter(|value| !value.trim().is_empty())),
+            )
+        }
+        ApiProvider::Gemini => {
+            let status = get_gemini_auth_status();
+            if status.has_credentials {
+                return (
+                    true,
+                    Some(
+                        match status.source {
+                            ccrust_providers::GeminiAuthSource::GeminiApiKey => "GEMINI_API_KEY",
+                            ccrust_providers::GeminiAuthSource::GoogleApiKey => "GOOGLE_API_KEY",
+                            ccrust_providers::GeminiAuthSource::None => "none",
+                        }
+                        .to_owned(),
+                    ),
                 );
             }
             let snapshot = read_provider_auth_snapshot(provider);
@@ -1168,14 +1193,24 @@ fn login_draft_from_environment(provider: ApiProvider) -> LoginConfigDraft {
     let mut draft = LoginConfigDraft {
         provider,
         anthropic_api_key: env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+        gemini_api_key: env::var("GEMINI_API_KEY")
+            .or_else(|_| env::var("GOOGLE_API_KEY"))
+            .unwrap_or_default(),
+        gemini_base_url: env::var("GEMINI_BASE_URL").unwrap_or_else(|_| get_gemini_base_url()),
         openai_api_key: env::var("OPENAI_API_KEY").unwrap_or_default(),
         openai_base_url: env::var("OPENAI_BASE_URL").unwrap_or_default(),
         openai_api_mode: get_openai_api_mode(provider),
         openai_transport: get_openai_transport_mode(),
-        reasoning_model: env::var("REASONING_MODEL")
-            .unwrap_or_else(|_| get_openai_reasoning_model()),
-        completion_model: env::var("COMPLETION_MODEL")
-            .unwrap_or_else(|_| get_openai_completion_model()),
+        reasoning_model: if provider == ApiProvider::Gemini {
+            env::var("GEMINI_REASONING_MODEL").unwrap_or_else(|_| get_gemini_reasoning_model())
+        } else {
+            env::var("REASONING_MODEL").unwrap_or_else(|_| get_openai_reasoning_model())
+        },
+        completion_model: if provider == ApiProvider::Gemini {
+            env::var("GEMINI_COMPLETION_MODEL").unwrap_or_else(|_| get_gemini_completion_model())
+        } else {
+            env::var("COMPLETION_MODEL").unwrap_or_else(|_| get_openai_completion_model())
+        },
         reasoning_model_think: env::var("REASONING_MODEL_THINK")
             .unwrap_or_else(|_| get_openai_reasoning_think_level()),
         completion_model_think: env::var("COMPLETION_MODEL_THINK")
@@ -1270,6 +1305,18 @@ fn managed_login_env_values(draft: &LoginConfigDraft) -> BTreeMap<String, String
                     "ANTHROPIC_API_KEY".to_owned(),
                     draft.anthropic_api_key.trim().to_owned(),
                 );
+            }
+        }
+        ApiProvider::Gemini => {
+            for (key, value) in [
+                ("GEMINI_API_KEY", draft.gemini_api_key.trim()),
+                ("GEMINI_BASE_URL", draft.gemini_base_url.trim()),
+                ("GEMINI_REASONING_MODEL", draft.reasoning_model.trim()),
+                ("GEMINI_COMPLETION_MODEL", draft.completion_model.trim()),
+            ] {
+                if !value.is_empty() {
+                    values.insert(key.to_owned(), value.to_owned());
+                }
             }
         }
         ApiProvider::OpenAICompatible => {
@@ -1514,6 +1561,91 @@ pub(crate) fn run_login_onboarding_flow<B: ratatui::backend::Backend>(
             false,
             true,
             Some(openai_compatible_think_level),
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+    } else if selected_provider == ApiProvider::Gemini {
+        draft.gemini_api_key = match run_onboarding_input_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "2/5",
+            "Gemini API Key",
+            vec![
+                "Enter a Gemini Developer API key. GOOGLE_API_KEY also works, but onboarding saves it as GEMINI_API_KEY."
+                    .to_owned(),
+            ],
+            "Preview",
+            vec![format!("provider: {selected_provider}")],
+            draft.gemini_api_key.clone(),
+            true,
+            true,
+            None,
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        draft.gemini_base_url = match run_onboarding_input_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "3/5",
+            "Gemini Base URL",
+            vec![
+                "Leave the default Gemini API base URL unless you need a proxy or custom endpoint."
+                    .to_owned(),
+            ],
+            "Preview",
+            vec![format!("api key source: GEMINI_API_KEY")],
+            draft.gemini_base_url.clone(),
+            false,
+            true,
+            None,
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        draft.reasoning_model = match run_onboarding_input_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "4/5",
+            "Reasoning Model",
+            vec!["Set the default Gemini model for main conversational turns.".to_owned()],
+            "Preview",
+            vec![format!("base_url: {}", draft.gemini_base_url)],
+            draft.reasoning_model.clone(),
+            false,
+            true,
+            None,
+        )? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        draft.completion_model = match run_onboarding_input_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "5/5",
+            "Fast Model",
+            vec![
+                "Set the Gemini model used for fast mode and lightweight utility turns.".to_owned(),
+            ],
+            "Preview",
+            vec![format!("reasoning model: {}", draft.reasoning_model)],
+            draft.completion_model.clone(),
+            false,
+            true,
+            None,
         )? {
             Some(value) => value,
             None => return Ok(None),

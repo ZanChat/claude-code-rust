@@ -4,6 +4,10 @@ const CCRUST_ENV_FILE_NAME: &str = ".env.ccrust";
 pub(crate) const MANAGED_LOGIN_ENV_KEYS: &[&str] = &[
     "CLAUDE_CODE_API_PROVIDER",
     "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GEMINI_BASE_URL",
+    "GEMINI_REASONING_MODEL",
+    "GEMINI_COMPLETION_MODEL",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_API_MODE",
@@ -352,6 +356,29 @@ pub(crate) fn managed_login_values_from_environment(
             if let Ok(value) = env::var("ANTHROPIC_API_KEY") {
                 if !value.trim().is_empty() {
                     values.insert("ANTHROPIC_API_KEY".to_owned(), value);
+                }
+            }
+        }
+        ApiProvider::Gemini => {
+            if let Ok(value) = env::var("GEMINI_API_KEY") {
+                if !value.trim().is_empty() {
+                    values.insert("GEMINI_API_KEY".to_owned(), value);
+                }
+            } else if let Ok(value) = env::var("GOOGLE_API_KEY") {
+                if !value.trim().is_empty() {
+                    values.insert("GEMINI_API_KEY".to_owned(), value);
+                }
+            }
+
+            for key in [
+                "GEMINI_BASE_URL",
+                "GEMINI_REASONING_MODEL",
+                "GEMINI_COMPLETION_MODEL",
+            ] {
+                if let Ok(value) = env::var(key) {
+                    if !value.trim().is_empty() {
+                        values.insert(key.to_owned(), value);
+                    }
                 }
             }
         }

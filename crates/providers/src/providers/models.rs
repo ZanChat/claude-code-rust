@@ -23,6 +23,11 @@ pub fn config_migration_report(provider: ApiProvider) -> ConfigMigrationReport {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_BASE_URL",
+        "GEMINI_REASONING_MODEL",
+        "GEMINI_COMPLETION_MODEL",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_API_MODE",
@@ -100,6 +105,7 @@ pub fn get_anthropic_credential_hint(provider: ApiProvider) -> String {
         ApiProvider::FirstParty => {
             "Set ANTHROPIC_API_KEY or provide CLAUDE_CODE_OAUTH_TOKEN.".to_owned()
         }
+        ApiProvider::Gemini => get_gemini_credential_hint(),
         ApiProvider::Bedrock => "Provide AWS credentials and region configuration.".to_owned(),
         ApiProvider::Vertex => {
             "Provide Google Cloud credentials and Vertex region configuration.".to_owned()
@@ -144,6 +150,14 @@ pub fn provider_descriptor(provider: ApiProvider) -> ProviderDescriptor {
             supports_tool_use: true,
             supports_reasoning: true,
             requires_cloud_auth: true,
+        },
+        ApiProvider::Gemini => ProviderDescriptor {
+            provider,
+            display_name: "Google Gemini".to_owned(),
+            supports_streaming: true,
+            supports_tool_use: true,
+            supports_reasoning: true,
+            requires_cloud_auth: false,
         },
         ApiProvider::ChatGPTCodex => ProviderDescriptor {
             provider,
@@ -195,10 +209,60 @@ pub fn compatibility_models_for(provider: ApiProvider) -> Vec<ModelMetadata> {
                 supports_reasoning: false,
             },
         ],
+        ApiProvider::Gemini => gemini_compatibility_models(provider),
         ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
             openai_family_compatibility_models(provider)
         }
     }
+}
+
+fn gemini_compatibility_models(provider: ApiProvider) -> Vec<ModelMetadata> {
+    let provider_name = provider.to_string();
+    let mut models = Vec::new();
+    let mut push_unique = |model: ModelMetadata| {
+        if models
+            .iter()
+            .any(|existing: &ModelMetadata| existing.id == model.id)
+        {
+            return;
+        }
+        models.push(model);
+    };
+
+    push_unique(ModelMetadata {
+        id: get_gemini_reasoning_model(),
+        provider: provider_name.clone(),
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        supports_tool_use: true,
+        supports_reasoning: true,
+    });
+    push_unique(ModelMetadata {
+        id: get_gemini_completion_model(),
+        provider: provider_name.clone(),
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        supports_tool_use: true,
+        supports_reasoning: true,
+    });
+    push_unique(ModelMetadata {
+        id: DEFAULT_GEMINI_REASONING_MODEL.to_owned(),
+        provider: provider_name.clone(),
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        supports_tool_use: true,
+        supports_reasoning: true,
+    });
+    push_unique(ModelMetadata {
+        id: DEFAULT_GEMINI_COMPLETION_MODEL.to_owned(),
+        provider: provider_name,
+        context_window: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        supports_tool_use: true,
+        supports_reasoning: true,
+    });
+
+    models
 }
 
 fn openai_family_compatibility_models(provider: ApiProvider) -> Vec<ModelMetadata> {
@@ -271,6 +335,15 @@ pub const DEFAULT_OPENAI_REASONING_MODEL: &str = "gpt-5.4";
 
 /// Default OpenAI completion model (used for standard/utility turns).
 pub const DEFAULT_OPENAI_COMPLETION_MODEL: &str = "gpt-5.3-codex";
+
+/// Default Gemini reasoning model (used for the default main loop).
+pub const DEFAULT_GEMINI_REASONING_MODEL: &str = "gemini-2.5-pro";
+
+/// Default Gemini completion model (used for fast/utility turns).
+pub const DEFAULT_GEMINI_COMPLETION_MODEL: &str = "gemini-2.5-flash";
+
+/// Default Gemini Developer API base URL.
+pub const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 /// Default max thinking token budget for Claude models.
 pub const DEFAULT_MAX_THINKING_TOKENS: u64 = 10_000;
@@ -435,6 +508,32 @@ pub fn get_openai_completion_model() -> String {
         .unwrap_or_else(|| DEFAULT_OPENAI_COMPLETION_MODEL.to_owned())
 }
 
+pub fn get_gemini_reasoning_model() -> String {
+    env::var("GEMINI_REASONING_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_GEMINI_REASONING_MODEL.to_owned())
+}
+
+pub fn get_gemini_completion_model() -> String {
+    env::var("GEMINI_COMPLETION_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_GEMINI_COMPLETION_MODEL.to_owned())
+}
+
+pub fn get_gemini_base_url() -> String {
+    env::var("GEMINI_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_GEMINI_BASE_URL.to_owned())
+}
+
+pub fn is_gemini_provider(provider: ApiProvider) -> bool {
+    provider == ApiProvider::Gemini
+}
+
 /// Parse a think-level env var value into a validated level string.
 fn parse_think_level(value: Option<String>, fallback: &str) -> String {
     match value
@@ -467,7 +566,7 @@ pub fn model_supports_thinking(model: &str, provider: ApiProvider) -> bool {
     let lower = model.to_lowercase();
     match provider {
         // OpenAI family always supports "thinking" via reasoning_effort
-        ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => true,
+        ApiProvider::Gemini | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => true,
         // 1P and Foundry: all Claude 4+ models
         ApiProvider::FirstParty | ApiProvider::Foundry => !lower.contains("claude-3-"),
         // 3P (Bedrock / Vertex): only Opus 4+ and Sonnet 4+
@@ -480,7 +579,7 @@ pub fn model_supports_thinking(model: &str, provider: ApiProvider) -> bool {
 /// Check if a Claude model supports adaptive thinking (newer 4.6+ models).
 pub fn model_supports_adaptive_thinking(model: &str, provider: ApiProvider) -> bool {
     match provider {
-        ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => true,
+        ApiProvider::Gemini | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => true,
         _ => {
             let lower = model.to_lowercase();
             if lower.contains("opus-4-6") || lower.contains("sonnet-4-6") {
@@ -550,6 +649,13 @@ pub fn resolve_active_model(
     }
 
     match provider {
+        ApiProvider::Gemini => {
+            if thinking_enabled {
+                get_gemini_reasoning_model()
+            } else {
+                get_gemini_completion_model()
+            }
+        }
         ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
             // OpenAI providers split between reasoning and completion models
             if thinking_enabled {

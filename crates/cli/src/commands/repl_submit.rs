@@ -77,6 +77,11 @@ pub(crate) async fn handle_repl_slash_command(
                         "transport={}",
                         ccrust_providers::get_openai_transport_mode().as_str()
                     ));
+                } else if provider == ApiProvider::Gemini {
+                    parts.push(format!(
+                        "base_url={}",
+                        ccrust_providers::get_gemini_base_url()
+                    ));
                 }
                 Ok(parts.join(" "))
             }
@@ -87,7 +92,7 @@ pub(crate) async fn handle_repl_slash_command(
                 return Ok(format!("current model={active_model}"));
             };
             let catalog = compatibility_model_catalog(provider);
-            if !matches!(provider, ApiProvider::OpenAICompatible)
+            if !matches!(provider, ApiProvider::OpenAICompatible | ApiProvider::Gemini)
                 && catalog.get_model(model).is_none()
             {
                 return Ok(format!("unknown compatibility model: {model}"));

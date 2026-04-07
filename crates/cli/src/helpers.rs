@@ -73,6 +73,8 @@ pub(crate) fn auth_hint_for_provider(provider: ApiProvider) -> String {
         ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible
     ) {
         get_openai_credential_hint(provider)
+    } else if provider == ApiProvider::Gemini {
+        ccrust_providers::get_gemini_credential_hint()
     } else {
         get_anthropic_credential_hint(provider)
     }
@@ -346,6 +348,8 @@ pub(crate) fn friendly_auth_source(source: Option<&str>) -> String {
     match source {
         Some("codex_auth_token") => "Codex refreshable token".to_owned(),
         Some("codex_auth_api_key") => "Codex API key".to_owned(),
+        Some("GEMINI_API_KEY") => "GEMINI_API_KEY".to_owned(),
+        Some("GOOGLE_API_KEY") => "GOOGLE_API_KEY".to_owned(),
         Some("OPENAI_API_KEY") => "OPENAI_API_KEY".to_owned(),
         Some("ANTHROPIC_API_KEY") => "ANTHROPIC_API_KEY".to_owned(),
         Some("CLAUDE_CODE_OAUTH_TOKEN") => "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),

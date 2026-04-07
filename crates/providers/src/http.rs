@@ -134,6 +134,37 @@ impl HttpProvider {
         )))
     }
 
+    async fn start_gemini_stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<Box<dyn ProviderStream>> {
+        let model = resolve_provider_model(ApiProvider::Gemini, &request.model);
+        let url = gemini_generate_content_url(&self.base_url, &model);
+        let payload = build_gemini_generate_content_payload(&request);
+
+        let response = self
+            .client
+            .post(url)
+            .headers(self.gemini_headers(&request.extra_headers)?)
+            .json(&payload)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "gemini request failed with status {}: {}",
+                status,
+                extract_gemini_error_detail(&body, &compact_error_body(&body))
+            ));
+        }
+
+        let value: Value = serde_json::from_str(&body)?;
+        Ok(Box::new(StaticProviderStream::new(
+            events_from_gemini_response(&value)?,
+        )))
+    }
+
     async fn start_openai_responses_stream(
         &self,
         request: ProviderRequest,
@@ -653,6 +684,29 @@ impl HttpProvider {
         Ok(headers)
     }
 
+    fn gemini_headers(&self, extra_headers: &BTreeMap<String, String>) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static(concat!("ccrust/", env!("CARGO_PKG_VERSION"))),
+        );
+
+        let api_key = self
+            .auth
+            .api_key
+            .as_deref()
+            .ok_or_else(|| anyhow!("missing Gemini API key"))?;
+        headers.insert(
+            HeaderName::from_static("x-goog-api-key"),
+            HeaderValue::from_str(api_key)?,
+        );
+
+        insert_extra_headers(&mut headers, extra_headers)?;
+        Ok(headers)
+    }
+
     async fn bedrock_headers(
         &self,
         url: &str,
@@ -841,6 +895,7 @@ impl Provider for HttpProvider {
     async fn start_stream(&self, request: ProviderRequest) -> Result<Box<dyn ProviderStream>> {
         match self.provider {
             ApiProvider::FirstParty => self.start_anthropic_stream(request).await,
+            ApiProvider::Gemini => self.start_gemini_stream(request).await,
             ApiProvider::OpenAICompatible => self.start_openai_responses_stream(request).await,
             ApiProvider::ChatGPTCodex => self.start_chatgpt_codex_stream(request).await,
             ApiProvider::Bedrock => self.start_bedrock_stream(request).await,
@@ -854,6 +909,7 @@ pub fn provider_base_url(provider: ApiProvider) -> String {
     match provider {
         ApiProvider::FirstParty => env::var("ANTHROPIC_BASE_URL")
             .unwrap_or_else(|_| "https://api.anthropic.com".to_owned()),
+        ApiProvider::Gemini => get_gemini_base_url(),
         ApiProvider::ChatGPTCodex => CHATGPT_CODEX_BASE_URL.to_owned(),
         ApiProvider::OpenAICompatible => env::var("OPENAI_BASE_URL")
             .ok()
@@ -1238,9 +1294,10 @@ pub(crate) fn resolve_provider_model(provider: ApiProvider, model: &str) -> Stri
         }
         ApiProvider::Vertex if normalized.contains('@') => normalized,
         ApiProvider::Foundry if !normalized.starts_with("claude-") => normalized,
-        ApiProvider::FirstParty | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
-            normalized
-        }
+        ApiProvider::FirstParty
+        | ApiProvider::Gemini
+        | ApiProvider::ChatGPTCodex
+        | ApiProvider::OpenAICompatible => normalized,
         ApiProvider::Bedrock => match normalized {
             "claude-3-7-sonnet-20250219" => "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
             "claude-3-5-sonnet-20241022" => "anthropic.claude-3-5-sonnet-20241022-v2:0",
@@ -1474,7 +1531,7 @@ fn anthropic_prompt_cache_control(
         ApiProvider::Bedrock | ApiProvider::Vertex | ApiProvider::Foundry => {
             Some(json!({ "type": "ephemeral" }))
         }
-        ApiProvider::OpenAICompatible | ApiProvider::ChatGPTCodex => None,
+        ApiProvider::Gemini | ApiProvider::OpenAICompatible | ApiProvider::ChatGPTCodex => None,
     }
 }
 
@@ -1742,6 +1799,366 @@ pub(crate) fn openai_chat_messages(request: &ProviderRequest) -> Vec<Value> {
     }
 
     encoded
+}
+
+fn gemini_generate_content_url(base_url: &str, model: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let encoded_model = utf8_percent_encode(model, URI_COMPONENT_ENCODE_SET).to_string();
+    format!("{trimmed}/models/{encoded_model}:generateContent")
+}
+
+fn extract_gemini_error_detail(raw_body: &str, fallback: &str) -> String {
+    let parsed = serde_json::from_str::<Value>(raw_body).ok();
+    let values = match parsed {
+        Some(Value::Array(values)) => values,
+        Some(value) => vec![value],
+        None => return fallback.to_owned(),
+    };
+
+    for value in values {
+        if let Some(message) = value
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+        {
+            return message.to_owned();
+        }
+    }
+
+    fallback.to_owned()
+}
+
+fn gemini_tool_name_map(messages: &[Message]) -> BTreeMap<String, String> {
+    let mut tool_names = BTreeMap::new();
+
+    for message in messages {
+        if message.role != MessageRole::Assistant {
+            continue;
+        }
+
+        for call in message.blocks.iter().filter_map(|block| match block {
+            ContentBlock::ToolCall { call } => Some(call),
+            _ => None,
+        }) {
+            tool_names.insert(call.id.clone(), call.name.clone());
+        }
+    }
+
+    tool_names
+}
+
+fn gemini_user_parts(message: &Message) -> Vec<Value> {
+    let mut parts = Vec::new();
+
+    for block in &message.blocks {
+        match block {
+            ContentBlock::Text { text } if !text.trim().is_empty() => {
+                parts.push(json!({ "text": text }));
+            }
+            ContentBlock::Attachment { attachment } => {
+                parts.push(json!({
+                    "text": format!("[Attachment omitted: {}]", attachment.name),
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    parts
+}
+
+fn gemini_assistant_parts(message: &Message) -> Vec<Value> {
+    let mut parts = Vec::new();
+
+    for block in &message.blocks {
+        match block {
+            ContentBlock::Text { text } if !text.trim().is_empty() => {
+                parts.push(json!({ "text": text }));
+            }
+            ContentBlock::ToolCall { call } => {
+                let mut part = json!({
+                    "functionCall": {
+                        "id": call.id,
+                        "name": call.name,
+                        "args": parse_tool_input(&call.input_json),
+                    }
+                });
+                if let Some(thought_signature) = call
+                    .thought_signature
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    part["thoughtSignature"] = Value::String(thought_signature.to_owned());
+                }
+                parts.push(part);
+            }
+            _ => {}
+        }
+    }
+
+    parts
+}
+
+fn gemini_tool_parts(message: &Message, tool_names: &BTreeMap<String, String>) -> Vec<Value> {
+    let mut parts = Vec::new();
+
+    for result in message.blocks.iter().filter_map(|block| match block {
+        ContentBlock::ToolResult { result } => Some(result),
+        _ => None,
+    }) {
+        let mut response = serde_json::Map::new();
+        if result.is_error {
+            response.insert(
+                "error".to_owned(),
+                Value::String(if result.output_text.trim().is_empty() {
+                    "Tool execution failed.".to_owned()
+                } else {
+                    result.output_text.clone()
+                }),
+            );
+        } else {
+            response.insert(
+                "output".to_owned(),
+                Value::String(result.output_text.clone()),
+            );
+        }
+
+        parts.push(json!({
+            "functionResponse": {
+                "id": result.tool_call_id,
+                "name": tool_names
+                    .get(&result.tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| result.tool_call_id.clone()),
+                "response": Value::Object(response),
+            }
+        }));
+    }
+
+    parts
+}
+
+pub(crate) fn build_gemini_generate_content_payload(request: &ProviderRequest) -> Value {
+    let mut contents = Vec::new();
+    let tool_names = gemini_tool_name_map(&request.messages);
+
+    for message in &request.messages {
+        let parts = match message.role {
+            MessageRole::System | MessageRole::Attachment => continue,
+            MessageRole::User => gemini_user_parts(message),
+            MessageRole::Assistant => gemini_assistant_parts(message),
+            MessageRole::Tool => gemini_tool_parts(message, &tool_names),
+        };
+
+        if parts.is_empty() {
+            continue;
+        }
+
+        contents.push(json!({
+            "role": match message.role {
+                MessageRole::Assistant => "model",
+                _ => "user",
+            },
+            "parts": parts,
+        }));
+    }
+
+    let mut payload = json!({
+        "contents": contents,
+    });
+
+    if let Some(system_prompt) = request_system_prompt_text(request) {
+        payload["systemInstruction"] = json!({
+            "parts": [{ "text": system_prompt }],
+        });
+    }
+
+    if !request.tools.is_empty() {
+        payload["tools"] = json!([
+            {
+                "functionDeclarations": request
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parametersJsonSchema": tool.input_schema,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            }
+        ]);
+        payload["toolConfig"] = json!({
+            "functionCallingConfig": {
+                "mode": "AUTO",
+            }
+        });
+    }
+
+    let mut generation_config = serde_json::Map::new();
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        generation_config.insert(
+            "maxOutputTokens".to_owned(),
+            Value::Number(max_output_tokens.into()),
+        );
+    }
+    match &request.thinking {
+        ThinkingConfig::Adaptive => {
+            generation_config.insert(
+                "thinkingConfig".to_owned(),
+                json!({
+                    "includeThoughts": true,
+                }),
+            );
+        }
+        ThinkingConfig::Enabled { budget_tokens } => {
+            generation_config.insert(
+                "thinkingConfig".to_owned(),
+                json!({
+                    "includeThoughts": true,
+                    "thinkingBudget": budget_tokens,
+                }),
+            );
+        }
+        ThinkingConfig::Disabled => {}
+    }
+    if !generation_config.is_empty() {
+        payload["generationConfig"] = Value::Object(generation_config);
+    }
+
+    payload
+}
+
+fn gemini_usage(value: &Value) -> Option<TokenUsage> {
+    let usage = value.get("usageMetadata")?;
+    Some(TokenUsage {
+        input_tokens: usage
+            .get("promptTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        output_tokens: usage
+            .get("candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            + usage
+                .get("thoughtsTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: usage
+            .get("cachedContentTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+    })
+}
+
+pub(crate) fn events_from_gemini_response(value: &Value) -> Result<Vec<ProviderEvent>> {
+    if let Some(block_reason) = value
+        .get("promptFeedback")
+        .and_then(|feedback| feedback.get("blockReason"))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        return Err(anyhow!("gemini request blocked: {block_reason}"));
+    }
+
+    let candidate = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first());
+    let mut events = Vec::new();
+    let mut saw_tool_calls = false;
+
+    if let Some(parts) = candidate
+        .and_then(|candidate| candidate.get("content"))
+        .and_then(|content| content.get("parts"))
+        .and_then(Value::as_array)
+    {
+        for (index, part) in parts.iter().enumerate() {
+            if let Some(function_call) = part.get("functionCall") {
+                let name = function_call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("gemini functionCall missing name"))?
+                    .to_owned();
+                let id = function_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("gemini_call_{index}"));
+                let args = function_call
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                events.push(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: id.clone(),
+                        name,
+                        input_json: serde_json::to_string(&args)?,
+                        thought_signature: part
+                            .get("thoughtSignature")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .filter(|value| !value.trim().is_empty()),
+                    },
+                });
+                events.push(ProviderEvent::ToolCallBoundary { id });
+                saw_tool_calls = true;
+                continue;
+            }
+
+            let is_thought = part
+                .get("thought")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if is_thought {
+                continue;
+            }
+
+            if let Some(text) = part
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+            {
+                events.push(ProviderEvent::MessageDelta {
+                    text: text.to_owned(),
+                });
+            }
+        }
+    }
+
+    if events.is_empty() {
+        if let Some(text) = candidate
+            .and_then(|candidate| candidate.get("finishMessage"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        {
+            events.push(ProviderEvent::MessageDelta {
+                text: text.to_owned(),
+            });
+        }
+    }
+
+    if let Some(usage) = gemini_usage(value) {
+        events.push(ProviderEvent::Usage { usage });
+    }
+
+    let finish_reason = candidate
+        .and_then(|candidate| candidate.get("finishReason"))
+        .and_then(Value::as_str);
+    events.push(ProviderEvent::Stop {
+        reason: if saw_tool_calls {
+            "tool_use".to_owned()
+        } else if finish_reason == Some("MAX_TOKENS") {
+            "max_tokens".to_owned()
+        } else {
+            "end_turn".to_owned()
+        },
+    });
+
+    Ok(events)
 }
 
 pub(crate) fn resolve_reasoning_effort(model: &str) -> String {

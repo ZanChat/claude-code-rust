@@ -42,6 +42,13 @@ pub struct OpenAIAuthStatus {
     pub token_freshness: OpenAITokenFreshness,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GeminiAuthStatus {
+    pub has_credentials: bool,
+    pub source: GeminiAuthSource,
+    pub api_key: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CodexAuthTokens {
     pub access_token: Option<String>,
@@ -98,10 +105,72 @@ pub enum OpenAITokenFreshness {
     Missing,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GeminiAuthSource {
+    #[serde(rename = "GEMINI_API_KEY")]
+    GeminiApiKey,
+    #[serde(rename = "GOOGLE_API_KEY")]
+    GoogleApiKey,
+    #[serde(rename = "none")]
+    None,
+}
+
+pub fn get_gemini_auth_status() -> GeminiAuthStatus {
+    if let Ok(api_key) = env::var("GEMINI_API_KEY") {
+        if !api_key.trim().is_empty() {
+            return GeminiAuthStatus {
+                has_credentials: true,
+                source: GeminiAuthSource::GeminiApiKey,
+                api_key: Some(api_key),
+            };
+        }
+    }
+
+    if let Ok(api_key) = env::var("GOOGLE_API_KEY") {
+        if !api_key.trim().is_empty() {
+            return GeminiAuthStatus {
+                has_credentials: true,
+                source: GeminiAuthSource::GoogleApiKey,
+                api_key: Some(api_key),
+            };
+        }
+    }
+
+    GeminiAuthStatus {
+        has_credentials: false,
+        source: GeminiAuthSource::None,
+        api_key: None,
+    }
+}
+
+pub fn get_gemini_credential_hint() -> String {
+    "Set GEMINI_API_KEY or GOOGLE_API_KEY.".to_owned()
+}
+
 #[async_trait]
 impl AuthResolver for EnvironmentAuthResolver {
     async fn resolve_auth(&self, request: AuthRequest) -> Result<AuthMaterial> {
         match request.provider {
+            ApiProvider::Gemini => {
+                let status = get_gemini_auth_status();
+                if status.has_credentials {
+                    return Ok(AuthMaterial {
+                        api_key: status.api_key,
+                        source: Some(
+                            match status.source {
+                                GeminiAuthSource::GeminiApiKey => "GEMINI_API_KEY",
+                                GeminiAuthSource::GoogleApiKey => "GOOGLE_API_KEY",
+                                GeminiAuthSource::None => "none",
+                            }
+                            .to_owned(),
+                        ),
+                        ..AuthMaterial::default()
+                    });
+                }
+
+                read_provider_auth_snapshot(request.provider)
+                    .ok_or_else(|| anyhow!(get_gemini_credential_hint()))
+            }
             ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
                 let status = get_openai_auth_status(request.provider);
                 if status.has_credentials {

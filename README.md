@@ -1,6 +1,6 @@
 # ccrust
 
-The `claude-code-rust` repository builds the `ccrust` binary: a Rust-native reimplementation of Claude Code agent workflows with support for tasks, tools, plugins, MCP, and multiple providers, for example Claude Code and Anthropic, OpenAI ChatGPT codex plan, and OpenAI-compatible providers like OpenRouter and Gemini Vertex AI. It is targeted fully compatible with Claude's official Claude Code with fully rewriting with Rust.
+The `claude-code-rust` repository builds the `ccrust` binary: a Rust-native reimplementation of Claude Code agent workflows with support for tasks, tools, plugins, MCP, and multiple providers, including Anthropic, native Gemini, ChatGPT Codex, and OpenAI-compatible backends such as OpenRouter. It is targeted fully compatible with Claude's official Claude Code with fully rewriting with Rust.
 
 You can use your own Codex Plan with Claude Code's agent workflow.
 
@@ -84,7 +84,23 @@ ccrust --provider openai-compatible
 The interactive `/login` flow also includes presets for OpenAI, OpenRouter,
 Gemini, and a custom OpenAI-compatible base URL.
 
-### 3. ChatGPT Codex
+### 3. Gemini — Native Gemini API
+
+Native Gemini is the preferred way to use Gemini with `ccrust`.
+
+```bash
+export GEMINI_API_KEY="..."
+ccrust --provider gemini
+```
+
+The native Gemini provider defaults to:
+- reasoning model: `GEMINI_REASONING_MODEL` or `gemini-2.5-pro`
+- fast model: `GEMINI_COMPLETION_MODEL` or `gemini-2.5-flash`
+- base URL: `GEMINI_BASE_URL` or `https://generativelanguage.googleapis.com/v1beta`
+
+`GOOGLE_API_KEY` is also accepted, but the interactive `/login` flow saves it as `GEMINI_API_KEY` so the setup stays provider-specific.
+
+### 4. ChatGPT Codex
 
 Uses `~/.codex/auth.json` for authentication with automatic token refresh:
 
@@ -92,7 +108,7 @@ Uses `~/.codex/auth.json` for authentication with automatic token refresh:
 ccrust --provider chatgpt-codex
 ```
 
-### 4. Amazon Bedrock
+### 5. Amazon Bedrock
 
 ```bash
 export AWS_ACCESS_KEY_ID="..."
@@ -101,14 +117,14 @@ export AWS_REGION="us-east-1"
 ccrust --provider bedrock
 ```
 
-### 5. Google Cloud Vertex AI
+### 6. Google Cloud Vertex AI
 
 ```bash
 export VERTEX_ACCESS_TOKEN="..."
 ccrust --provider vertex
 ```
 
-### 6. Azure AI Foundry
+### 7. Azure AI Foundry
 
 ```bash
 export ANTHROPIC_FOUNDRY_API_KEY="..."
@@ -121,13 +137,15 @@ ccrust --provider foundry
 
 | Variable | Description | Default |
 |---|---|---|
-| `CLAUDE_CODE_API_PROVIDER` | Override the active provider (`firstParty`, `openai-compatible`, `chatgpt-codex`, `bedrock`, `vertex`, `foundry`). `openai` is accepted as a legacy alias for `openai-compatible`. | `firstParty` |
+| `CLAUDE_CODE_API_PROVIDER` | Override the active provider (`firstParty`, `gemini`, `openai-compatible`, `chatgpt-codex`, `bedrock`, `vertex`, `foundry`). `openai` is accepted as a legacy alias for `openai-compatible`. | `firstParty` |
 
 ### Authentication
 
 | Variable | Description |
 |---|---|
 | `ANTHROPIC_API_KEY` | API key for Anthropic first-party provider |
+| `GEMINI_API_KEY` | API key for the native Gemini provider |
+| `GOOGLE_API_KEY` | Alternative API key for the native Gemini provider |
 | `OPENAI_API_KEY` | API key / bearer token for OpenAI-family providers |
 | `AWS_ACCESS_KEY_ID` | AWS access key for Bedrock |
 | `AWS_SECRET_ACCESS_KEY` | AWS secret key for Bedrock |
@@ -145,6 +163,7 @@ ccrust --provider foundry
 | Variable | Description | Default |
 |---|---|---|
 | `ANTHROPIC_BASE_URL` | Override Anthropic API endpoint | `https://api.anthropic.com` |
+| `GEMINI_BASE_URL` | Override Gemini API endpoint | `https://generativelanguage.googleapis.com/v1beta` |
 | `OPENAI_BASE_URL` | Override OpenAI API endpoint | `https://api.openai.com/v1` |
 | `ANTHROPIC_BEDROCK_BASE_URL` / `BEDROCK_BASE_URL` | Override Bedrock endpoint | Auto-detected from region |
 | `ANTHROPIC_VERTEX_BASE_URL` / `VERTEX_BASE_URL` | Override Vertex AI endpoint | Auto-detected from project/region |
@@ -157,6 +176,8 @@ ccrust --provider foundry
 |---|---|---|
 | `REASONING_MODEL` | Model for thinking-enabled turns | `gpt-5.4` |
 | `COMPLETION_MODEL` | Model for standard and utility turns | `gpt-5.3-codex` |
+| `GEMINI_REASONING_MODEL` | Default model for native Gemini main turns | `gemini-2.5-pro` |
+| `GEMINI_COMPLETION_MODEL` | Default model for native Gemini fast turns | `gemini-2.5-flash` |
 
 ### OpenAI Thinking
 

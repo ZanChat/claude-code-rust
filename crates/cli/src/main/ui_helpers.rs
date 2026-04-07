@@ -772,6 +772,7 @@ fn provider_supports_live_runtime(provider: ApiProvider) -> bool {
             | ApiProvider::Bedrock
             | ApiProvider::Vertex
             | ApiProvider::Foundry
+            | ApiProvider::Gemini
             | ApiProvider::ChatGPTCodex
             | ApiProvider::OpenAICompatible
     )

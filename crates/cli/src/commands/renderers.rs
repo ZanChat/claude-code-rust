@@ -56,6 +56,8 @@ pub(crate) fn render_status_command(
         "fast_mode": settings.fast_mode,
         "advisor_model": settings.advisor_model,
         "chrome_default_enabled": settings.chrome_default_enabled,
+        "gemini_base_url": (provider == ApiProvider::Gemini)
+            .then(ccrust_providers::get_gemini_base_url),
         "openai_api_mode": ccrust_providers::is_openai_provider(provider)
             .then(|| ccrust_providers::get_openai_api_mode(provider).as_str()),
         "openai_transport": ccrust_providers::is_openai_provider(provider)
@@ -917,7 +919,7 @@ pub(crate) fn render_fast_command(
     let settings = load_command_settings();
     let provider_supports_fast_mode = matches!(
         provider,
-        ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible
+        ApiProvider::Gemini | ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible
     );
     let Some(arg) = invocation
         .args
@@ -935,7 +937,7 @@ pub(crate) fn render_fast_command(
             String::new()
         } else {
             format!(
-                "\nSaved fast-mode preferences only affect chatgpt-codex and openai-compatible sessions."
+                "\nSaved fast-mode preferences only affect gemini, chatgpt-codex, and openai-compatible sessions."
             )
         };
         return Ok(FastCommandOutcome {
@@ -967,7 +969,7 @@ pub(crate) fn render_fast_command(
         if provider_supports_fast_mode {
             "Fast mode enabled.".to_owned()
         } else {
-            "Fast mode enabled for supported OpenAI-family sessions. The current provider does not change models for fast mode.".to_owned()
+            "Fast mode enabled for supported Gemini and OpenAI-family sessions. The current provider does not change models for fast mode.".to_owned()
         }
     } else {
         "Fast mode disabled.".to_owned()

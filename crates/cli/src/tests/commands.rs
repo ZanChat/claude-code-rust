@@ -1501,7 +1501,7 @@ fn fast_command_reports_when_current_provider_does_not_apply_it() {
     .unwrap();
     assert!(current
         .message
-        .contains("chatgpt-codex and openai-compatible"));
+        .contains("gemini, chatgpt-codex, and openai-compatible"));
 
     let enabled = render_fast_command(
         &CommandInvocation {
@@ -1515,7 +1515,7 @@ fn fast_command_reports_when_current_provider_does_not_apply_it() {
     .unwrap();
     assert!(enabled
         .message
-        .contains("enabled for supported OpenAI-family sessions"));
+        .contains("enabled for supported Gemini and OpenAI-family sessions"));
     assert!(enabled.next_model.is_none());
 }
 

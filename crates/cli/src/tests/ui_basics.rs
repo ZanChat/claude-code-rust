@@ -1,4 +1,5 @@
 use super::*;
+use crate::managed_login_values_from_environment;
 use crossterm::event::KeyboardEnhancementFlags;
 
 #[test]
@@ -257,6 +258,22 @@ fn resolve_launch_provider_uses_default_when_nothing_is_configured() {
 }
 
 #[test]
+fn resolve_launch_provider_accepts_gemini_from_env() {
+    let selection = with_env_vars(&[("CLAUDE_CODE_API_PROVIDER", Some("gemini"))], || {
+        resolve_launch_provider(
+            None,
+            &StartupPreferences::default(),
+            &ManagedLoginConfigState::default(),
+        )
+    })
+    .unwrap();
+
+    assert_eq!(selection.provider, ApiProvider::Gemini);
+    assert!(selection.configured);
+    assert_eq!(selection.source, LaunchProviderSource::Env);
+}
+
+#[test]
 fn config_env_files_load_with_local_override_but_real_env_wins() {
     let root = temp_session_root("config-env-order");
     let home = temp_session_root("config-env-home");
@@ -326,6 +343,39 @@ fn resolve_launch_provider_reports_config_file_source() {
             assert_eq!(selection.provider, ApiProvider::OpenAICompatible);
             assert!(selection.configured);
             assert_eq!(selection.source, LaunchProviderSource::ConfigFile);
+        },
+    );
+}
+
+#[test]
+fn managed_login_values_from_environment_maps_google_api_key_to_gemini_key() {
+    with_env_vars(
+        &[
+            ("GEMINI_API_KEY", None),
+            ("GOOGLE_API_KEY", Some("google-key")),
+            (
+                "GEMINI_BASE_URL",
+                Some("https://generativelanguage.googleapis.com/v1beta"),
+            ),
+            ("GEMINI_REASONING_MODEL", Some("gemini-2.5-pro")),
+            ("GEMINI_COMPLETION_MODEL", Some("gemini-2.5-flash")),
+        ],
+        || {
+            let values = managed_login_values_from_environment(ApiProvider::Gemini);
+
+            assert_eq!(
+                values.get("CLAUDE_CODE_API_PROVIDER"),
+                Some(&"gemini".to_owned())
+            );
+            assert_eq!(values.get("GEMINI_API_KEY"), Some(&"google-key".to_owned()));
+            assert_eq!(
+                values.get("GEMINI_REASONING_MODEL"),
+                Some(&"gemini-2.5-pro".to_owned())
+            );
+            assert_eq!(
+                values.get("GEMINI_COMPLETION_MODEL"),
+                Some(&"gemini-2.5-flash".to_owned())
+            );
         },
     );
 }

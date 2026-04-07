@@ -1,5 +1,5 @@
 use anyhow::Result;
-use ccrust_providers::{get_openai_completion_model, ApiProvider};
+use ccrust_providers::{get_gemini_completion_model, get_openai_completion_model, ApiProvider};
 use ccrust_session::claude_config_home_dir;
 use ccrust_ui::set_runtime_ui_theme;
 use serde::{Deserialize, Serialize};
@@ -131,13 +131,14 @@ pub(crate) fn preferred_model_for_provider(
     provider: ApiProvider,
     settings: &CommandSettings,
 ) -> Option<String> {
-    if settings.fast_mode
-        && matches!(
-            provider,
-            ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible
-        )
-    {
-        return Some(get_openai_completion_model());
+    if settings.fast_mode {
+        return match provider {
+            ApiProvider::Gemini => Some(get_gemini_completion_model()),
+            ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible => {
+                Some(get_openai_completion_model())
+            }
+            _ => None,
+        };
     }
 
     None

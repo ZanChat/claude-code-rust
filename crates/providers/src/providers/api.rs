@@ -15,6 +15,8 @@ pub enum ApiProvider {
     Vertex,
     #[serde(rename = "foundry")]
     Foundry,
+    #[serde(rename = "gemini")]
+    Gemini,
     #[serde(rename = "chatgpt-codex")]
     ChatGPTCodex,
     #[serde(rename = "openai-compatible", alias = "openai")]
@@ -23,11 +25,12 @@ pub enum ApiProvider {
 
 
 impl ApiProvider {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::FirstParty,
         Self::Bedrock,
         Self::Vertex,
         Self::Foundry,
+        Self::Gemini,
         Self::ChatGPTCodex,
         Self::OpenAICompatible,
     ];
@@ -38,6 +41,7 @@ impl ApiProvider {
             Self::Bedrock => "bedrock",
             Self::Vertex => "vertex",
             Self::Foundry => "foundry",
+            Self::Gemini => "gemini",
             Self::ChatGPTCodex => "chatgpt-codex",
             Self::OpenAICompatible => "openai-compatible",
         }
@@ -59,6 +63,7 @@ impl FromStr for ApiProvider {
             "bedrock" => Ok(Self::Bedrock),
             "vertex" => Ok(Self::Vertex),
             "foundry" => Ok(Self::Foundry),
+            "gemini" => Ok(Self::Gemini),
             "openai" => Ok(Self::OpenAICompatible),
             "chatgpt-codex" => Ok(Self::ChatGPTCodex),
             "openai-compatible" => Ok(Self::OpenAICompatible),

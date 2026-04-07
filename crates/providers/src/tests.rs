@@ -1,16 +1,17 @@
 use super::{
     codex_auth_file_path, collect_provider_response, collect_provider_text,
     compatibility_model_catalog, decode_jwt_claims, events_from_anthropic_response,
-    events_from_openai_response, events_from_openai_sse_body, get_anthropic_auth_material,
-    get_openai_api_mode, get_openai_auth_status, get_openai_credential_hint,
-    get_openai_family_capabilities, get_openai_transport_mode, get_token_freshness,
-    is_openai_provider, provider_base_url, provider_descriptor, refresh_codex_access_token,
-    resolve_api_provider, resolve_provider_model, sign_bedrock_request, ApiProvider, AuthMaterial,
-    AuthRequest, AuthResolver, EchoProvider, EnvironmentAuthResolver, HttpProvider, ModelCatalog,
-    OpenAIApiMode, OpenAIAuthSource, OpenAIFamilyCapabilities, OpenAITokenFreshness,
-    OpenAITransportMode, PromptBlockStability, PromptCacheScope, ProviderRequest,
-    ProviderToolDefinition, SystemPromptBlock, DEFAULT_OPENAI_COMPLETION_MODEL,
-    DEFAULT_OPENAI_REASONING_MODEL,
+    events_from_gemini_response, events_from_openai_response, events_from_openai_sse_body,
+    get_anthropic_auth_material, get_gemini_credential_hint, get_openai_api_mode,
+    get_openai_auth_status, get_openai_credential_hint, get_openai_family_capabilities,
+    get_openai_transport_mode, get_token_freshness, is_openai_provider, provider_base_url,
+    provider_descriptor, refresh_codex_access_token, resolve_api_provider, resolve_provider_model,
+    sign_bedrock_request, ApiProvider, AuthMaterial, AuthRequest, AuthResolver, EchoProvider,
+    EnvironmentAuthResolver, HttpProvider, ModelCatalog, OpenAIApiMode, OpenAIAuthSource,
+    OpenAIFamilyCapabilities, OpenAITokenFreshness, OpenAITransportMode, PromptBlockStability,
+    PromptCacheScope, ProviderRequest, ProviderToolDefinition, SystemPromptBlock,
+    DEFAULT_GEMINI_COMPLETION_MODEL, DEFAULT_GEMINI_REASONING_MODEL,
+    DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
 };
 use ccrust_core::{ContentBlock, Message, MessageRole, ToolCall};
 use serde_json::json;
@@ -419,6 +420,11 @@ fn openai_provider_hint_mentions_expected_setup() {
 }
 
 #[test]
+fn gemini_provider_hint_mentions_expected_setup() {
+    assert!(get_gemini_credential_hint().contains("GEMINI_API_KEY"));
+}
+
+#[test]
 fn exposes_provider_descriptors_and_model_catalogs() {
     let descriptor = provider_descriptor(ApiProvider::Foundry);
     let catalog = compatibility_model_catalog(ApiProvider::OpenAICompatible);
@@ -427,6 +433,16 @@ fn exposes_provider_descriptors_and_model_catalogs() {
     assert!(descriptor.supports_tool_use);
     assert!(catalog.get_model(DEFAULT_OPENAI_REASONING_MODEL).is_some());
     assert!(catalog.get_model(DEFAULT_OPENAI_COMPLETION_MODEL).is_some());
+}
+
+#[test]
+fn gemini_catalog_uses_native_default_models() {
+    let descriptor = provider_descriptor(ApiProvider::Gemini);
+    let catalog = compatibility_model_catalog(ApiProvider::Gemini);
+
+    assert_eq!(descriptor.display_name, "Google Gemini");
+    assert!(catalog.get_model(DEFAULT_GEMINI_REASONING_MODEL).is_some());
+    assert!(catalog.get_model(DEFAULT_GEMINI_COMPLETION_MODEL).is_some());
 }
 
 #[test]
@@ -543,6 +559,31 @@ async fn resolves_auth_from_environment() {
     }
 
     assert_eq!(auth.api_key.as_deref(), Some("openai-key"));
+}
+
+#[tokio::test]
+async fn resolves_gemini_auth_from_environment() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let previous = env::var("GEMINI_API_KEY").ok();
+    env::set_var("GEMINI_API_KEY", "gemini-key");
+
+    let resolver = EnvironmentAuthResolver;
+    let auth = resolver
+        .resolve_auth(AuthRequest {
+            provider: ApiProvider::Gemini,
+            profile: None,
+        })
+        .await
+        .unwrap();
+
+    match previous {
+        Some(value) => env::set_var("GEMINI_API_KEY", value),
+        None => env::remove_var("GEMINI_API_KEY"),
+    }
+
+    assert_eq!(auth.api_key.as_deref(), Some("gemini-key"));
+    assert_eq!(auth.source.as_deref(), Some("GEMINI_API_KEY"));
 }
 
 #[tokio::test]
@@ -687,6 +728,33 @@ fn serializes_openai_chat_tool_call_thought_signature() {
         encoded[1]["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
         "signature-a"
     );
+}
+
+#[test]
+fn parses_native_gemini_tool_call_thought_signature() {
+    let events = events_from_gemini_response(&json!({
+        "candidates": [{
+            "content": {
+                "parts": [{
+                    "functionCall": {
+                        "id": "call_123",
+                        "name": "file_read",
+                        "args": {"path": "src/main.rs"}
+                    },
+                    "thoughtSignature": "signature-a"
+                }]
+            },
+            "finishReason": "STOP"
+        }]
+    }))
+    .unwrap();
+
+    assert!(matches!(
+        &events[0],
+        super::ProviderEvent::ToolCall { call }
+            if call.id == "call_123"
+                && call.thought_signature.as_deref() == Some("signature-a")
+    ));
 }
 
 #[test]
@@ -1106,6 +1174,121 @@ async fn retries_openai_compatible_chat_completions_send_failures() {
     assert_eq!(body["messages"][0]["role"], "system");
     assert_eq!(body["messages"][0]["content"], "Gemini instructions");
     assert_eq!(body["messages"][1]["role"], "user");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sends_native_gemini_generate_content_requests() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let (base_url, server) = spawn_json_server(json!({
+        "candidates": [{
+            "content": {
+                "parts": [
+                    { "text": "Need to inspect the file." },
+                    {
+                        "functionCall": {
+                            "id": "call_123",
+                            "name": "file_read",
+                            "args": { "path": "src/main.rs" }
+                        },
+                        "thoughtSignature": "signature-a"
+                    }
+                ]
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 11,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 2
+        }
+    }))
+    .await;
+    let provider = HttpProvider::with_base_url(
+        ApiProvider::Gemini,
+        AuthMaterial {
+            api_key: Some("gemini-key".to_owned()),
+            ..AuthMaterial::default()
+        },
+        format!("{base_url}/v1beta"),
+    );
+    let request = ProviderRequest {
+        model: DEFAULT_GEMINI_REASONING_MODEL.to_owned(),
+        system_prompt: vec![SystemPromptBlock::new(
+            "Gemini instructions",
+            PromptBlockStability::Static,
+            Some(PromptCacheScope::Global),
+        )],
+        messages: vec![
+            Message::new(
+                MessageRole::User,
+                vec![ContentBlock::Text {
+                    text: "hello gemini".to_owned(),
+                }],
+            ),
+            Message::new(
+                MessageRole::Assistant,
+                vec![ContentBlock::ToolCall {
+                    call: ToolCall {
+                        id: "call_123".to_owned(),
+                        name: "file_read".to_owned(),
+                        input_json: "{\"path\":\"src/main.rs\"}".to_owned(),
+                        thought_signature: Some("signature-a".to_owned()),
+                    },
+                }],
+            ),
+            Message::new(
+                MessageRole::Tool,
+                vec![ContentBlock::ToolResult {
+                    result: ccrust_core::ToolResult {
+                        tool_call_id: "call_123".to_owned(),
+                        output_text: "fn main() {}".to_owned(),
+                        is_error: false,
+                    },
+                }],
+            ),
+        ],
+        tools: vec![ProviderToolDefinition {
+            name: "file_read".to_owned(),
+            description: "Read a file".to_owned(),
+            input_schema: json!({"type":"object"}),
+        }],
+        ..ProviderRequest::default()
+    };
+
+    let collected = collect_provider_response(&provider, request).await.unwrap();
+    let captured = server.join().unwrap();
+    let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+
+    assert_eq!(collected.text, "Need to inspect the file.");
+    assert_eq!(captured.method, "POST");
+    assert_eq!(
+        captured.path,
+        format!("/v1beta/models/{DEFAULT_GEMINI_REASONING_MODEL}:generateContent")
+    );
+    assert_eq!(
+        captured.headers.get("x-goog-api-key").map(String::as_str),
+        Some("gemini-key")
+    );
+    assert_eq!(
+        body["systemInstruction"]["parts"][0]["text"],
+        "Gemini instructions"
+    );
+    assert_eq!(body["contents"][0]["role"], "user");
+    assert_eq!(body["contents"][1]["role"], "model");
+    assert_eq!(
+        body["contents"][1]["parts"][0]["thoughtSignature"],
+        "signature-a"
+    );
+    assert_eq!(body["contents"][2]["role"], "user");
+    assert_eq!(
+        body["contents"][2]["parts"][0]["functionResponse"]["name"],
+        "file_read"
+    );
+    assert_eq!(
+        body["tools"][0]["functionDeclarations"][0]["name"],
+        "file_read"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
