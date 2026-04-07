@@ -36,6 +36,42 @@ fn builtin_commands_are_wired_for_repl_and_noninteractive_handlers() {
 }
 
 #[test]
+fn help_command_includes_ts_parity_commands_and_shortcuts() {
+    let help = render_command_help(&compatibility_command_registry(), false);
+
+    for command in [
+        "/add-dir",
+        "/batch",
+        "/branch",
+        "/btw",
+        "/color",
+        "/context",
+        "/debug",
+        "/init",
+        "/insights",
+        "/pr-comments",
+        "/security-review",
+        "/simplify",
+        "/terminal-setup",
+        "/update-config",
+    ] {
+        assert!(help.contains(command), "missing {command} in help output");
+    }
+
+    for shortcut in [
+        "Prompt helpers:",
+        "/btw <question>",
+        "Shortcuts:",
+        "Ctrl+R",
+        "Ctrl+E",
+        "Ctrl+C",
+        "switch panes",
+    ] {
+        assert!(help.contains(shortcut), "missing {shortcut} in help output");
+    }
+}
+
+#[test]
 fn startup_screens_show_provider_onboarding_when_provider_is_missing() {
     let root = temp_session_root("startup-first-run");
     let session_root = root.join(".sessions");

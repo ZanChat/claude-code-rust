@@ -11,6 +11,36 @@
       "args": []
     },
     {
+      "input": "/settings",
+      "name": "config",
+      "args": []
+    },
+    {
+      "input": "/fork spike-session",
+      "name": "branch",
+      "args": ["spike-session"]
+    },
+    {
+      "input": "/btw why is the picker empty",
+      "name": "btw",
+      "args": ["why", "is", "the", "picker", "empty"]
+    },
+    {
+      "input": "/bug paste handling is broken",
+      "name": "feedback",
+      "args": ["paste", "handling", "is", "broken"]
+    },
+    {
+      "input": "/app",
+      "name": "desktop",
+      "args": []
+    },
+    {
+      "input": "/reload-auth",
+      "name": "reload-auth",
+      "args": []
+    },
+    {
       "input": "/plugin bridge-status ./fixtures/plugin-fixtures/review-tools",
       "name": "plugin",
       "args": ["bridge-status", "./fixtures/plugin-fixtures/review-tools"]

@@ -29,6 +29,121 @@ Keep the review direct and actionable.
 PR number: $ARGUMENTS
 "#;
 
+const BUILTIN_BATCH_PROMPT: &str = r#"
+You are coordinating a large, parallelizable change across this codebase.
+
+User request: $ARGUMENTS
+
+1. Research the affected areas before editing anything.
+2. Break the work into independent units that can be implemented and validated separately.
+3. Use task-planning or agent/task orchestration tools when available to parallelize the work safely.
+4. For each unit, make the change, run focused validation, and track progress clearly.
+5. Finish with a concise summary of completed units, validation, and remaining risks.
+
+If the request is empty, ask the user what batch change they want to make.
+"#;
+
+const BUILTIN_BTW_PROMPT: &str = r#"
+You are handling a quick side question that should not derail the main task.
+
+Answer the side question directly and briefly. Preserve awareness of the broader task, but do not rewrite the main plan unless the user asks.
+
+Side question: $ARGUMENTS
+"#;
+
+const BUILTIN_DEBUG_PROMPT: &str = r#"
+Help the user debug the current Rust runtime session or a parity issue.
+
+Use the current transcript plus slash-command status surfaces such as /status, /session, /config, /skills, /agents, /mcp, or /plugin when relevant. Read workspace files under .claude/ if they matter.
+
+Explain the most likely root cause, call out missing TS parity explicitly when that is the issue, and suggest concrete next steps.
+
+User issue: $ARGUMENTS
+"#;
+
+const BUILTIN_INIT_PROMPT: &str = r#"
+Initialize or refresh project guidance for this repository.
+
+Inspect the codebase and create or update CLAUDE.md with:
+- project purpose and structure
+- build, test, and development commands
+- coding conventions
+- validation workflow
+
+Avoid duplicating stale boilerplate. If CLAUDE.md already exists, refine it in place.
+
+User notes: $ARGUMENTS
+"#;
+
+const BUILTIN_INSIGHTS_PROMPT: &str = r#"
+Generate an insights report about the user's Claude Code work.
+
+Inspect available transcripts, recent session artifacts, and repository context. Summarize repeated tasks, bottlenecks, failure patterns, and the highest-value next actions.
+
+If historical session data is unavailable, say so explicitly and base the report on the current session only.
+
+Focus: $ARGUMENTS
+"#;
+
+const BUILTIN_PR_COMMENTS_PROMPT: &str = r#"
+Fetch and summarize GitHub pull request comments.
+
+1. Determine the current PR with `gh pr view` unless the user supplied a target.
+2. Fetch PR-level and review comments with `gh api`.
+3. Summarize actionable comments by file or thread.
+4. If there are no comments, say so clearly.
+
+Requested scope: $ARGUMENTS
+"#;
+
+const BUILTIN_SECURITY_REVIEW_PROMPT: &str = r#"
+Perform a security review of the pending changes or requested scope.
+
+Inspect the diff, prioritize exploitable issues, and report only concrete findings. Focus on authentication, secrets, injection, filesystem access, network boundaries, sandboxing, and permission-policy regressions.
+
+If there are no concrete issues, say that explicitly and mention any remaining validation gaps.
+
+Scope: $ARGUMENTS
+"#;
+
+const BUILTIN_SIMPLIFY_PROMPT: &str = r#"
+Review the changed files for duplication, unnecessary complexity, weak abstractions, and avoidable work.
+
+Reuse existing helpers where possible. Fix the issues you find, then summarize what changed and what validation ran.
+
+Additional focus: $ARGUMENTS
+"#;
+
+const BUILTIN_UPDATE_CONFIG_PROMPT: &str = r#"
+Update Claude Code configuration, settings, hooks, or permission files safely.
+
+Relevant files often include:
+- ~/.claude/settings.json
+- .claude/settings.json
+- .claude/settings.local.json
+- CLAUDE.md
+
+Preserve scope boundaries between user, project, and local settings. Explain what you changed and why.
+
+Requested config change: $ARGUMENTS
+"#;
+
+fn builtin_prompt_content(name: &str) -> Option<&'static str> {
+    match name {
+        "batch" => Some(BUILTIN_BATCH_PROMPT),
+        "btw" => Some(BUILTIN_BTW_PROMPT),
+        "debug" => Some(BUILTIN_DEBUG_PROMPT),
+        "init" => Some(BUILTIN_INIT_PROMPT),
+        "insights" => Some(BUILTIN_INSIGHTS_PROMPT),
+        "pr-comments" => Some(BUILTIN_PR_COMMENTS_PROMPT),
+        "review" => Some(BUILTIN_REVIEW_PROMPT),
+        "security-review" => Some(BUILTIN_SECURITY_REVIEW_PROMPT),
+        "simplify" => Some(BUILTIN_SIMPLIFY_PROMPT),
+        "update-config" => Some(BUILTIN_UPDATE_CONFIG_PROMPT),
+        _ => None,
+    }
+}
+
 fn strip_matching_quotes(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.len() >= 2 {
@@ -255,15 +370,12 @@ fn resolve_prompt_command_definition(
     plugin_root: Option<&PathBuf>,
 ) -> Option<ResolvedPromptCommand> {
     if spec.source == CommandSource::BuiltIn {
-        return match spec.name.as_str() {
-            "review" => Some(ResolvedPromptCommand {
-                content: BUILTIN_REVIEW_PROMPT.to_owned(),
-                base_dir: None,
-                plugin_root: PathBuf::new(),
-                argument_names: Vec::new(),
-            }),
-            _ => None,
-        };
+        return builtin_prompt_content(&spec.name).map(|content| ResolvedPromptCommand {
+            content: content.to_owned(),
+            base_dir: None,
+            plugin_root: PathBuf::new(),
+            argument_names: Vec::new(),
+        });
     }
 
     let root = resolve_plugin_root_with_override(plugin_root, None, cwd);

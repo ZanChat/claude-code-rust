@@ -16,17 +16,55 @@ pub(crate) async fn handle_slash_command(
     match invocation.name.as_str() {
         "help" => println!("{}", render_command_help(registry, false)),
         "version" => println!("{}", env!("CARGO_PKG_VERSION")),
+        "add-dir" => println!(
+            "{}",
+            render_simple_compat_command(
+                "add-dir",
+                "Working-directory expansion is not modeled yet in the Rust runtime. Reopen the session from the target path when you need to pivot into another directory.",
+            )?
+        ),
+        "branch" => {
+            let requested_title = invocation_argument_string(&invocation);
+            let messages = if raw_messages.is_empty() {
+                store.load_session(session_id).await.unwrap_or_default()
+            } else {
+                raw_messages.to_vec()
+            };
+            let outcome = create_branch_session(
+                store,
+                session_id,
+                &messages,
+                requested_title.as_deref(),
+            )
+            .await?;
+            println!("{}", render_branch_command_message(&outcome, false));
+        }
         "session" => println!("{}", render_session_command(store, session_id).await?),
         "permissions" => println!("{}", render_permissions_command(cwd).await?),
         "status" => println!("{}", render_status_command(provider, active_model, session_id, live_runtime, cwd)?),
         "ide" => println!("{}", render_ide_command(cwd, ide_bridge_enabled(cli), ide_bridge_address(cli))?),
         "statusline" => println!("{}", render_statusline_command(provider, active_model, session_id)?),
+        "color" => println!(
+            "{}",
+            render_simple_compat_command(
+                "color",
+                "Prompt-bar color overrides are not implemented in the Rust runtime yet. Use /theme for terminal palette changes.",
+            )?
+        ),
         "theme" => println!("{}", render_theme_command(&invocation)?),
         "vim" => println!("{}", render_vim_command(false)?),
         "plan" => println!("{}", render_plan_command(cwd, &invocation)?),
+        "doctor" => println!(
+            "{}",
+            render_simple_compat_command(
+                "doctor",
+                "Compatibility diagnostics are still minimal in the Rust runtime. Use /status, /config, /mcp, /plugin, and /skills to inspect the active setup.",
+            )?
+        ),
         "fast" => println!("{}", render_fast_command(&invocation, provider, active_model)?.message),
         "passes" => println!("{}", render_simple_compat_command("passes", "Pass-count tuning is not yet modeled separately in the Rust runtime.")?),
         "effort" => println!("{}", render_effort_command(cwd, &invocation)?),
+        "context" => println!("{}", render_context_command(raw_messages, provider, active_model)?),
         "tag" => println!("{}", render_tag_command(store, session_id, &invocation).await?),
         "rename" => {
             let messages = if raw_messages.is_empty() {
@@ -47,9 +85,59 @@ pub(crate) async fn handle_slash_command(
         "skills" => println!("{}", render_skills_command(cwd, cli.plugin_root.as_ref()).await?),
         "reload-plugins" => println!("{}", render_skills_command(cwd, cli.plugin_root.as_ref()).await?),
         "hooks" => println!("{}", render_hooks_command(cwd, cli.plugin_root.as_ref())?),
+        "feedback" => println!(
+            "{}",
+            render_simple_compat_command(
+                "feedback",
+                "Interactive feedback submission is not bundled into the Rust runtime yet.",
+            )?
+        ),
+        "install-github-app" => println!(
+            "{}",
+            render_simple_compat_command(
+                "install-github-app",
+                "The GitHub Actions setup UI is not bundled into the Rust runtime yet.",
+            )?
+        ),
+        "longtask" => println!(
+            "{}",
+            render_simple_compat_command(
+                "longtask",
+                "The long-running wrapper REPL is not modeled separately in the Rust runtime yet.",
+            )?
+        ),
         "mobile" => println!("{}", render_mobile_command(store, session_id).await?),
         "desktop" => println!("{}", render_desktop_command(store, session_id).await?),
         "chrome" => println!("{}", render_chrome_command(&invocation)?),
+        "release-notes" => println!(
+            "{}",
+            render_simple_compat_command(
+                "release-notes",
+                "A dedicated release-notes viewer is not bundled into the Rust runtime yet.",
+            )?
+        ),
+        "reload-auth" => println!("{}", render_reload_auth_command(provider)?),
+        "sandbox" => println!(
+            "{}",
+            render_simple_compat_command(
+                "sandbox",
+                "Sandbox policy toggles are not wired into the Rust runtime yet. Use the surrounding shell or launch configuration to control sandboxing.",
+            )?
+        ),
+        "stickers" => println!(
+            "{}",
+            render_simple_compat_command(
+                "stickers",
+                "Sticker ordering is not available in the Rust runtime.",
+            )?
+        ),
+        "terminal-setup" => println!(
+            "{}",
+            render_simple_compat_command(
+                "terminal-setup",
+                "Terminal keybinding installers are not bundled into the Rust runtime yet. Configure your terminal to send a dedicated newline shortcut if you need one.",
+            )?
+        ),
         "output-style" => println!("{}", render_output_style_command()?),
         "files" => println!("{}", render_files_command(raw_messages, cwd)?),
         "diff" => println!("{}", render_diff_command(raw_messages)?),

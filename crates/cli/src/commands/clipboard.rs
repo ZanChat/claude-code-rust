@@ -161,18 +161,47 @@ pub(crate) async fn render_skills_command(
     Ok(lines.join("\n"))
 }
 
+    fn help_pane_shortcut_label() -> &'static str {
+        let term_program = std::env::var("TERM_PROGRAM").ok();
+        if cfg!(target_os = "macos") {
+            if term_program.as_deref() == Some("vscode") {
+                "Ctrl/Alt+1-6"
+            } else if term_program.as_deref() == Some("Apple_Terminal") {
+                "Alt+1-6"
+            } else {
+                "Cmd/Ctrl/Alt+1-6"
+            }
+        } else {
+            "Ctrl/Alt+1-6"
+        }
+    }
+
 pub(crate) fn render_command_help(registry: &CommandRegistry, remote_only: bool) -> String {
     let commands = if remote_only {
         registry.remote_safe()
     } else {
         registry.all()
     };
-    let mut lines = vec!["REPL commands:".to_owned()];
+        let mut lines = vec!["Commands:".to_owned()];
     lines.extend(
         commands
             .into_iter()
             .map(|spec| format!("/{:<16} {}", spec.name, spec.description)),
     );
+
+        lines.push(String::new());
+        lines.push("Prompt helpers:".to_owned());
+        lines.push("/                   list commands and command help".to_owned());
+        if !remote_only {
+            lines.push("/btw <question>     ask a side question without leaving the main task".to_owned());
+        }
+
+        lines.push(String::new());
+        lines.push("Shortcuts:".to_owned());
+        lines.push("Ctrl+R              search prompt history".to_owned());
+        lines.push("Ctrl+E              toggle pending details or history groups".to_owned());
+        lines.push("Ctrl+C              interrupt the active turn".to_owned());
+        lines.push(format!("{:<20} switch panes", help_pane_shortcut_label()));
     lines.join("\n")
 }
 

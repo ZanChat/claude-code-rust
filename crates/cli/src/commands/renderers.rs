@@ -163,6 +163,282 @@ async fn persist_rewound_session(
     Ok(transcript_path)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BranchCommandOutcome {
+    pub(crate) source_session_id: SessionId,
+    pub(crate) branch_session_id: SessionId,
+    pub(crate) branch_transcript_path: PathBuf,
+    pub(crate) branch_messages: Vec<Message>,
+    pub(crate) saved_title: Option<String>,
+}
+
+fn first_branchable_prompt(raw_messages: &[Message]) -> Option<String> {
+    raw_messages.iter().find_map(|message| {
+        if message.role != MessageRole::User {
+            return None;
+        }
+
+        let text = collapse_whitespace(&message_text(message));
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed.starts_with('/') {
+            return None;
+        }
+
+        Some(preview_lines_from_text(trimmed.to_owned(), 1, 100).join(" "))
+    })
+}
+
+fn branch_title_base(metadata: &SessionMetadata, raw_messages: &[Message]) -> String {
+    metadata
+        .display_title()
+        .map(str::to_owned)
+        .or_else(|| first_branchable_prompt(raw_messages))
+        .unwrap_or_else(|| "Branched conversation".to_owned())
+}
+
+async fn next_branch_title(store: &ActiveSessionStore, base_title: &str) -> Result<Option<String>> {
+    let base_title = collapse_whitespace(base_title);
+    if base_title.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let existing_titles = store
+        .list_sessions()
+        .await?
+        .into_iter()
+        .filter_map(|summary| {
+            let metadata = load_session_metadata_for_path(&summary.transcript_path);
+            metadata
+                .display_title()
+                .map(str::to_owned)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .collect::<BTreeSet<_>>();
+
+    let candidate = format!("{base_title} (Branch)");
+    if !existing_titles.contains(&candidate) {
+        return Ok(Some(candidate));
+    }
+
+    let mut suffix = 2usize;
+    loop {
+        let numbered = format!("{base_title} (Branch {suffix})");
+        if !existing_titles.contains(&numbered) {
+            return Ok(Some(numbered));
+        }
+        suffix += 1;
+    }
+}
+
+pub(crate) async fn create_branch_session(
+    store: &ActiveSessionStore,
+    source_session_id: SessionId,
+    raw_messages: &[Message],
+    requested_title: Option<&str>,
+) -> Result<BranchCommandOutcome> {
+    if raw_messages.is_empty() {
+        return Err(anyhow!("No conversation to branch"));
+    }
+
+    let source_transcript_path = store.transcript_path(source_session_id).await?;
+    let source_metadata = load_session_metadata_for_path(&source_transcript_path);
+    let requested_title = requested_title
+        .map(collapse_whitespace)
+        .filter(|value| !value.trim().is_empty());
+    let saved_title = next_branch_title(
+        store,
+        requested_title
+            .as_deref()
+            .unwrap_or(&branch_title_base(&source_metadata, raw_messages)),
+    )
+    .await?;
+
+    let branch_session_id = SessionId::new_v4();
+    let branch_transcript_path = store.transcript_path(branch_session_id).await?;
+    let branch_messages = raw_messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            message.session_id = Some(branch_session_id);
+            message
+        })
+        .collect::<Vec<_>>();
+    write_transcript_messages(&branch_transcript_path, &branch_messages)?;
+
+    if let Some(title) = saved_title.as_ref() {
+        update_session_metadata_for_path(&branch_transcript_path, |metadata| {
+            metadata.custom_title = Some(title.clone());
+            metadata.agent_name = Some(title.clone());
+            metadata.tag = None;
+        })?;
+    }
+
+    Ok(BranchCommandOutcome {
+        source_session_id,
+        branch_session_id,
+        branch_transcript_path,
+        branch_messages,
+        saved_title,
+    })
+}
+
+pub(crate) fn render_branch_command_message(
+    outcome: &BranchCommandOutcome,
+    switched_to_branch: bool,
+) -> String {
+    let mut lines = vec![match outcome.saved_title.as_deref() {
+        Some(title) => format!("Branched conversation as {title}."),
+        None => "Branched conversation.".to_owned(),
+    }];
+    if switched_to_branch {
+        lines.push("You are now in the branch.".to_owned());
+    }
+    lines.push(format!(
+        "Branch: {}",
+        resume_command_for_session(outcome.branch_session_id)
+    ));
+    lines.push(format!(
+        "Resume the original: {}",
+        resume_command_for_session(outcome.source_session_id)
+    ));
+    lines.push(format!(
+        "Transcript: {}",
+        outcome.branch_transcript_path.display()
+    ));
+    lines.join("\n")
+}
+
+fn openai_auth_source_label(source: &ccrust_providers::OpenAIAuthSource) -> &'static str {
+    match source {
+        ccrust_providers::OpenAIAuthSource::OpenAiApiKey => "OPENAI_API_KEY",
+        ccrust_providers::OpenAIAuthSource::CodexAuthApiKey => "codex_auth_api_key",
+        ccrust_providers::OpenAIAuthSource::CodexAuthToken => "codex_auth_token",
+        ccrust_providers::OpenAIAuthSource::None => "none",
+    }
+}
+
+fn openai_token_freshness_label(
+    freshness: &ccrust_providers::OpenAITokenFreshness,
+) -> &'static str {
+    match freshness {
+        ccrust_providers::OpenAITokenFreshness::Fresh => "fresh",
+        ccrust_providers::OpenAITokenFreshness::Stale => "stale",
+        ccrust_providers::OpenAITokenFreshness::Expired => "expired",
+        ccrust_providers::OpenAITokenFreshness::Missing => "missing",
+    }
+}
+
+pub(crate) fn render_reload_auth_command(provider: ApiProvider) -> Result<String> {
+    if !ccrust_providers::is_openai_provider(provider) {
+        return Ok(format!(
+            "Current provider \"{provider}\" does not use file-based auth. No reload needed."
+        ));
+    }
+
+    let status = ccrust_providers::get_openai_auth_status(provider);
+    let mut lines = vec![format!(
+        "Auth credentials reloaded from: {}",
+        ccrust_providers::codex_auth_file_path().display()
+    )];
+    lines.push(format!("Provider: {provider}"));
+    lines.push(format!("Has credentials: {}", status.has_credentials));
+    lines.push(format!(
+        "Source: {}",
+        openai_auth_source_label(&status.source)
+    ));
+
+    if let Some(auth_mode) = status
+        .auth_mode
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("Auth mode: {auth_mode}"));
+    }
+    if let Some(email) = status
+        .email
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("Email: {email}"));
+    }
+    if let Some(account_id) = status
+        .account_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("Account ID: {account_id}"));
+    }
+    lines.push(format!(
+        "Token freshness: {}",
+        openai_token_freshness_label(&status.token_freshness)
+    ));
+    Ok(lines.join("\n"))
+}
+
+pub(crate) fn render_context_command(
+    raw_messages: &[Message],
+    provider: ApiProvider,
+    active_model: &str,
+) -> Result<String> {
+    let runtime_messages = materialize_runtime_messages(raw_messages);
+    let estimated_tokens = estimate_message_tokens(&runtime_messages);
+    let context_window = compatibility_model_catalog(provider)
+        .get_model(active_model)
+        .and_then(|model| model.context_window);
+    let usage_message_count = runtime_messages
+        .iter()
+        .filter(|message| message.metadata.usage.is_some())
+        .count();
+
+    let mut lines = vec!["Context usage".to_owned(), format!("Model: {active_model}")];
+    if raw_messages.len() == runtime_messages.len() {
+        lines.push(format!("Runtime messages: {}", runtime_messages.len()));
+    } else {
+        lines.push(format!(
+            "Runtime messages: {} (from {} transcript messages)",
+            runtime_messages.len(),
+            raw_messages.len()
+        ));
+    }
+
+    match context_window {
+        Some(window) => {
+            let percent = estimated_tokens as f64 * 100.0 / window as f64;
+            lines.push(format!(
+                "Estimated tokens: {estimated_tokens} / {window} ({percent:.1}%)"
+            ));
+            lines.push(format!(
+                "Estimated free space: {}",
+                window.saturating_sub(estimated_tokens)
+            ));
+        }
+        None => {
+            lines.push(format!("Estimated tokens: {estimated_tokens}"));
+            lines.push("Context window: unknown for this compatibility model".to_owned());
+        }
+    }
+
+    lines.push(format!(
+        "Responses with provider-reported usage: {usage_message_count}"
+    ));
+
+    if let Some(usage) = runtime_messages
+        .iter()
+        .rev()
+        .find_map(|message| message.metadata.usage.as_ref())
+    {
+        lines.push(format!(
+            "Latest response usage: input={} output={} cache_write={} cache_read={}",
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+        ));
+    }
+
+    Ok(lines.join("\n"))
+}
+
 fn effort_display_name(value: &str) -> &str {
     match value {
         "xhigh" => "max",
@@ -209,7 +485,11 @@ async fn handoff_lines(
     if let Some(title) = metadata.display_title() {
         lines.push(format!("Title: {title}"));
     }
-    if let Some(tag) = metadata.tag.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(tag) = metadata
+        .tag
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         lines.push(format!("Tag: #{tag}"));
     }
     lines.push(format!("Transcript: {}", transcript_path.display()));
@@ -451,7 +731,10 @@ fn open_path_in_editor(path: &Path) -> Result<()> {
     };
 
     if !status.success() {
-        bail!("editor exited unsuccessfully while opening {}", path.display());
+        bail!(
+            "editor exited unsuccessfully while opening {}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -561,7 +844,10 @@ fn format_agent_task_record(task: &TaskRecord) -> String {
         }
     )];
     lines.push(format!("ID: {}", task.id));
-    lines.push(format!("Status: {}", task_status_label(task.status.clone())));
+    lines.push(format!(
+        "Status: {}",
+        task_status_label(task.status.clone())
+    ));
     lines.push(format!("Kind: {}", task.kind));
     if let Some(session_id) = task.session_id {
         lines.push(format!("Session: {session_id}"));
@@ -572,7 +858,11 @@ fn format_agent_task_record(task: &TaskRecord) -> String {
     if let Some(artifact_path) = task.artifact_path.as_ref() {
         lines.push(format!("Artifact: {}", artifact_path.display()));
     }
-    if let Some(output) = task.output.as_ref().filter(|value| !value.trim().is_empty()) {
+    if let Some(output) = task
+        .output
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
         lines.push(String::new());
         lines.push("Output:".to_owned());
         lines.extend(preview_lines_from_text(output.clone(), 12, 96));
@@ -625,7 +915,11 @@ pub(crate) fn render_fast_command(
         provider,
         ApiProvider::ChatGPTCodex | ApiProvider::OpenAICompatible
     );
-    let Some(arg) = invocation.args.first().map(|value| value.trim().to_ascii_lowercase()) else {
+    let Some(arg) = invocation
+        .args
+        .first()
+        .map(|value| value.trim().to_ascii_lowercase())
+    else {
         let status = if settings.fast_mode && !provider_supports_fast_mode {
             "ON (inactive for current provider)"
         } else if settings.fast_mode {
@@ -675,11 +969,18 @@ pub(crate) fn render_fast_command(
         "Fast mode disabled.".to_owned()
     };
 
-    Ok(FastCommandOutcome { message, next_model })
+    Ok(FastCommandOutcome {
+        message,
+        next_model,
+    })
 }
 
 pub(crate) fn render_effort_command(cwd: &Path, invocation: &CommandInvocation) -> Result<String> {
-    let Some(arg) = invocation.args.first().map(|value| value.trim().to_ascii_lowercase()) else {
+    let Some(arg) = invocation
+        .args
+        .first()
+        .map(|value| value.trim().to_ascii_lowercase())
+    else {
         return Ok([
             current_effort_summary(),
             usage_line("effort", "[low|medium|high|max|auto]"),
@@ -698,7 +999,10 @@ pub(crate) fn render_effort_command(cwd: &Path, invocation: &CommandInvocation) 
         ]),
         "max" | "xhigh" => BTreeMap::from([
             ("REASONING_MODEL_THINK".to_owned(), Some("xhigh".to_owned())),
-            ("COMPLETION_MODEL_THINK".to_owned(), Some("xhigh".to_owned())),
+            (
+                "COMPLETION_MODEL_THINK".to_owned(),
+                Some("xhigh".to_owned()),
+            ),
         ]),
         _ => {
             return Ok([
@@ -756,6 +1060,26 @@ pub(crate) async fn render_tag_command(
     })
 }
 
+pub(crate) async fn render_branch_command(
+    store: &ActiveSessionStore,
+    repl_session: &mut ReplSessionState,
+    invocation: &CommandInvocation,
+    raw_messages: &mut Vec<Message>,
+) -> Result<String> {
+    let requested_title = invocation_argument_string(invocation);
+    let outcome = create_branch_session(
+        store,
+        repl_session.session_id,
+        raw_messages,
+        requested_title.as_deref(),
+    )
+    .await?;
+    repl_session.session_id = outcome.branch_session_id;
+    repl_session.transcript_path = Some(outcome.branch_transcript_path.clone());
+    *raw_messages = outcome.branch_messages.clone();
+    Ok(render_branch_command_message(&outcome, true))
+}
+
 pub(crate) async fn render_rename_command(
     store: &ActiveSessionStore,
     session_id: SessionId,
@@ -766,9 +1090,8 @@ pub(crate) async fn render_rename_command(
     let new_name = if let Some(arg) = invocation_argument_string(invocation) {
         collapse_whitespace(&arg)
     } else {
-        suggested_session_title(raw_messages).ok_or_else(|| {
-            anyhow!("Could not generate a name yet. Usage: /rename <name>")
-        })?
+        suggested_session_title(raw_messages)
+            .ok_or_else(|| anyhow!("Could not generate a name yet. Usage: /rename <name>"))?
     };
 
     if new_name.trim().is_empty() {
@@ -795,8 +1118,7 @@ pub(crate) async fn render_rewind_command(
 
     let Some(arg) = invocation.args.first() else {
         return Ok([
-            "Use the /rewind picker to choose a turn, or run /rewind <message-index>."
-                .to_owned(),
+            "Use the /rewind picker to choose a turn, or run /rewind <message-index>.".to_owned(),
             format!(
                 "Latest turn: {} ({})",
                 candidates[0].turn_number, candidates[0].preview
@@ -808,8 +1130,13 @@ pub(crate) async fn render_rewind_command(
     let Ok(raw_index) = arg.parse::<usize>() else {
         return Ok("/rewind expects a numeric message index from the picker.".to_owned());
     };
-    let Some(candidate) = candidates.iter().find(|candidate| candidate.raw_index == raw_index) else {
-        return Ok(format!("No rewind target found for message index {raw_index}."));
+    let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| candidate.raw_index == raw_index)
+    else {
+        return Ok(format!(
+            "No rewind target found for message index {raw_index}."
+        ));
     };
 
     raw_messages.truncate(candidate.raw_index.saturating_sub(1));
@@ -840,13 +1167,20 @@ pub(crate) async fn render_desktop_command(
 ) -> Result<String> {
     let (_, _, mut lines) = handoff_lines(store, session_id).await?;
     lines.insert(0, "Desktop handoff".to_owned());
-    lines.insert(1, format!("Resume: {}", resume_command_for_session(session_id)));
+    lines.insert(
+        1,
+        format!("Resume: {}", resume_command_for_session(session_id)),
+    );
     Ok(lines.join("\n"))
 }
 
 pub(crate) fn render_chrome_command(invocation: &CommandInvocation) -> Result<String> {
     let current_settings = load_command_settings();
-    let Some(arg) = invocation.args.first().map(|value| value.trim().to_ascii_lowercase()) else {
+    let Some(arg) = invocation
+        .args
+        .first()
+        .map(|value| value.trim().to_ascii_lowercase())
+    else {
         return Ok([
             format!(
                 "Claude in Chrome default: {}",
@@ -878,7 +1212,10 @@ pub(crate) fn render_chrome_command(invocation: &CommandInvocation) -> Result<St
             "Open the permissions page:\n{CHROME_PERMISSIONS_URL}"
         )),
         "reconnect" => Ok(format!("Open the reconnect page:\n{CHROME_RECONNECT_URL}")),
-        _ => Ok(usage_line("chrome", "[on|off|install|permissions|reconnect]")),
+        _ => Ok(usage_line(
+            "chrome",
+            "[on|off|install|permissions|reconnect]",
+        )),
     }
 }
 
@@ -1122,7 +1459,10 @@ pub(crate) fn render_export_command(
 ) -> Result<String> {
     Ok(format!(
         "Transcript export ready\nSession: {session_id}\nPath: {}",
-        store.root_dir().join(format!("{session_id}.jsonl")).display()
+        store
+            .root_dir()
+            .join(format!("{session_id}.jsonl"))
+            .display()
     ))
 }
 
@@ -1342,7 +1682,9 @@ pub(crate) async fn render_agents_command(
                 .filter(|task| is_agent_task_kind(task.kind.as_str()))
                 .collect::<Vec<_>>();
             if tasks.is_empty() {
-                return Ok("Agents\nNo agents found. Use /agents create <title> to start one.".to_owned());
+                return Ok(
+                    "Agents\nNo agents found. Use /agents create <title> to start one.".to_owned(),
+                );
             }
 
             let mut lines = vec![format!("Agents ({})", tasks.len())];

@@ -1231,6 +1231,45 @@ fn resolve_prompt_command_prompt_supports_builtin_review() {
 }
 
 #[test]
+fn resolve_prompt_command_prompt_supports_builtin_parity_prompts() {
+    let root = temp_session_root("builtin-parity-prompts");
+    let registry = compatibility_command_registry();
+    let session_id = SessionId::new_v4();
+
+    for (name, args, expected) in [
+        ("batch", "rename all session handlers", "independent units"),
+        (
+            "btw",
+            "does /branch create a new transcript?",
+            "quick side question",
+        ),
+        ("debug", "the command picker is empty", "/status"),
+        (
+            "update-config",
+            "allow Read in project settings",
+            ".claude/settings.json",
+        ),
+    ] {
+        let prompt = resolve_prompt_command_prompt(
+            &registry,
+            &CommandInvocation {
+                name: name.to_owned(),
+                args: args.split_whitespace().map(str::to_owned).collect(),
+                raw_input: format!("/{name} {args}"),
+            },
+            &root,
+            None,
+            session_id,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(prompt.contains(expected), "missing {expected} for /{name}");
+        assert!(prompt.contains(args), "missing args for /{name}");
+    }
+}
+
+#[test]
 fn settings_commands_persist_preferences_and_effort_env() {
     let home = temp_session_root("command-settings-home");
     let home_path = home.display().to_string();
@@ -1464,6 +1503,205 @@ async fn rename_tag_and_rewind_commands_persist_session_state() {
 }
 
 #[tokio::test]
+async fn repl_branch_command_clones_messages_into_new_session() {
+    let root = temp_session_root("repl-branch");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+    let mut raw_messages = vec![
+        build_text_message(
+            session_id,
+            MessageRole::User,
+            "Does /branch create a new transcript?".to_owned(),
+            None,
+        ),
+        build_text_message(
+            session_id,
+            MessageRole::Assistant,
+            "Yes, it should fork the session state.".to_owned(),
+            None,
+        ),
+    ];
+
+    let output = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "branch".to_owned(),
+            args: vec!["Auth handoff".to_owned()],
+            raw_input: "/branch Auth handoff".to_owned(),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let branch_session_id = repl_session.session_id;
+    let branch_transcript_path = store.transcript_path(branch_session_id).await.unwrap();
+    let branched_messages = store.load_session(branch_session_id).await.unwrap();
+    let metadata = load_session_metadata_for_path(&branch_transcript_path);
+
+    assert_ne!(branch_session_id, session_id);
+    assert!(output.contains("Branched conversation as Auth handoff (Branch)."));
+    assert!(output.contains(&resume_command_for_session(session_id)));
+    assert!(output.contains(&resume_command_for_session(branch_session_id)));
+    assert_eq!(branched_messages.len(), 2);
+    assert!(branched_messages
+        .iter()
+        .all(|message| message.session_id == Some(branch_session_id)));
+    assert_eq!(
+        message_text(&branched_messages[0]),
+        "Does /branch create a new transcript?"
+    );
+    assert_eq!(raw_messages, branched_messages);
+    assert_eq!(
+        metadata.custom_title.as_deref(),
+        Some("Auth handoff (Branch)")
+    );
+}
+
+#[test]
+fn reload_auth_command_reports_codex_auth_file_status() {
+    let home = temp_session_root("reload-auth-home");
+    write_test_file(
+        &home.join("auth.json"),
+        r#"{
+              "OPENAI_API_KEY": "sk-test"
+            }"#,
+    );
+    let home_path = home.display().to_string();
+
+    with_env_vars(
+        &[
+            ("CODEX_HOME", Some(&home_path)),
+            ("OPENAI_API_KEY", None),
+            ("OPENAI_BASE_URL", None),
+        ],
+        || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let root = temp_session_root("reload-auth-command");
+                let store =
+                    ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+                let tool_registry = compatibility_tool_registry();
+                let registry = resolved_command_registry(&root, None).await;
+                let session_id = SessionId::new_v4();
+                let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+                let mut vim_state = ccrust_ui::vim::VimState::default();
+                let mut repl_session = repl_session_state(session_id);
+                let mut raw_messages = Vec::new();
+
+                let output = handle_repl_slash_command(
+                    &registry,
+                    CommandInvocation {
+                        name: "reload-auth".to_owned(),
+                        args: vec![],
+                        raw_input: "/reload-auth".to_owned(),
+                    },
+                    &store,
+                    &tool_registry,
+                    &root,
+                    None,
+                    ApiProvider::OpenAICompatible,
+                    &mut active_model,
+                    &mut repl_session,
+                    &mut raw_messages,
+                    false,
+                    &mut vim_state,
+                    false,
+                    false,
+                )
+                .await
+                .unwrap();
+
+                assert!(output.contains(&home.join("auth.json").display().to_string()));
+                assert!(output.contains("Has credentials: true"));
+                assert!(output.contains("Source: codex_auth_api_key"));
+            });
+        },
+    );
+}
+
+#[tokio::test]
+async fn context_command_reports_estimated_usage() {
+    let root = temp_session_root("context-command");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+    let tool_registry = compatibility_tool_registry();
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+    let mut assistant = build_text_message(
+        session_id,
+        MessageRole::Assistant,
+        "Summarized answer".to_owned(),
+        None,
+    );
+    assistant.metadata.usage = Some(ccrust_core::TokenUsage {
+        input_tokens: 64,
+        output_tokens: 12,
+        cache_creation_input_tokens: 8,
+        cache_read_input_tokens: 4,
+    });
+    let mut raw_messages = vec![
+        build_text_message(
+            session_id,
+            MessageRole::User,
+            "Estimate current context usage".to_owned(),
+            None,
+        ),
+        assistant,
+    ];
+
+    let output = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "context".to_owned(),
+            args: vec![],
+            raw_input: "/context".to_owned(),
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(output.contains("Context usage"));
+    assert!(output.contains(&format!("Model: {DEFAULT_OPENAI_REASONING_MODEL}")));
+    assert!(output.contains("Runtime messages: 2"));
+    assert!(output.contains("Estimated tokens:"));
+    assert!(output.contains("Latest response usage: input=64 output=12 cache_write=8 cache_read=4"));
+}
+
+#[tokio::test]
 async fn targeted_command_outputs_do_not_use_placeholder_copy() {
     let root = temp_session_root("command-placeholder-copy");
     let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
@@ -1497,6 +1735,11 @@ async fn targeted_command_outputs_do_not_use_placeholder_copy() {
             raw_input: "/effort".to_owned(),
         },
         CommandInvocation {
+            name: "context".to_owned(),
+            args: vec![],
+            raw_input: "/context".to_owned(),
+        },
+        CommandInvocation {
             name: "mobile".to_owned(),
             args: vec![],
             raw_input: "/mobile".to_owned(),
@@ -1515,6 +1758,11 @@ async fn targeted_command_outputs_do_not_use_placeholder_copy() {
             name: "advisor".to_owned(),
             args: vec![],
             raw_input: "/advisor".to_owned(),
+        },
+        CommandInvocation {
+            name: "reload-auth".to_owned(),
+            args: vec![],
+            raw_input: "/reload-auth".to_owned(),
         },
     ];
     let banned = [
