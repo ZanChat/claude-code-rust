@@ -2,12 +2,14 @@ use super::{
     codex_auth_file_path, collect_provider_response, collect_provider_text,
     compatibility_model_catalog, decode_jwt_claims, events_from_anthropic_response,
     events_from_openai_response, events_from_openai_sse_body, get_anthropic_auth_material,
-    get_openai_auth_status, get_openai_credential_hint, get_token_freshness, is_openai_provider,
-    provider_base_url, provider_descriptor, refresh_codex_access_token, resolve_api_provider,
-    resolve_provider_model, sign_bedrock_request, ApiProvider, AuthMaterial, AuthRequest,
-    AuthResolver, EchoProvider, EnvironmentAuthResolver, HttpProvider, ModelCatalog,
-    OpenAIAuthSource, OpenAITokenFreshness, PromptBlockStability, PromptCacheScope,
-    ProviderRequest, ProviderToolDefinition, SystemPromptBlock, DEFAULT_OPENAI_COMPLETION_MODEL,
+    get_openai_api_mode, get_openai_auth_status, get_openai_credential_hint,
+    get_openai_family_capabilities, get_openai_transport_mode, get_token_freshness,
+    is_openai_provider, provider_base_url, provider_descriptor, refresh_codex_access_token,
+    resolve_api_provider, resolve_provider_model, sign_bedrock_request, ApiProvider, AuthMaterial,
+    AuthRequest, AuthResolver, EchoProvider, EnvironmentAuthResolver, HttpProvider, ModelCatalog,
+    OpenAIApiMode, OpenAIAuthSource, OpenAIFamilyCapabilities, OpenAITokenFreshness,
+    OpenAITransportMode, PromptBlockStability, PromptCacheScope, ProviderRequest,
+    ProviderToolDefinition, SystemPromptBlock, DEFAULT_OPENAI_COMPLETION_MODEL,
     DEFAULT_OPENAI_REASONING_MODEL,
 };
 use ccrust_core::{ContentBlock, Message, MessageRole, ToolCall};
@@ -18,8 +20,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::LazyLock;
 use time::{Date, Month, PrimitiveDateTime, Time};
+use tokio::sync::Mutex;
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -35,7 +38,7 @@ fn fixture_json(relative: &str) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug)]
 struct CapturedHttpRequest {
@@ -43,6 +46,20 @@ struct CapturedHttpRequest {
     path: String,
     headers: BTreeMap<String, String>,
     body: String,
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => env::set_var(self.key, value),
+            None => env::remove_var(self.key),
+        }
+    }
 }
 
 fn read_captured_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
@@ -153,6 +170,43 @@ async fn spawn_flaky_json_server(
     (format!("http://{address}"), handle)
 }
 
+async fn spawn_openai_transport_fallback_server(
+    response_body: serde_json::Value,
+) -> (String, std::thread::JoinHandle<Vec<CapturedHttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let body_string = serde_json::to_string(&response_body).unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut captured = Vec::new();
+
+        let (mut websocket_stream, _) = listener.accept().unwrap();
+        captured.push(read_captured_http_request(&mut websocket_stream));
+        websocket_stream
+            .write_all(
+                b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+
+        let (mut sse_stream, _) = listener.accept().unwrap();
+        captured.push(read_captured_http_request(&mut sse_stream));
+        let sse_body = "temporary SSE failure";
+        let sse_response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            sse_body.len(),
+            sse_body
+        );
+        sse_stream.write_all(sse_response.as_bytes()).unwrap();
+
+        let (mut rest_stream, _) = listener.accept().unwrap();
+        captured.push(read_captured_http_request(&mut rest_stream));
+        write_json_response(&mut rest_stream, &body_string);
+
+        captured
+    });
+
+    (format!("http://{address}/v1"), handle)
+}
+
 fn with_env_var(key: &str, value: Option<&str>, f: impl FnOnce()) {
     let previous = env::var(key).ok();
     match value {
@@ -167,8 +221,17 @@ fn with_env_var(key: &str, value: Option<&str>, f: impl FnOnce()) {
 }
 
 fn with_env_lock<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.blocking_lock();
     f()
+}
+
+fn set_env_var(key: &'static str, value: Option<&str>) -> EnvVarGuard {
+    let previous = env::var(key).ok();
+    match value {
+        Some(value) => env::set_var(key, value),
+        None => env::remove_var(key),
+    }
+    EnvVarGuard { key, previous }
 }
 
 #[test]
@@ -257,10 +320,8 @@ fn treats_undecodable_tokens_as_fresh_for_openai_compatibility() {
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn refreshes_codex_auth_atomically() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    drop(_guard); // Fix await_holding_lock, it's just a test, but better use a different mutex or drop it
+    let _guard = ENV_LOCK.lock().await;
 
     let root = env::temp_dir().join(format!(
         "codex-refresh-{}-{}",
@@ -274,8 +335,8 @@ async fn refreshes_codex_auth_atomically() {
     fs::create_dir_all(&root).unwrap();
     let auth_path = root.join("auth.json");
     fs::write(
-            &auth_path,
-            r#"{
+        &auth_path,
+        r#"{
   "auth_mode":"chatgpt",
   "tokens":{
     "access_token":"header.eyJleHAiOjEsImNsaWVudF9pZCI6ImNsaWVudDEyMyIsImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSJ9.signature",
@@ -284,15 +345,15 @@ async fn refreshes_codex_auth_atomically() {
     "account_id":"acct_123"
   }
 }"#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
     let (base_url, server) = spawn_json_server(json!({
-            "access_token": "header.eyJleHAiOjQ3MDAwMDAwMDAsImNsaWVudF9pZCI6ImNsaWVudDEyMyIsImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSJ9.signature",
-            "refresh_token": "new-refresh-token",
-            "id_token": "header.eyJhdWQiOlsiY2xpZW50MTIzIl0sImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSJ9.signature"
-        }))
-        .await;
+        "access_token": "header.eyJleHAiOjQ3MDAwMDAwMDAsImNsaWVudF9pZCI6ImNsaWVudDEyMyIsImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSJ9.signature",
+        "refresh_token": "new-refresh-token",
+        "id_token": "header.eyJhdWQiOlsiY2xpZW50MTIzIl0sImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSJ9.signature"
+    }))
+    .await;
 
     let previous_auth_url = env::var("OPENAI_AUTH_URL").ok();
     env::set_var("OPENAI_AUTH_URL", &base_url);
@@ -308,11 +369,11 @@ async fn refreshes_codex_auth_atomically() {
     let captured = server.join().unwrap();
 
     assert_eq!(
-            refreshed.as_deref(),
-            Some(
-                "header.eyJleHAiOjQ3MDAwMDAwMDAsImNsaWVudF9pZCI6ImNsaWVudDEyMyIsImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSJ9.signature"
-            )
-        );
+        refreshed.as_deref(),
+        Some(
+            "header.eyJleHAiOjQ3MDAwMDAwMDAsImNsaWVudF9pZCI6ImNsaWVudDEyMyIsImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSJ9.signature"
+        )
+    );
     assert_eq!(captured.method, "POST");
     assert_eq!(captured.path, "/");
     assert!(captured.body.contains("grant_type=refresh_token"));
@@ -400,6 +461,56 @@ fn detects_gemini_openai_compatible_chat_completions_mode() {
 }
 
 #[test]
+fn honors_openai_routing_env_overrides() {
+    with_env_lock(|| {
+        with_env_var("OPENAI_API_MODE", Some("responses"), || {
+            with_env_var("OPENAI_TRANSPORT", Some("sse"), || {
+                assert_eq!(
+                    get_openai_api_mode(ApiProvider::OpenAICompatible),
+                    OpenAIApiMode::Responses
+                );
+                assert_eq!(get_openai_transport_mode(), OpenAITransportMode::Sse);
+            });
+        });
+    });
+}
+
+#[test]
+fn openai_compatible_capabilities_disable_websockets_for_openrouter() {
+    let capabilities = get_openai_family_capabilities(
+        ApiProvider::OpenAICompatible,
+        Some("https://openrouter.ai/api/v1"),
+    );
+
+    assert_eq!(
+        capabilities,
+        OpenAIFamilyCapabilities {
+            supports_responses: true,
+            supports_chat_completions: true,
+            supports_websocket: false,
+            supports_sse: true,
+            supports_rest: true,
+        }
+    );
+}
+
+#[test]
+fn openai_api_mode_override_controls_chat_completions_detection() {
+    with_env_lock(|| {
+        with_env_var("OPENAI_API_MODE", Some("responses"), || {
+            assert!(!super::openai_compatible_uses_chat_completions(
+                "https://generativelanguage.googleapis.com/v1beta/openai"
+            ));
+        });
+        with_env_var("OPENAI_API_MODE", Some("chat-completions"), || {
+            assert!(super::openai_compatible_uses_chat_completions(
+                "https://compat.example/v1"
+            ));
+        });
+    });
+}
+
+#[test]
 fn reads_anthropic_env_auth_material() {
     with_env_lock(|| {
         with_env_var("ANTHROPIC_API_KEY", Some("anthropic-key"), || {
@@ -411,10 +522,8 @@ fn reads_anthropic_env_auth_material() {
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn resolves_auth_from_environment() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    drop(_guard);
+    let _guard = ENV_LOCK.lock().await;
 
     let previous = env::var("OPENAI_API_KEY").ok();
     env::set_var("OPENAI_API_KEY", "openai-key");
@@ -868,6 +977,9 @@ async fn sends_foundry_messages_requests() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sends_openai_responses_requests() {
+    let _guard = ENV_LOCK.lock().await;
+    let _transport = set_env_var("OPENAI_TRANSPORT", Some("sse"));
+
     let (base_url, server) = spawn_json_server(json!({
         "output": [
             {
@@ -935,6 +1047,8 @@ async fn sends_openai_responses_requests() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retries_openai_compatible_chat_completions_send_failures() {
+    let _guard = ENV_LOCK.lock().await;
+
     let (base_url, server) = spawn_flaky_json_server(json!({
         "choices": [{
             "message": {
@@ -996,6 +1110,9 @@ async fn retries_openai_compatible_chat_completions_send_failures() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sends_chatgpt_codex_responses_requests() {
+    let _guard = ENV_LOCK.lock().await;
+    let _transport = set_env_var("OPENAI_TRANSPORT", Some("sse"));
+
     let (base_url, server) = spawn_json_server(json!({
         "output": [
             {
@@ -1045,6 +1162,58 @@ async fn sends_chatgpt_codex_responses_requests() {
     assert_eq!(body["instructions"], "Codex instructions");
     assert_eq!(body["stream"], true);
     assert_eq!(body["input"][0]["role"], "user");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn falls_back_from_websocket_to_sse_to_rest_for_openai_responses() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let (base_url, server) = spawn_openai_transport_fallback_server(json!({
+        "output": [
+            {
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "rest fallback ok" }]
+            }
+        ],
+        "usage": { "input_tokens": 9, "output_tokens": 3 }
+    }))
+    .await;
+    let provider = HttpProvider::with_base_url(
+        ApiProvider::OpenAICompatible,
+        AuthMaterial {
+            api_key: Some("openai-key".to_owned()),
+            bearer_token: Some("openai-key".to_owned()),
+            ..AuthMaterial::default()
+        },
+        base_url,
+    );
+    let request = ProviderRequest {
+        model: "gpt-5.4".to_owned(),
+        messages: vec![Message::new(
+            MessageRole::User,
+            vec![ContentBlock::Text {
+                text: "hello fallback".to_owned(),
+            }],
+        )],
+        ..ProviderRequest::default()
+    };
+
+    let collected = collect_provider_response(&provider, request).await.unwrap();
+    let captured = server.join().unwrap();
+    let sse_body: serde_json::Value = serde_json::from_str(&captured[1].body).unwrap();
+    let rest_body: serde_json::Value = serde_json::from_str(&captured[2].body).unwrap();
+
+    assert_eq!(collected.text, "rest fallback ok");
+    assert_eq!(captured[0].method, "GET");
+    assert_eq!(captured[0].path, "/v1/responses");
+    assert_eq!(
+        captured[0].headers.get("openai-beta").map(String::as_str),
+        Some("responses_websockets=2026-02-06")
+    );
+    assert_eq!(captured[1].path, "/v1/responses");
+    assert_eq!(captured[2].path, "/v1/responses");
+    assert_eq!(sse_body["stream"], true);
+    assert_eq!(rest_body["stream"], false);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

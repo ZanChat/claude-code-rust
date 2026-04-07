@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 ccrust-core = { path = "../core" }
+futures-util.workspace = true
 hmac.workspace = true
 hex.workspace = true
 percent-encoding.workspace = true
@@ -17,3 +18,4 @@ serde_json.workspace = true
 sha2.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true

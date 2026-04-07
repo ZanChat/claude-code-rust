@@ -6,9 +6,18 @@ use std::env;
 
 use std::time::Duration;
 
+use futures_util::SinkExt;
+
 use tokio::time::sleep;
 
 use tokio::process::Command;
+
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{
+    HeaderName as WsHeaderName, HeaderValue as WsHeaderValue,
+};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use ccrust_core::{ContentBlock, Message, MessageRole};
 
@@ -29,6 +38,7 @@ use hmac::Mac;
 use sha2::{Digest, Sha256};
 
 const OFFICIAL_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const OPENAI_RESPONSES_WEBSOCKETS_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
 
 #[derive(Clone, Debug)]
 pub struct HttpProvider {
@@ -128,17 +138,133 @@ impl HttpProvider {
         &self,
         request: ProviderRequest,
     ) -> Result<Box<dyn ProviderStream>> {
-        if matches!(self.provider, ApiProvider::OpenAICompatible)
-            && openai_compatible_uses_chat_completions(&self.base_url)
-        {
-            let url = join_if_missing(&self.base_url, "chat/completions");
+        self.start_openai_family_stream(
+            request,
+            join_if_missing(&self.base_url, "responses"),
+            Some(join_if_missing(&self.base_url, "chat/completions")),
+            true,
+            true,
+        )
+        .await
+    }
+
+    async fn start_openai_family_stream(
+        &self,
+        request: ProviderRequest,
+        responses_url: String,
+        chat_completions_url: Option<String>,
+        supports_reasoning_summaries: bool,
+        supports_verbosity: bool,
+    ) -> Result<Box<dyn ProviderStream>> {
+        let api_mode = get_openai_api_mode(self.provider);
+        if api_mode == OpenAIApiMode::ChatCompletions {
+            let Some(chat_completions_url) = chat_completions_url else {
+                return Err(anyhow!("ChatGPT Codex only supports the Responses API"));
+            };
             return self
-                .start_openai_chat_completions_stream(url, request)
+                .start_openai_chat_completions_stream(chat_completions_url, request)
                 .await;
         }
-        let url = join_if_missing(&self.base_url, "responses");
-        self.send_openai_responses_request(url, request, true, true)
+
+        let transport_mode = get_openai_transport_mode();
+        let capabilities = get_openai_family_capabilities(self.provider, Some(&self.base_url));
+        let should_attempt_responses = api_mode == OpenAIApiMode::Responses
+            || transport_mode != OpenAITransportMode::Auto
+            || capabilities.supports_responses;
+        let transports = resolve_openai_responses_transports(
+            transport_mode,
+            api_mode == OpenAIApiMode::Responses,
+            capabilities,
+        );
+        let mut last_error = None;
+
+        if should_attempt_responses {
+            for transport in transports {
+                match self
+                    .send_openai_responses_transport_request(
+                        responses_url.clone(),
+                        request.clone(),
+                        supports_reasoning_summaries,
+                        supports_verbosity,
+                        transport,
+                    )
+                    .await
+                {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => {
+                        last_error = Some(error);
+                        if transport_mode != OpenAITransportMode::Auto {
+                            return Err(last_error.expect("transport error should exist"));
+                        }
+                    }
+                }
+            }
+        }
+
+        if api_mode == OpenAIApiMode::Responses {
+            return Err(last_error.unwrap_or_else(|| {
+                anyhow!(
+                    "{} did not expose a usable Responses transport",
+                    openai_request_failure_label(self.provider)
+                )
+            }));
+        }
+
+        if let Some(last_error) = last_error {
+            return Err(last_error);
+        }
+
+        let Some(chat_completions_url) = chat_completions_url else {
+            return Err(anyhow!(
+                "{} only supports the Responses API",
+                openai_request_failure_label(self.provider)
+            ));
+        };
+
+        self.start_openai_chat_completions_stream(chat_completions_url, request)
             .await
+    }
+
+    async fn send_openai_responses_transport_request(
+        &self,
+        url: String,
+        request: ProviderRequest,
+        supports_reasoning_summaries: bool,
+        supports_verbosity: bool,
+        transport: OpenAITransportMode,
+    ) -> Result<Box<dyn ProviderStream>> {
+        match transport {
+            OpenAITransportMode::Auto => Err(anyhow!(
+                "auto transport must be resolved before sending a request"
+            )),
+            OpenAITransportMode::WebSocket => {
+                self.send_openai_responses_websocket_request(
+                    url,
+                    request,
+                    supports_reasoning_summaries,
+                    supports_verbosity,
+                )
+                .await
+            }
+            OpenAITransportMode::Sse => {
+                self.send_openai_responses_sse_request(
+                    url,
+                    request,
+                    supports_reasoning_summaries,
+                    supports_verbosity,
+                )
+                .await
+            }
+            OpenAITransportMode::Rest => {
+                self.send_openai_responses_rest_request(
+                    url,
+                    request,
+                    supports_reasoning_summaries,
+                    supports_verbosity,
+                )
+                .await
+            }
+        }
     }
 
     async fn start_openai_chat_completions_stream(
@@ -200,16 +326,17 @@ impl HttpProvider {
             }
         }
 
-        self.send_openai_responses_request(
-            url,
+        self.start_openai_family_stream(
             request,
+            url,
+            None,
             supports_reasoning_summaries,
             supports_verbosity,
         )
         .await
     }
 
-    async fn send_openai_responses_request(
+    async fn send_openai_responses_sse_request(
         &self,
         url: String,
         request: ProviderRequest,
@@ -237,6 +364,91 @@ impl HttpProvider {
         }
 
         Ok(Box::new(OpenAIResponsesSseStream::new(response)))
+    }
+
+    async fn send_openai_responses_rest_request(
+        &self,
+        url: String,
+        request: ProviderRequest,
+        supports_reasoning_summaries: bool,
+        supports_verbosity: bool,
+    ) -> Result<Box<dyn ProviderStream>> {
+        let mut payload = build_openai_responses_payload(
+            &request,
+            supports_reasoning_summaries,
+            supports_verbosity,
+        );
+        payload["stream"] = Value::Bool(false);
+
+        let response = self
+            .post_openai_json_with_retry(&url, &request.extra_headers, &payload)
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "{} request failed with status {}: {}",
+                openai_request_failure_label(self.provider),
+                status,
+                compact_error_body(&body)
+            ));
+        }
+
+        let value: Value = serde_json::from_str(&body)?;
+        Ok(Box::new(StaticProviderStream::new(
+            events_from_openai_response(&value)?,
+        )))
+    }
+
+    async fn send_openai_responses_websocket_request(
+        &self,
+        url: String,
+        request: ProviderRequest,
+        supports_reasoning_summaries: bool,
+        supports_verbosity: bool,
+    ) -> Result<Box<dyn ProviderStream>> {
+        let payload = build_openai_responses_payload(
+            &request,
+            supports_reasoning_summaries,
+            supports_verbosity,
+        );
+        let Value::Object(payload_map) = payload else {
+            return Err(anyhow!("OpenAI Responses payload must be a JSON object"));
+        };
+
+        let websocket_url = openai_websocket_url(&url)?;
+        let mut websocket_request = websocket_url.into_client_request()?;
+        let headers = self.openai_headers(&request.extra_headers)?;
+        for (name, value) in &headers {
+            websocket_request.headers_mut().insert(
+                WsHeaderName::from_bytes(name.as_str().as_bytes())?,
+                WsHeaderValue::from_bytes(value.as_bytes())?,
+            );
+        }
+        websocket_request.headers_mut().insert(
+            WsHeaderName::from_static("openai-beta"),
+            WsHeaderValue::from_static(OPENAI_RESPONSES_WEBSOCKETS_BETA_HEADER_VALUE),
+        );
+
+        let (mut websocket, _) = connect_async(websocket_request).await.map_err(|error| {
+            anyhow!(
+                "{} websocket request failed: {error}",
+                openai_request_failure_label(self.provider)
+            )
+        })?;
+
+        let mut websocket_payload = serde_json::Map::from_iter([(
+            "type".to_owned(),
+            Value::String("response.create".to_owned()),
+        )]);
+        websocket_payload.extend(payload_map);
+        websocket
+            .send(WsMessage::Text(
+                Value::Object(websocket_payload).to_string().into(),
+            ))
+            .await?;
+
+        Ok(Box::new(OpenAIResponsesWebSocketStream::new(websocket)))
     }
 
     async fn post_openai_json_with_retry(
@@ -953,9 +1165,59 @@ pub(crate) fn join_if_missing(base_url: &str, suffix: &str) -> String {
     }
 }
 
+fn openai_websocket_url(url: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(url)?;
+    let websocket_scheme = match parsed.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        other => other,
+    }
+    .to_owned();
+
+    let mut websocket_url = parsed;
+    websocket_url
+        .set_scheme(&websocket_scheme)
+        .map_err(|_| anyhow!("invalid websocket URL scheme: {url}"))?;
+    Ok(websocket_url.to_string())
+}
+
+fn resolve_openai_responses_transports(
+    transport_mode: OpenAITransportMode,
+    force_all_transports: bool,
+    capabilities: OpenAIFamilyCapabilities,
+) -> Vec<OpenAITransportMode> {
+    if transport_mode != OpenAITransportMode::Auto {
+        return vec![transport_mode];
+    }
+
+    let mut transports = Vec::new();
+    if capabilities.supports_websocket {
+        transports.push(OpenAITransportMode::WebSocket);
+    }
+    if capabilities.supports_sse {
+        transports.push(OpenAITransportMode::Sse);
+    }
+    if capabilities.supports_rest {
+        transports.push(OpenAITransportMode::Rest);
+    }
+
+    if !transports.is_empty() || !force_all_transports {
+        return transports;
+    }
+
+    vec![
+        OpenAITransportMode::WebSocket,
+        OpenAITransportMode::Sse,
+        OpenAITransportMode::Rest,
+    ]
+}
+
+#[cfg(test)]
 pub(crate) fn openai_compatible_uses_chat_completions(base_url: &str) -> bool {
-    if env_flag_truthy("OPENAI_COMPAT_CHAT_COMPLETIONS") {
-        return true;
+    match get_openai_api_mode(ApiProvider::OpenAICompatible) {
+        OpenAIApiMode::ChatCompletions => return true,
+        OpenAIApiMode::Responses => return false,
+        OpenAIApiMode::Auto => {}
     }
 
     base_url

@@ -27,10 +27,12 @@ use ccrust_ui::{CommandPaletteEntry, PanePreview, UiState};
 use ccrust_core::SessionId;
 
 use ccrust_providers::{
-    compatibility_model_catalog, get_anthropic_auth_material, get_openai_auth_status,
-    get_openai_completion_model, get_openai_completion_think_level, get_openai_reasoning_model,
-    get_openai_reasoning_think_level, is_openai_provider, provider_descriptor,
-    read_provider_auth_snapshot, ApiProvider, ModelCatalog, OpenAIAuthSource,
+    compatibility_model_catalog, get_anthropic_auth_material, get_openai_api_mode,
+    get_openai_auth_status, get_openai_completion_model, get_openai_completion_think_level,
+    get_openai_family_capabilities, get_openai_reasoning_model, get_openai_reasoning_think_level,
+    get_openai_transport_mode, is_openai_provider, provider_descriptor,
+    read_provider_auth_snapshot, ApiProvider, ModelCatalog, OpenAIApiMode, OpenAIAuthSource,
+    OpenAITransportMode,
 };
 
 use anyhow::Result;
@@ -94,6 +96,8 @@ struct LoginConfigDraft {
     anthropic_api_key: String,
     openai_api_key: String,
     openai_base_url: String,
+    openai_api_mode: OpenAIApiMode,
+    openai_transport: OpenAITransportMode,
     reasoning_model: String,
     completion_model: String,
     reasoning_model_think: String,
@@ -959,12 +963,215 @@ fn openai_compatible_think_level(value: &str) -> bool {
     matches!(value, "low" | "medium" | "high" | "xhigh")
 }
 
+fn openai_api_mode_choice_list(
+    selected: OpenAIApiMode,
+    allow_chat_completions: bool,
+) -> (ChoiceListState, Vec<OpenAIApiMode>) {
+    let mut modes = vec![OpenAIApiMode::Auto, OpenAIApiMode::Responses];
+    if allow_chat_completions {
+        modes.push(OpenAIApiMode::ChatCompletions);
+    }
+
+    let items = modes
+        .iter()
+        .map(|mode| match mode {
+            OpenAIApiMode::Auto => ChoiceListItem {
+                label: "Auto".to_owned(),
+                detail: Some(
+                    "Prefer Responses, then fall back to chat completions when needed".to_owned(),
+                ),
+                secondary: None,
+            },
+            OpenAIApiMode::Responses => ChoiceListItem {
+                label: "Responses".to_owned(),
+                detail: Some("Use the Responses API only".to_owned()),
+                secondary: None,
+            },
+            OpenAIApiMode::ChatCompletions => ChoiceListItem {
+                label: "Chat Completions".to_owned(),
+                detail: Some("Use chat completions only".to_owned()),
+                secondary: None,
+            },
+        })
+        .collect::<Vec<_>>();
+    let selected = modes
+        .iter()
+        .position(|mode| *mode == selected)
+        .unwrap_or_default();
+
+    (
+        onboarding_choice_list(
+            "Choose API mode",
+            "Select which OpenAI-family API shape should be preferred.",
+            selected,
+            items,
+        ),
+        modes,
+    )
+}
+
+fn openai_transport_choice_list(
+    selected: OpenAITransportMode,
+    chat_completions_only: bool,
+    allow_websocket: bool,
+    allow_sse: bool,
+    allow_rest: bool,
+) -> (ChoiceListState, Vec<OpenAITransportMode>) {
+    let modes = if chat_completions_only {
+        vec![OpenAITransportMode::Rest]
+    } else {
+        let mut modes = vec![OpenAITransportMode::Auto];
+        if allow_websocket {
+            modes.push(OpenAITransportMode::WebSocket);
+        }
+        if allow_sse {
+            modes.push(OpenAITransportMode::Sse);
+        }
+        if allow_rest {
+            modes.push(OpenAITransportMode::Rest);
+        }
+        modes
+    };
+
+    let items = modes
+        .iter()
+        .map(|mode| match mode {
+            OpenAITransportMode::Auto => ChoiceListItem {
+                label: "Auto".to_owned(),
+                detail: Some("Try WebSocket, then SSE, then REST".to_owned()),
+                secondary: None,
+            },
+            OpenAITransportMode::WebSocket => ChoiceListItem {
+                label: "WebSocket".to_owned(),
+                detail: Some("Use the Responses websocket transport".to_owned()),
+                secondary: None,
+            },
+            OpenAITransportMode::Sse => ChoiceListItem {
+                label: "SSE".to_owned(),
+                detail: Some("Use streaming Responses over HTTP".to_owned()),
+                secondary: None,
+            },
+            OpenAITransportMode::Rest => ChoiceListItem {
+                label: "REST".to_owned(),
+                detail: Some(if chat_completions_only {
+                    "Chat completions use plain REST only".to_owned()
+                } else {
+                    "Use non-streaming Responses over HTTP".to_owned()
+                }),
+                secondary: None,
+            },
+        })
+        .collect::<Vec<_>>();
+    let selected = modes
+        .iter()
+        .position(|mode| *mode == selected)
+        .unwrap_or_default();
+
+    (
+        onboarding_choice_list(
+            "Choose transport",
+            "Select how OpenAI-family requests should be transported.",
+            selected,
+            items,
+        ),
+        modes,
+    )
+}
+
+fn run_openai_routing_onboarding_step<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    cwd: &Path,
+    api_step_label: &str,
+    transport_step_label: &str,
+    draft: &mut LoginConfigDraft,
+    base_url: Option<&str>,
+) -> Result<bool> {
+    let capabilities = get_openai_family_capabilities(provider, base_url);
+    let (api_choice_list, api_modes) = openai_api_mode_choice_list(
+        draft.openai_api_mode,
+        capabilities.supports_chat_completions,
+    );
+    let api_choice = run_onboarding_choice_step(
+        terminal,
+        provider,
+        active_model,
+        session_id,
+        cwd,
+        api_step_label,
+        "OpenAI API Mode",
+        vec![
+            "Responses is preferred when the provider supports it.".to_owned(),
+            "Auto mode falls back to chat completions when Responses is unavailable.".to_owned(),
+        ],
+        "Preview",
+        vec![
+            format!("provider: {provider}"),
+            format!("base_url: {}", base_url.unwrap_or("(default)")),
+        ],
+        api_choice_list,
+        Some("Enter accepts the selection. Esc cancels onboarding.".to_owned()),
+    )?;
+    let Some(api_choice) = api_choice else {
+        return Ok(false);
+    };
+    draft.openai_api_mode = api_modes[api_choice];
+
+    let chat_completions_only = draft.openai_api_mode == OpenAIApiMode::ChatCompletions;
+    let force_all_transports = draft.openai_api_mode == OpenAIApiMode::Responses;
+    let (transport_choice_list, transport_modes) = openai_transport_choice_list(
+        if chat_completions_only {
+            OpenAITransportMode::Rest
+        } else {
+            draft.openai_transport
+        },
+        chat_completions_only,
+        force_all_transports || capabilities.supports_websocket,
+        force_all_transports || capabilities.supports_sse,
+        chat_completions_only || force_all_transports || capabilities.supports_rest,
+    );
+    let transport_choice = run_onboarding_choice_step(
+        terminal,
+        provider,
+        active_model,
+        session_id,
+        cwd,
+        transport_step_label,
+        "OpenAI Transport",
+        vec![
+            "Auto transport tries WebSocket first, then SSE, then plain REST.".to_owned(),
+            if chat_completions_only {
+                "Chat completions uses REST only.".to_owned()
+            } else {
+                "You can pin a transport when the endpoint requires it.".to_owned()
+            },
+        ],
+        "Preview",
+        vec![
+            format!("api mode: {}", draft.openai_api_mode.as_str()),
+            format!("base_url: {}", base_url.unwrap_or("(default)")),
+        ],
+        transport_choice_list,
+        Some("Enter accepts the selection. Esc cancels onboarding.".to_owned()),
+    )?;
+    let Some(transport_choice) = transport_choice else {
+        return Ok(false);
+    };
+    draft.openai_transport = transport_modes[transport_choice];
+
+    Ok(true)
+}
+
 fn login_draft_from_environment(provider: ApiProvider) -> LoginConfigDraft {
     let mut draft = LoginConfigDraft {
         provider,
         anthropic_api_key: env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
         openai_api_key: env::var("OPENAI_API_KEY").unwrap_or_default(),
         openai_base_url: env::var("OPENAI_BASE_URL").unwrap_or_default(),
+        openai_api_mode: get_openai_api_mode(provider),
+        openai_transport: get_openai_transport_mode(),
         reasoning_model: env::var("REASONING_MODEL")
             .unwrap_or_else(|_| get_openai_reasoning_model()),
         completion_model: env::var("COMPLETION_MODEL")
@@ -1040,6 +1247,21 @@ fn managed_login_env_values(draft: &LoginConfigDraft) -> BTreeMap<String, String
         "CLAUDE_CODE_API_PROVIDER".to_owned(),
         draft.provider.to_string(),
     )]);
+
+    if is_openai_provider(draft.provider) {
+        if draft.openai_api_mode != OpenAIApiMode::Auto {
+            values.insert(
+                "OPENAI_API_MODE".to_owned(),
+                draft.openai_api_mode.as_str().to_owned(),
+            );
+        }
+        if draft.openai_transport != OpenAITransportMode::Auto {
+            values.insert(
+                "OPENAI_TRANSPORT".to_owned(),
+                draft.openai_transport.as_str().to_owned(),
+            );
+        }
+    }
 
     match draft.provider {
         ApiProvider::FirstParty => {
@@ -1134,7 +1356,7 @@ pub(crate) fn run_login_onboarding_flow<B: ratatui::backend::Backend>(
             active_model,
             session_id,
             cwd,
-            "2/8",
+            "2/10",
             "OpenAI-Compatible Preset",
             vec![
                 "Pick a preset base URL for the OpenAI-compatible provider.".to_owned(),
@@ -1165,7 +1387,7 @@ pub(crate) fn run_login_onboarding_flow<B: ratatui::backend::Backend>(
             active_model,
             session_id,
             cwd,
-            "3/8",
+            "3/10",
             "API Key",
             vec!["Enter the API key for the selected OpenAI-compatible endpoint.".to_owned()],
             "Preview",
@@ -1187,7 +1409,7 @@ pub(crate) fn run_login_onboarding_flow<B: ratatui::backend::Backend>(
             active_model,
             session_id,
             cwd,
-            "4/8",
+            "4/10",
             "Base URL",
             vec!["Edit the OpenAI-compatible base URL if needed.".to_owned()],
             "Preview",
@@ -1200,13 +1422,27 @@ pub(crate) fn run_login_onboarding_flow<B: ratatui::backend::Backend>(
             Some(value) => value,
             None => return Ok(None),
         };
+        let openai_base_url = draft.openai_base_url.clone();
+        if !run_openai_routing_onboarding_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "5/10",
+            "6/10",
+            &mut draft,
+            Some(openai_base_url.as_str()),
+        )? {
+            return Ok(None);
+        }
         draft.reasoning_model = match run_onboarding_input_step(
             terminal,
             selected_provider,
             active_model,
             session_id,
             cwd,
-            "5/8",
+            "7/10",
             "Reasoning Model",
             vec!["Set the model used for thinking-enabled turns.".to_owned()],
             "Preview",
@@ -1225,7 +1461,7 @@ pub(crate) fn run_login_onboarding_flow<B: ratatui::backend::Backend>(
             active_model,
             session_id,
             cwd,
-            "6/8",
+            "8/10",
             "Completion Model",
             vec!["Set the model used for standard turns and utility calls.".to_owned()],
             "Preview",
@@ -1244,7 +1480,7 @@ pub(crate) fn run_login_onboarding_flow<B: ratatui::backend::Backend>(
             active_model,
             session_id,
             cwd,
-            "7/8",
+            "9/10",
             "Reasoning Think",
             vec![
                 "Set the reasoning effort for the reasoning model.".to_owned(),
@@ -1266,7 +1502,7 @@ pub(crate) fn run_login_onboarding_flow<B: ratatui::backend::Backend>(
             active_model,
             session_id,
             cwd,
-            "8/8",
+            "10/10",
             "Completion Think",
             vec![
                 "Set the reasoning effort for the completion model.".to_owned(),
@@ -1282,6 +1518,20 @@ pub(crate) fn run_login_onboarding_flow<B: ratatui::backend::Backend>(
             Some(value) => value,
             None => return Ok(None),
         };
+    } else if selected_provider == ApiProvider::ChatGPTCodex {
+        if !run_openai_routing_onboarding_step(
+            terminal,
+            selected_provider,
+            active_model,
+            session_id,
+            cwd,
+            "2/3",
+            "3/3",
+            &mut draft,
+            None,
+        )? {
+            return Ok(None);
+        }
     } else if selected_provider == ApiProvider::FirstParty {
         draft.anthropic_api_key = match run_onboarding_input_step(
             terminal,

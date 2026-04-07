@@ -62,13 +62,23 @@ pub(crate) async fn handle_repl_slash_command(
             if matches!(invocation.args.first().map(String::as_str), Some("migrate")) {
                 Ok(serde_json::to_string_pretty(&config_migration_report(provider))?)
             } else {
-                Ok(format!(
-                    "provider={} model={} session={} runtime={}",
-                    provider,
-                    active_model,
-                    repl_session.session_id,
-                    if live_runtime { "live" } else { "offline" }
-                ))
+                let mut parts = vec![
+                    format!("provider={provider}"),
+                    format!("model={active_model}"),
+                    format!("session={}", repl_session.session_id),
+                    format!("runtime={}", if live_runtime { "live" } else { "offline" }),
+                ];
+                if ccrust_providers::is_openai_provider(provider) {
+                    parts.push(format!(
+                        "api_mode={}",
+                        ccrust_providers::get_openai_api_mode(provider).as_str()
+                    ));
+                    parts.push(format!(
+                        "transport={}",
+                        ccrust_providers::get_openai_transport_mode().as_str()
+                    ));
+                }
+                Ok(parts.join(" "))
             }
         }
         "ide" => render_ide_command(cwd, ide_bridge_active, None),

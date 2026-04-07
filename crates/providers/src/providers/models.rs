@@ -25,6 +25,8 @@ pub fn config_migration_report(provider: ApiProvider) -> ConfigMigrationReport {
         "CLAUDE_CODE_OAUTH_TOKEN",
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
+        "OPENAI_API_MODE",
+        "OPENAI_TRANSPORT",
         "OPENAI_ORG_ID",
         "AZURE_OPENAI_API_KEY",
         "AWS_REGION",
@@ -275,6 +277,147 @@ pub const DEFAULT_MAX_THINKING_TOKENS: u64 = 10_000;
 
 /// Valid think-level values for OpenAI reasoning effort.
 pub const OPENAI_THINK_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OpenAIApiMode {
+    #[default]
+    Auto,
+    Responses,
+    ChatCompletions,
+}
+
+impl OpenAIApiMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Responses => "responses",
+            Self::ChatCompletions => "chat-completions",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OpenAITransportMode {
+    #[default]
+    Auto,
+    WebSocket,
+    Sse,
+    Rest,
+}
+
+impl OpenAITransportMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::WebSocket => "websocket",
+            Self::Sse => "sse",
+            Self::Rest => "rest",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpenAIFamilyCapabilities {
+    pub supports_responses: bool,
+    pub supports_chat_completions: bool,
+    pub supports_websocket: bool,
+    pub supports_sse: bool,
+    pub supports_rest: bool,
+}
+
+fn parse_openai_api_mode(value: Option<String>) -> Option<OpenAIApiMode> {
+    match value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .as_deref()
+    {
+        Some("auto") => Some(OpenAIApiMode::Auto),
+        Some("responses") => Some(OpenAIApiMode::Responses),
+        Some("chat-completions") => Some(OpenAIApiMode::ChatCompletions),
+        _ => None,
+    }
+}
+
+fn parse_openai_transport_mode(value: Option<String>) -> Option<OpenAITransportMode> {
+    match value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .as_deref()
+    {
+        Some("auto") => Some(OpenAITransportMode::Auto),
+        Some("websocket") => Some(OpenAITransportMode::WebSocket),
+        Some("sse") => Some(OpenAITransportMode::Sse),
+        Some("rest") => Some(OpenAITransportMode::Rest),
+        _ => None,
+    }
+}
+
+fn is_gemini_openai_compatible_base_url(base_url: &str) -> bool {
+    base_url
+        .to_ascii_lowercase()
+        .contains("generativelanguage.googleapis.com")
+}
+
+fn is_openrouter_openai_compatible_base_url(base_url: &str) -> bool {
+    base_url.to_ascii_lowercase().contains("openrouter.ai")
+}
+
+pub fn get_openai_api_mode(provider: ApiProvider) -> OpenAIApiMode {
+    if let Some(mode) = parse_openai_api_mode(env::var("OPENAI_API_MODE").ok()) {
+        return mode;
+    }
+
+    if provider == ApiProvider::OpenAICompatible
+        && env_flag_truthy("OPENAI_COMPAT_CHAT_COMPLETIONS")
+    {
+        return OpenAIApiMode::ChatCompletions;
+    }
+
+    OpenAIApiMode::Auto
+}
+
+pub fn get_openai_transport_mode() -> OpenAITransportMode {
+    parse_openai_transport_mode(env::var("OPENAI_TRANSPORT").ok())
+        .unwrap_or(OpenAITransportMode::Auto)
+}
+
+pub fn get_openai_family_capabilities(
+    provider: ApiProvider,
+    base_url: Option<&str>,
+) -> OpenAIFamilyCapabilities {
+    match provider {
+        ApiProvider::OpenAICompatible => {
+            let Some(base_url) = base_url.filter(|base_url| !base_url.trim().is_empty()) else {
+                return OpenAIFamilyCapabilities {
+                    supports_responses: true,
+                    supports_chat_completions: true,
+                    supports_websocket: true,
+                    supports_sse: true,
+                    supports_rest: true,
+                };
+            };
+
+            let gemini_compatible = is_gemini_openai_compatible_base_url(base_url);
+            let openrouter_compatible = is_openrouter_openai_compatible_base_url(base_url);
+
+            OpenAIFamilyCapabilities {
+                supports_responses: !gemini_compatible,
+                supports_chat_completions: true,
+                supports_websocket: !gemini_compatible && !openrouter_compatible,
+                supports_sse: !gemini_compatible,
+                supports_rest: !gemini_compatible,
+            }
+        }
+        ApiProvider::ChatGPTCodex => OpenAIFamilyCapabilities {
+            supports_responses: true,
+            supports_chat_completions: false,
+            supports_websocket: true,
+            supports_sse: true,
+            supports_rest: true,
+        },
+        _ => OpenAIFamilyCapabilities::default(),
+    }
+}
 
 /// Returns the OpenAI reasoning model, honouring the `REASONING_MODEL` env var.
 pub fn get_openai_reasoning_model() -> String {

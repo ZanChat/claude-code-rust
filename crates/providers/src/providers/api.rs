@@ -1,3 +1,8 @@
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[derive(Default)]
 pub enum ApiProvider {
@@ -363,6 +368,96 @@ impl ProviderStream for OpenAIResponsesSseStream {
                 }
                 None => {
                     self.drain_buffer(true)?;
+                }
+            }
+        }
+    }
+}
+
+pub struct OpenAIResponsesWebSocketStream {
+    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    pending: VecDeque<ProviderEvent>,
+    completed: bool,
+    saw_text_delta: bool,
+}
+
+impl OpenAIResponsesWebSocketStream {
+    pub fn new(socket: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        Self {
+            socket,
+            pending: VecDeque::new(),
+            completed: false,
+            saw_text_delta: false,
+        }
+    }
+
+    fn extend_from_message(&mut self, message: &str) -> Result<()> {
+        let value: Value = serde_json::from_str(message)?;
+        let events = provider_events_from_openai_sse_event(
+            &value,
+            &mut self.saw_text_delta,
+            &mut self.completed,
+        )?;
+        self.pending.extend(events);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ProviderStream for OpenAIResponsesWebSocketStream {
+    async fn next_event(&mut self) -> Result<Option<ProviderEvent>> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+            if self.completed {
+                return Ok(None);
+            }
+
+            match self.socket.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    self.extend_from_message(text.as_ref())?;
+                }
+                Some(Ok(WsMessage::Binary(bytes))) => {
+                    let text = std::str::from_utf8(&bytes)?;
+                    self.extend_from_message(text)?;
+                }
+                Some(Ok(WsMessage::Ping(payload))) => {
+                    self.socket.send(WsMessage::Pong(payload)).await?;
+                }
+                Some(Ok(WsMessage::Pong(_))) | Some(Ok(WsMessage::Frame(_))) => {}
+                Some(Ok(WsMessage::Close(frame))) => {
+                    if self.completed {
+                        return Ok(None);
+                    }
+
+                    let message = frame
+                        .map(|frame| {
+                            let reason = frame.reason.trim();
+                            if reason.is_empty() {
+                                format!(
+                                    "responses websocket closed with code {} before response.completed",
+                                    frame.code
+                                )
+                            } else {
+                                format!(
+                                    "responses websocket closed with code {}: {}",
+                                    frame.code, reason
+                                )
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            "responses websocket closed before response.completed".to_owned()
+                        });
+                    return Err(anyhow!(message));
+                }
+                Some(Err(error)) => {
+                    return Err(anyhow!("responses websocket failed: {error}"));
+                }
+                None => {
+                    return Err(anyhow!(
+                        "responses websocket ended without a response.completed event"
+                    ));
                 }
             }
         }

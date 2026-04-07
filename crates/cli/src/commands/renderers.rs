@@ -56,6 +56,10 @@ pub(crate) fn render_status_command(
         "fast_mode": settings.fast_mode,
         "advisor_model": settings.advisor_model,
         "chrome_default_enabled": settings.chrome_default_enabled,
+        "openai_api_mode": ccrust_providers::is_openai_provider(provider)
+            .then(|| ccrust_providers::get_openai_api_mode(provider).as_str()),
+        "openai_transport": ccrust_providers::is_openai_provider(provider)
+            .then(|| ccrust_providers::get_openai_transport_mode().as_str()),
     }))?)
 }
 

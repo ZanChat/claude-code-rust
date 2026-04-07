@@ -1121,6 +1121,48 @@ async fn repl_config_command_reports_runtime_state() {
 }
 
 #[tokio::test]
+async fn repl_config_command_reports_openai_routing_state() {
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root(
+        "repl-config-openai-routing",
+    )));
+    let tool_registry = compatibility_tool_registry();
+    let root = env::temp_dir();
+    let registry = resolved_command_registry(&root, None).await;
+    let mut active_model = "gpt-5.4".to_owned();
+    let session_id = SessionId::new_v4();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "config".to_owned(),
+            raw_input: "/config".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(status.contains("provider=openai-compatible"));
+    assert!(status.contains("api_mode=auto"));
+    assert!(status.contains("transport=auto"));
+}
+
+#[tokio::test]
 async fn repl_ide_command_reports_bridge_state() {
     let store = ActiveSessionStore::Local(LocalSessionStore::new(temp_session_root("repl-ide")));
     let tool_registry = compatibility_tool_registry();
