@@ -1,11 +1,14 @@
 async fn run_pending_repl_operation<F, T>(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     registry: &ccrust_core::CommandRegistry,
+    tool_registry: &ToolRegistry,
     pending_view: Arc<Mutex<PendingReplView>>,
     cwd: &Path,
+    plugin_root: Option<&PathBuf>,
     provider: ApiProvider,
     active_model: &str,
     session_id: SessionId,
+    auth_configured: bool,
     total_usage_totals: UsageTotals,
     input_buffer: &mut ccrust_ui::InputBuffer,
     prompt_history_index: &mut Option<usize>,
@@ -25,6 +28,7 @@ where
     let mut operation = std::pin::pin!(operation);
     let mut tick = 0usize;
     let mut compact_banner = compact_banner;
+    let mut side_question_task: Option<tokio::task::JoinHandle<Result<String>>> = None;
 
     loop {
         let pending_snapshot = pending_repl_snapshot(&pending_view);
@@ -358,6 +362,9 @@ where
                                 if interaction_state.transcript_mode {
                                     exit_transcript_mode(interaction_state);
                                     continue;
+                                }
+                                if let Some(task) = side_question_task.take() {
+                                    task.abort();
                                 }
                                 return Ok(PendingReplOperationResult::Interrupted);
                             }
@@ -1300,6 +1307,46 @@ where
                                 prompt_history_index,
                                 prompt_history_draft,
                             );
+                            if let Some(invocation) = registry.parse_slash_command(&prompt_text) {
+                                if invocation.name == "btw" {
+                                    if side_question_task.is_some() {
+                                        compact_banner = Some(
+                                            "/btw is already answering a side question".to_owned(),
+                                        );
+                                    } else if let Some(question) =
+                                        pending_btw_question(&invocation)
+                                    {
+                                        compact_banner = Some("answering /btw".to_owned());
+                                        let system_prompt = build_runtime_system_prompt(
+                                            cwd,
+                                            tool_registry,
+                                            provider,
+                                            active_model,
+                                            plugin_root,
+                                        );
+                                        side_question_task = Some(tokio::spawn(
+                                            run_pending_btw_side_question(
+                                                provider,
+                                                active_model.to_owned(),
+                                                session_id,
+                                                system_prompt.blocks,
+                                                pending_btw_context_messages(
+                                                    &pending_snapshot.messages,
+                                                ),
+                                                question,
+                                                auth_configured,
+                                            ),
+                                        ));
+                                    } else {
+                                        compact_banner =
+                                            Some("Usage: /btw <question>".to_owned());
+                                    }
+                                    clear_prompt_selection(interaction_state);
+                                    input_buffer.clear();
+                                    *selected_command_suggestion = 0;
+                                    continue;
+                                }
+                            }
                             queue_pending_repl_input(&pending_view, prompt_text);
                             clear_prompt_selection(interaction_state);
                             input_buffer.clear();
@@ -1341,12 +1388,109 @@ where
         )?;
 
         tokio::select! {
-            result = &mut operation => return result.map(PendingReplOperationResult::Completed),
+            result = &mut operation => {
+                if let Some(task) = side_question_task.take() {
+                    task.abort();
+                }
+                return result.map(PendingReplOperationResult::Completed)
+            },
+            result = async {
+                match side_question_task.as_mut() {
+                    Some(task) => Some(task.await),
+                    None => None,
+                }
+            }, if side_question_task.is_some() => {
+                match result {
+                    Some(Ok(Ok(answer))) => {
+                        compact_banner = Some(pending_btw_banner(&answer));
+                    }
+                    Some(Ok(Err(error))) => {
+                        compact_banner = Some(format!("/btw error: {error}"));
+                    }
+                    Some(Err(error)) => {
+                        compact_banner = Some(format!("/btw task failed: {error}"));
+                    }
+                    None => {}
+                }
+                side_question_task = None;
+            }
             _ = tokio::time::sleep(Duration::from_millis(120)) => {
                 tick = tick.wrapping_add(1);
             }
         }
     }
+}
+
+const BTW_SIDE_QUESTION_WRAPPER: &str = r#"<system-reminder>This is a side question from the user. You must answer this question directly in a single response.
+
+IMPORTANT CONTEXT:
+- You are a separate, lightweight side-question request.
+- The main task is not interrupted and continues independently.
+- You share the current conversation context, but this reply stays separate from the main task.
+
+CRITICAL CONSTRAINTS:
+- Do not call tools.
+- Do not promise follow-up actions.
+- Answer directly with the information already available in the current context.
+- If you do not know, say so briefly.</system-reminder>
+
+"#;
+
+fn pending_btw_question(invocation: &CommandInvocation) -> Option<String> {
+    let question = invocation.args.join(" ").trim().to_owned();
+    (!question.is_empty()).then_some(question)
+}
+
+fn pending_btw_context_messages(messages: &[Message]) -> Vec<Message> {
+    let mut context = messages.to_vec();
+    if matches!(
+        context.last().map(|message| &message.role),
+        Some(MessageRole::Assistant)
+    ) {
+        context.pop();
+    }
+    context
+}
+
+fn pending_btw_banner(answer: &str) -> String {
+    let detail = preview_detail(answer, 2, 120).unwrap_or_else(|| "no response".to_owned());
+    format!("/btw {detail}")
+}
+
+async fn run_pending_btw_side_question(
+    provider: ApiProvider,
+    active_model: String,
+    session_id: SessionId,
+    system_prompt: Vec<SystemPromptBlock>,
+    mut context_messages: Vec<Message>,
+    question: String,
+    auth_configured: bool,
+) -> Result<String> {
+    let parent_id = context_messages.last().map(|message| message.id);
+    context_messages.push(build_text_message(
+        session_id,
+        MessageRole::User,
+        format!("{BTW_SIDE_QUESTION_WRAPPER}{question}"),
+        parent_id,
+    ));
+    let provider_client = resolve_provider_client(provider, auth_configured).await?;
+    let response = ccrust_providers::collect_provider_response(
+        provider_client.as_ref(),
+        ProviderRequest {
+            model: active_model,
+            system_prompt,
+            messages: context_messages,
+            tools: Vec::new(),
+            max_output_tokens: Some(512),
+            ..ProviderRequest::default()
+        },
+    )
+    .await?;
+    let answer = response.text.trim().to_owned();
+    if answer.is_empty() {
+        bail!("No response received");
+    }
+    Ok(answer)
 }
 
 enum PendingReplOperationResult<T> {

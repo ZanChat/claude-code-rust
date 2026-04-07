@@ -116,6 +116,10 @@ fn take_pending_repl_inputs(pending_view: &Arc<Mutex<PendingReplView>>) -> Vec<S
         .unwrap_or_default()
 }
 
+fn should_append_pending_interrupt_message(queued_inputs: &[String]) -> bool {
+    queued_inputs.is_empty()
+}
+
 fn toggle_pending_repl_group(pending_view: &Arc<Mutex<PendingReplView>>, group_id: &str) {
     if let Ok(mut state) = pending_view.lock() {
         if let Some(entry) = state.steps.iter_mut().find(|entry| entry.id() == group_id) {

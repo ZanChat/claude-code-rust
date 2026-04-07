@@ -1270,6 +1270,82 @@ fn resolve_prompt_command_prompt_supports_builtin_parity_prompts() {
 }
 
 #[test]
+fn pending_interrupt_message_follows_ts_submit_interrupt_rules() {
+    assert!(should_append_pending_interrupt_message(&[]));
+    assert!(!should_append_pending_interrupt_message(&[
+        "follow up".to_owned()
+    ]));
+}
+
+#[test]
+fn pending_btw_helpers_extract_question_and_strip_preview_assistant() {
+    let session_id = SessionId::new_v4();
+    let user = build_text_message(session_id, MessageRole::User, "main task".to_owned(), None);
+    let assistant = build_text_message(
+        session_id,
+        MessageRole::Assistant,
+        "partial answer".to_owned(),
+        Some(user.id),
+    );
+    let invocation = CommandInvocation {
+        name: "btw".to_owned(),
+        args: vec!["what".to_owned(), "changed?".to_owned()],
+        raw_input: "/btw what changed?".to_owned(),
+    };
+
+    assert_eq!(
+        pending_btw_question(&invocation).as_deref(),
+        Some("what changed?")
+    );
+    assert!(pending_btw_question(&CommandInvocation {
+        name: "btw".to_owned(),
+        args: vec![],
+        raw_input: "/btw".to_owned(),
+    })
+    .is_none());
+    assert_eq!(
+        pending_btw_context_messages(&[user.clone(), assistant]),
+        vec![user]
+    );
+    assert!(pending_btw_banner("line one\nline two").starts_with("/btw "));
+}
+
+#[tokio::test]
+async fn pending_btw_side_question_uses_immediate_side_channel() {
+    let root = temp_session_root("pending-btw-side-channel");
+    let tool_registry = compatibility_tool_registry();
+    let system_prompt = build_runtime_system_prompt(
+        &root,
+        &tool_registry,
+        ApiProvider::OpenAICompatible,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        None,
+    );
+    let session_id = SessionId::new_v4();
+    let messages = vec![build_text_message(
+        session_id,
+        MessageRole::User,
+        "main task is still running".to_owned(),
+        None,
+    )];
+
+    let answer = run_pending_btw_side_question(
+        ApiProvider::OpenAICompatible,
+        DEFAULT_OPENAI_REASONING_MODEL.to_owned(),
+        session_id,
+        system_prompt.blocks,
+        messages,
+        "what changed?".to_owned(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(answer.contains("what changed?"));
+    assert!(answer.contains("side question"));
+}
+
+#[test]
 fn settings_commands_persist_preferences_and_effort_env() {
     let home = temp_session_root("command-settings-home");
     let home_path = home.display().to_string();

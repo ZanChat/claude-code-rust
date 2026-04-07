@@ -543,11 +543,14 @@ async fn process_repl_submission(
         let result = run_pending_repl_operation(
             terminal,
             registry,
+            tool_registry,
             pending_view.clone(),
             cwd,
+            plugin_root,
             *provider,
             &active_model_display,
             repl_session.session_id,
+            *live_runtime,
             total_usage_totals,
             input_buffer,
             prompt_history_index,
@@ -577,7 +580,10 @@ async fn process_repl_submission(
             ),
         )
         .await;
-        queued_submissions.extend(take_pending_repl_inputs(&pending_view));
+        let pending_inputs = take_pending_repl_inputs(&pending_view);
+        let should_append_interrupt_message =
+            should_append_pending_interrupt_message(&pending_inputs);
+        queued_submissions.extend(pending_inputs);
 
         match result {
             Ok(PendingReplOperationResult::Completed(next_status)) if next_status == "exit" => {
@@ -622,12 +628,14 @@ async fn process_repl_submission(
                 }
             }
             Ok(PendingReplOperationResult::Interrupted) => {
-                let interruption_messages = pending_interrupt_messages(
-                    repl_session.session_id,
-                    raw_messages,
-                    &pending_repl_snapshot(&pending_view),
-                );
-                append_session_messages(store, raw_messages, interruption_messages).await?;
+                if should_append_interrupt_message {
+                    let interruption_messages = pending_interrupt_messages(
+                        repl_session.session_id,
+                        raw_messages,
+                        &pending_repl_snapshot(&pending_view),
+                    );
+                    append_session_messages(store, raw_messages, interruption_messages).await?;
+                }
                 *status_line = status_with_detail(
                     repl_runtime_status(
                         *provider,
@@ -689,11 +697,14 @@ async fn process_repl_submission(
     let result = run_pending_repl_operation(
         terminal,
         registry,
+        tool_registry,
         pending_view.clone(),
         cwd,
+        plugin_root,
         *provider,
         active_model,
         repl_session.session_id,
+        *live_runtime,
         total_usage_totals,
         input_buffer,
         prompt_history_index,
@@ -720,7 +731,10 @@ async fn process_repl_submission(
         ),
     )
     .await;
-    queued_submissions.extend(take_pending_repl_inputs(&pending_view));
+    let pending_inputs = take_pending_repl_inputs(&pending_view);
+    let should_append_interrupt_message =
+        should_append_pending_interrupt_message(&pending_inputs);
+    queued_submissions.extend(pending_inputs);
 
     match result {
         Ok(PendingReplOperationResult::Completed((
@@ -763,12 +777,14 @@ async fn process_repl_submission(
             *status_marquee_tick = 0;
         }
         Ok(PendingReplOperationResult::Interrupted) => {
-            let interruption_messages = pending_interrupt_messages(
-                repl_session.session_id,
-                raw_messages,
-                &pending_repl_snapshot(&pending_view),
-            );
-            append_session_messages(store, raw_messages, interruption_messages).await?;
+            if should_append_interrupt_message {
+                let interruption_messages = pending_interrupt_messages(
+                    repl_session.session_id,
+                    raw_messages,
+                    &pending_repl_snapshot(&pending_view),
+                );
+                append_session_messages(store, raw_messages, interruption_messages).await?;
+            }
             *status_line = status_with_detail(
                 repl_runtime_status(
                     *provider,
