@@ -18,6 +18,7 @@ impl PendingReplStep {
 #[derive(Clone, Debug)]
 struct PendingReplView {
     messages: Vec<Message>,
+    transcript_overlay_messages: Vec<Message>,
     spinner_verb: String,
     progress_label: String,
     steps: Vec<PendingReplStep>,
@@ -30,6 +31,7 @@ impl PendingReplView {
         let progress_label = progress_label.into();
         Self {
             messages,
+            transcript_overlay_messages: Vec::new(),
             spinner_verb: pending_spinner_verb(&progress_label),
             progress_label,
             steps: Vec::new(),
@@ -120,6 +122,38 @@ fn should_append_pending_interrupt_message(queued_inputs: &[String]) -> bool {
     queued_inputs.is_empty()
 }
 
+const PENDING_TRANSCRIPT_OVERLAY_TAG: &str = "pending_transcript_overlay";
+
+fn append_pending_repl_overlay_ui_event(
+    pending_view: &Arc<Mutex<PendingReplView>>,
+    session_id: SessionId,
+    text: impl Into<String>,
+    ui_role: &str,
+    ui_author: Option<String>,
+) {
+    if let Ok(mut state) = pending_view.lock() {
+        let parent_id = state
+            .transcript_overlay_messages
+            .last()
+            .map(|message| message.id)
+            .or_else(|| state.messages.last().map(|message| message.id));
+        let mut message = build_ui_event_message(session_id, parent_id, text.into(), ui_role, ui_author);
+        message
+            .metadata
+            .tags
+            .push(PENDING_TRANSCRIPT_OVERLAY_TAG.to_owned());
+        state.transcript_overlay_messages.push(message);
+    }
+}
+
+fn is_pending_transcript_overlay_message(message: &Message) -> bool {
+    message
+        .metadata
+        .tags
+        .iter()
+        .any(|tag| tag == PENDING_TRANSCRIPT_OVERLAY_TAG)
+}
+
 fn toggle_pending_repl_group(pending_view: &Arc<Mutex<PendingReplView>>, group_id: &str) {
     if let Ok(mut state) = pending_view.lock() {
         if let Some(entry) = state.steps.iter_mut().find(|entry| entry.id() == group_id) {
@@ -151,6 +185,8 @@ fn pending_interrupt_messages(
         .messages
         .iter()
         .filter(|message| {
+            !is_pending_transcript_overlay_message(message)
+                &&
             raw_messages
                 .iter()
                 .all(|existing| existing.id != message.id)

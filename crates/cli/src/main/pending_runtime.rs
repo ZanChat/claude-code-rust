@@ -1316,6 +1316,13 @@ where
                                     } else if let Some(question) =
                                         pending_btw_question(&invocation)
                                     {
+                                        append_pending_repl_overlay_ui_event(
+                                            &pending_view,
+                                            session_id,
+                                            invocation.raw_input.clone(),
+                                            "command",
+                                            None,
+                                        );
                                         compact_banner = Some("answering /btw".to_owned());
                                         let system_prompt = build_runtime_system_prompt(
                                             cwd,
@@ -1402,13 +1409,34 @@ where
             }, if side_question_task.is_some() => {
                 match result {
                     Some(Ok(Ok(answer))) => {
-                        compact_banner = Some(pending_btw_banner(&answer));
+                        append_pending_repl_overlay_ui_event(
+                            &pending_view,
+                            session_id,
+                            answer,
+                            "command_output",
+                            Some("/btw".to_owned()),
+                        );
+                        compact_banner = None;
                     }
                     Some(Ok(Err(error))) => {
-                        compact_banner = Some(format!("/btw error: {error}"));
+                        append_pending_repl_overlay_ui_event(
+                            &pending_view,
+                            session_id,
+                            format!("error: {error}"),
+                            "command_output",
+                            Some("/btw".to_owned()),
+                        );
+                        compact_banner = None;
                     }
                     Some(Err(error)) => {
-                        compact_banner = Some(format!("/btw task failed: {error}"));
+                        append_pending_repl_overlay_ui_event(
+                            &pending_view,
+                            session_id,
+                            format!("task failed: {error}"),
+                            "command_output",
+                            Some("/btw".to_owned()),
+                        );
+                        compact_banner = None;
                     }
                     None => {}
                 }
@@ -1450,11 +1478,6 @@ fn pending_btw_context_messages(messages: &[Message]) -> Vec<Message> {
         context.pop();
     }
     context
-}
-
-fn pending_btw_banner(answer: &str) -> String {
-    let detail = preview_detail(answer, 2, 120).unwrap_or_else(|| "no response".to_owned());
-    format!("/btw {detail}")
 }
 
 async fn run_pending_btw_side_question(

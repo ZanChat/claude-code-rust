@@ -220,6 +220,7 @@ fn build_repl_ui_state_groups_pending_steps() {
     let messages = vec![user, assistant, tool];
     let pending_view = PendingReplView {
         messages: materialize_runtime_messages(&messages),
+        transcript_overlay_messages: Vec::new(),
         spinner_verb: "Running list_dir".to_owned(),
         progress_label: "running list_dir".to_owned(),
         steps: vec![PendingReplStep {
@@ -268,6 +269,67 @@ fn build_repl_ui_state_groups_pending_steps() {
         .title
         .contains("Step 1 · running list_dir"));
     assert_eq!(state.queued_inputs, vec!["follow up after this".to_owned()]);
+}
+
+#[test]
+fn build_repl_ui_state_shows_pending_overlay_messages_in_transcript() {
+    let app = ccrust_ui::RatatuiApp::new("repl");
+    let registry = compatibility_command_registry();
+    let session_id = SessionId::new_v4();
+    let user = build_text_message(session_id, MessageRole::User, "main task".to_owned(), None);
+    let pending_view = PendingReplView {
+        messages: materialize_runtime_messages(std::slice::from_ref(&user)),
+        transcript_overlay_messages: vec![
+            build_repl_command_input_message(session_id, Some(user.id), "/btw what changed?"),
+            build_repl_command_output_message(
+                session_id,
+                None,
+                "btw",
+                "This is the side-question answer.",
+            ),
+        ],
+        spinner_verb: "Working".to_owned(),
+        progress_label: "working".to_owned(),
+        steps: vec![PendingReplStep {
+            step: 1,
+            start_index: 1,
+            status_label: "working".to_owned(),
+            status_detail: None,
+            task_status: TaskStatus::Running,
+            expanded: false,
+            touched: false,
+        }],
+        queued_inputs: Vec::new(),
+        show_transcript_details: false,
+    };
+
+    let state = build_repl_ui_state(
+        &app,
+        &registry,
+        std::slice::from_ref(&user),
+        Some(&pending_view),
+        Path::new("."),
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        session_id,
+        UsageTotals::default(),
+        &ccrust_ui::InputBuffer::new(),
+        "status",
+        Some("working".to_owned()),
+        ccrust_ui::PaneKind::Transcript,
+        None,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        &ReplInteractionState::default(),
+    );
+
+    let rendered = ccrust_ui::render_to_string(&state, 100, 24).unwrap();
+
+    assert!(rendered.contains("/btw what changed?"));
+    assert!(rendered.contains("This is the side-question answer."));
 }
 
 #[test]
@@ -530,6 +592,7 @@ fn pending_interrupt_messages_preserve_partial_preview_before_marker() {
     );
     let pending_view = PendingReplView {
         messages: vec![user.clone(), partial.clone()],
+        transcript_overlay_messages: Vec::new(),
         spinner_verb: "Working".to_owned(),
         progress_label: "Working".to_owned(),
         steps: Vec::new(),
@@ -552,6 +615,7 @@ fn pending_interrupt_messages_preserve_partial_preview_before_marker() {
 fn toggle_pending_repl_transcript_details_switches_visibility() {
     let pending_view = Arc::new(Mutex::new(PendingReplView {
         messages: Vec::new(),
+        transcript_overlay_messages: Vec::new(),
         spinner_verb: "Working".to_owned(),
         progress_label: "Working".to_owned(),
         steps: vec![

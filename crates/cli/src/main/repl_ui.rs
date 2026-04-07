@@ -34,6 +34,8 @@ fn build_repl_ui_state(
             .collect();
     }
     if let Some(pending_view) = pending_view.filter(|view| !view.steps.is_empty()) {
+        let overlay_transcript =
+            UiState::from_messages(pending_view.transcript_overlay_messages.clone());
         let first_step_start = pending_view
             .steps
             .first()
@@ -48,6 +50,9 @@ fn build_repl_ui_state(
         state.transcript_lines = visible_transcript.transcript_lines;
         state.transcript_items = visible_history.items;
         state.transcript_preview = visible_transcript.transcript_preview;
+        state
+            .transcript_lines
+            .extend(overlay_transcript.transcript_lines.clone());
         state.pending_step_count = pending_view.steps.len();
         state.pending_transcript_details = pending_view.show_transcript_details;
         if pending_view.show_transcript_details {
@@ -112,6 +117,9 @@ fn build_repl_ui_state(
                     .map(TranscriptItem::Group),
             );
         }
+        state
+            .transcript_items
+            .extend(overlay_transcript.transcript_items);
     } else {
         state.transcript_items = build_history_transcript_presentation(
             &runtime_messages,

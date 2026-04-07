@@ -1307,7 +1307,42 @@ fn pending_btw_helpers_extract_question_and_strip_preview_assistant() {
         pending_btw_context_messages(&[user.clone(), assistant]),
         vec![user]
     );
-    assert!(pending_btw_banner("line one\nline two").starts_with("/btw "));
+}
+
+#[test]
+fn pending_overlay_ui_events_chain_after_runtime_messages() {
+    let session_id = SessionId::new_v4();
+    let base = build_text_message(session_id, MessageRole::User, "main task".to_owned(), None);
+    let pending_view = Arc::new(Mutex::new(PendingReplView::new(
+        vec![base.clone()],
+        "working",
+    )));
+
+    append_pending_repl_overlay_ui_event(
+        &pending_view,
+        session_id,
+        "/btw what changed?",
+        "command",
+        None,
+    );
+    append_pending_repl_overlay_ui_event(
+        &pending_view,
+        session_id,
+        "side answer",
+        "command_output",
+        Some("/btw".to_owned()),
+    );
+
+    let state = pending_view.lock().unwrap();
+    assert_eq!(state.transcript_overlay_messages.len(), 2);
+    assert_eq!(
+        state.transcript_overlay_messages[0].parent_id,
+        Some(base.id)
+    );
+    assert_eq!(
+        state.transcript_overlay_messages[1].parent_id,
+        Some(state.transcript_overlay_messages[0].id)
+    );
 }
 
 #[tokio::test]
