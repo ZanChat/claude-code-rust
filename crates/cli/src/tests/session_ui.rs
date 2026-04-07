@@ -194,8 +194,8 @@ fn build_repl_ui_state_adds_session_and_total_usage_to_header_context() {
     );
 
     let header_context = state.header_context.unwrap_or_default();
-    assert!(header_context.contains("session 20 tok"));
-    assert!(header_context.contains("total 54 tok"));
+    assert!(header_context.contains("session 20 tok (2 cached)"));
+    assert!(header_context.contains("total 54 tok (1 cached)"));
 }
 
 #[test]

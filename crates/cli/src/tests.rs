@@ -205,6 +205,107 @@ async fn execute_local_turn_refreshes_raw_messages_after_provider_error() {
     assert!(message_text(&raw_messages[1]).contains("GEMINI_API_KEY"));
 }
 
+#[tokio::test]
+async fn execute_local_turn_continues_after_tool_invocation_error() {
+    let root = temp_session_root("execute-local-turn-tool-invoke-error");
+    let file_path = root.join("example.txt");
+    write_test_file(&file_path, "alpha\n");
+
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+    let session_id = SessionId::new_v4();
+    let tool_registry = compatibility_tool_registry();
+    let mut raw_messages = Vec::new();
+    let prompt = format!(
+        "tool:file_edit {}",
+        json!({
+            "path": file_path.to_string_lossy(),
+            "old_string": "missing",
+            "new_string": "beta",
+        })
+    );
+
+    let (_, turn_count, stop_reason, _, _) = execute_local_turn(
+        &store,
+        &tool_registry,
+        root.clone(),
+        None,
+        ApiProvider::Gemini,
+        "gemini-2.5-pro".to_owned(),
+        session_id,
+        &mut raw_messages,
+        prompt,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(turn_count, 2);
+    assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+    assert_eq!(raw_messages.len(), 4);
+
+    let tool_result = raw_messages
+        .iter()
+        .find_map(|message| {
+            message.blocks.iter().find_map(|block| match block {
+                ContentBlock::ToolResult { result } => Some(result),
+                _ => None,
+            })
+        })
+        .expect("expected tool result");
+    assert!(tool_result.is_error);
+    assert!(tool_result
+        .output_text
+        .contains("Error calling tool (file_edit):"));
+    assert!(tool_result.output_text.contains("target string not found"));
+    assert_eq!(fs::read_to_string(&file_path).unwrap(), "alpha\n");
+
+    assert!(message_text(raw_messages.last().unwrap()).contains("echo tool result"));
+    assert!(message_text(raw_messages.last().unwrap()).contains("target string not found"));
+}
+
+#[tokio::test]
+async fn execute_local_turn_continues_after_invalid_tool_call_json() {
+    let root = temp_session_root("execute-local-turn-invalid-tool-json");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+    let session_id = SessionId::new_v4();
+    let tool_registry = compatibility_tool_registry();
+    let mut raw_messages = Vec::new();
+
+    let (_, turn_count, stop_reason, _, _) = execute_local_turn(
+        &store,
+        &tool_registry,
+        root.clone(),
+        None,
+        ApiProvider::Gemini,
+        "gemini-2.5-pro".to_owned(),
+        session_id,
+        &mut raw_messages,
+        "tool:file_read {not-json".to_owned(),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(turn_count, 2);
+    assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+    assert_eq!(raw_messages.len(), 4);
+
+    let tool_result = raw_messages
+        .iter()
+        .find_map(|message| {
+            message.blocks.iter().find_map(|block| match block {
+                ContentBlock::ToolResult { result } => Some(result),
+                _ => None,
+            })
+        })
+        .expect("expected tool result");
+    assert!(tool_result.is_error);
+    assert!(tool_result.output_text.contains("invalid tool input JSON"));
+    assert!(message_text(raw_messages.last().unwrap()).contains("invalid tool input JSON"));
+}
+
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};

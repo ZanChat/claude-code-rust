@@ -568,65 +568,70 @@ pub(crate) fn run_startup_flow<B: ratatui::backend::Backend>(
                 }
                 _ => {}
             },
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Tab => {
-                    if index + 1 >= screens.len() {
-                        break;
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+            {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Tab => {
+                        if index + 1 >= screens.len() {
+                            break;
+                        }
+                        index += 1;
                     }
-                    index += 1;
-                }
-                KeyCode::Left | KeyCode::BackTab => {
-                    index = index.saturating_sub(1);
-                }
-                KeyCode::Up | KeyCode::PageUp => {
-                    if screen.choice_list.is_some() {
-                        let current = ApiProvider::ALL
-                            .iter()
-                            .position(|provider| *provider == selected_provider)
-                            .unwrap_or_default();
-                        selected_provider = ApiProvider::ALL[current.saturating_sub(1)];
-                    } else {
-                        scroll_up(&mut transcript_scroll, 1);
+                    KeyCode::Left | KeyCode::BackTab => {
+                        index = index.saturating_sub(1);
                     }
-                }
-                KeyCode::Down | KeyCode::PageDown => {
-                    if screen.choice_list.is_some() {
-                        let current = ApiProvider::ALL
-                            .iter()
-                            .position(|provider| *provider == selected_provider)
-                            .unwrap_or_default();
-                        let next = (current + 1).min(ApiProvider::ALL.len().saturating_sub(1));
-                        selected_provider = ApiProvider::ALL[next];
-                    } else {
-                        scroll_down(&mut transcript_scroll, 1);
+                    KeyCode::Up | KeyCode::PageUp => {
+                        if screen.choice_list.is_some() {
+                            let current = ApiProvider::ALL
+                                .iter()
+                                .position(|provider| *provider == selected_provider)
+                                .unwrap_or_default();
+                            selected_provider = ApiProvider::ALL[current.saturating_sub(1)];
+                        } else {
+                            scroll_up(&mut transcript_scroll, 1);
+                        }
                     }
-                }
-                KeyCode::Home => {
-                    if screen.choice_list.is_some() {
-                        selected_provider = ApiProvider::ALL[0];
-                    } else {
-                        transcript_scroll = u16::MAX;
+                    KeyCode::Down | KeyCode::PageDown => {
+                        if screen.choice_list.is_some() {
+                            let current = ApiProvider::ALL
+                                .iter()
+                                .position(|provider| *provider == selected_provider)
+                                .unwrap_or_default();
+                            let next = (current + 1).min(ApiProvider::ALL.len().saturating_sub(1));
+                            selected_provider = ApiProvider::ALL[next];
+                        } else {
+                            scroll_down(&mut transcript_scroll, 1);
+                        }
                     }
-                }
-                KeyCode::End => {
-                    if screen.choice_list.is_some() {
-                        selected_provider = *ApiProvider::ALL.last().unwrap_or(&selected_provider);
-                    } else {
-                        transcript_scroll = 0;
+                    KeyCode::Home => {
+                        if screen.choice_list.is_some() {
+                            selected_provider = ApiProvider::ALL[0];
+                        } else {
+                            transcript_scroll = u16::MAX;
+                        }
                     }
+                    KeyCode::End => {
+                        if screen.choice_list.is_some() {
+                            selected_provider =
+                                *ApiProvider::ALL.last().unwrap_or(&selected_provider);
+                        } else {
+                            transcript_scroll = 0;
+                        }
+                    }
+                    KeyCode::Esc => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char(ch) if key.modifiers.is_empty() && screen.show_input => {
+                        let mut input_buffer = ccrust_ui::InputBuffer::new();
+                        input_buffer.push(ch);
+                        return Ok(StartupFlowResult {
+                            input_buffer,
+                            provider: screen_provider,
+                        });
+                    }
+                    _ => {}
                 }
-                KeyCode::Esc => break,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Char(ch) if key.modifiers.is_empty() && screen.show_input => {
-                    let mut input_buffer = ccrust_ui::InputBuffer::new();
-                    input_buffer.push(ch);
-                    return Ok(StartupFlowResult {
-                        input_buffer,
-                        provider: screen_provider,
-                    });
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
@@ -794,25 +799,29 @@ fn run_onboarding_choice_step<B: ratatui::backend::Backend>(
                 }
                 _ => {}
             },
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Up | KeyCode::Left => {
-                    choice_list.selected = choice_list.selected.saturating_sub(1);
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+            {
+                match key.code {
+                    KeyCode::Up | KeyCode::Left => {
+                        choice_list.selected = choice_list.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Right => {
+                        choice_list.selected = (choice_list.selected + 1)
+                            .min(choice_list.items.len().saturating_sub(1));
+                    }
+                    KeyCode::Home => choice_list.selected = 0,
+                    KeyCode::End => {
+                        choice_list.selected = choice_list.items.len().saturating_sub(1);
+                    }
+                    KeyCode::Enter => return Ok(Some(choice_list.selected)),
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None)
+                    }
+                    _ => {}
                 }
-                KeyCode::Down | KeyCode::Right => {
-                    choice_list.selected =
-                        (choice_list.selected + 1).min(choice_list.items.len().saturating_sub(1));
-                }
-                KeyCode::Home => choice_list.selected = 0,
-                KeyCode::End => {
-                    choice_list.selected = choice_list.items.len().saturating_sub(1);
-                }
-                KeyCode::Enter => return Ok(Some(choice_list.selected)),
-                KeyCode::Esc => return Ok(None),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(None)
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
@@ -870,54 +879,62 @@ fn run_onboarding_input_step<B: ratatui::backend::Backend>(
                     compact_banner = None;
                 }
             }
-            Event::Key(key) if key.kind == KeyEventKind::Press && is_paste_shortcut(&key) => {
+            Event::Key(key)
+                if (key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat)
+                    && is_paste_shortcut(&key) =>
+            {
                 if let Some(text) = read_text_from_clipboard() {
                     if insert_onboarding_input_text(&mut input_buffer, &text) {
                         compact_banner = None;
                     }
                 }
             }
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Enter => {
-                    let value = input_buffer.as_str();
-                    let trimmed = value.trim();
-                    if required && trimmed.is_empty() {
-                        compact_banner = Some("A value is required for this field.".to_owned());
-                        continue;
-                    }
-                    if let Some(validate) = validator {
-                        if !trimmed.is_empty() && !validate(trimmed) {
-                            compact_banner =
-                                Some("Expected one of: low, medium, high, xhigh.".to_owned());
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+            {
+                match key.code {
+                    KeyCode::Enter => {
+                        let value = input_buffer.as_str();
+                        let trimmed = value.trim();
+                        if required && trimmed.is_empty() {
+                            compact_banner = Some("A value is required for this field.".to_owned());
                             continue;
                         }
+                        if let Some(validate) = validator {
+                            if !trimmed.is_empty() && !validate(trimmed) {
+                                compact_banner =
+                                    Some("Expected one of: low, medium, high, xhigh.".to_owned());
+                                continue;
+                            }
+                        }
+                        return Ok(Some(trimmed.to_owned()));
                     }
-                    return Ok(Some(trimmed.to_owned()));
+                    KeyCode::Backspace => {
+                        input_buffer.pop();
+                        compact_banner = None;
+                    }
+                    KeyCode::Left => {
+                        input_buffer.cursor = input_buffer.cursor.saturating_sub(1);
+                    }
+                    KeyCode::Right => {
+                        input_buffer.cursor =
+                            (input_buffer.cursor + 1).min(input_buffer.chars.len());
+                    }
+                    KeyCode::Home => input_buffer.cursor = 0,
+                    KeyCode::End => input_buffer.cursor = input_buffer.chars.len(),
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None)
+                    }
+                    KeyCode::Char(ch)
+                        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        input_buffer.push(ch);
+                        compact_banner = None;
+                    }
+                    _ => {}
                 }
-                KeyCode::Backspace => {
-                    input_buffer.pop();
-                    compact_banner = None;
-                }
-                KeyCode::Left => {
-                    input_buffer.cursor = input_buffer.cursor.saturating_sub(1);
-                }
-                KeyCode::Right => {
-                    input_buffer.cursor = (input_buffer.cursor + 1).min(input_buffer.chars.len());
-                }
-                KeyCode::Home => input_buffer.cursor = 0,
-                KeyCode::End => input_buffer.cursor = input_buffer.chars.len(),
-                KeyCode::Esc => return Ok(None),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(None)
-                }
-                KeyCode::Char(ch)
-                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-                {
-                    input_buffer.push(ch);
-                    compact_banner = None;
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }

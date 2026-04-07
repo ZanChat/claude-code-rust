@@ -479,7 +479,7 @@ pub(crate) async fn run_interactive_repl(
             let Event::Key(key) = event else {
                 continue;
             };
-            if key.kind != KeyEventKind::Press {
+            if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
                 continue;
             }
             clear_prompt_mouse_anchor(&mut interaction_state);
@@ -507,13 +507,15 @@ pub(crate) async fn run_interactive_repl(
                             dirty = true;
                         }
                         KeyCode::PageUp => {
-                            picker.selected = picker.selected.saturating_sub(5);
+                            let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
+                            picker.selected = picker.selected.saturating_sub(step);
                             dirty = true;
                         }
                         KeyCode::PageDown => {
+                            let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
                             if !picker.sessions.is_empty() {
                                 picker.selected =
-                                    (picker.selected + 5).min(picker.sessions.len() - 1);
+                                    (picker.selected + step).min(picker.sessions.len() - 1);
                             }
                             dirty = true;
                         }
@@ -607,13 +609,15 @@ pub(crate) async fn run_interactive_repl(
                             dirty = true;
                         }
                         KeyCode::PageUp => {
-                            picker.selected = picker.selected.saturating_sub(5);
+                            let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
+                            picker.selected = picker.selected.saturating_sub(step);
                             dirty = true;
                         }
                         KeyCode::PageDown => {
+                            let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
                             if !picker.candidates.is_empty() {
                                 picker.selected =
-                                    (picker.selected + 5).min(picker.candidates.len() - 1);
+                                    (picker.selected + step).min(picker.candidates.len() - 1);
                             }
                             dirty = true;
                         }
@@ -713,12 +717,14 @@ pub(crate) async fn run_interactive_repl(
                             dirty = true;
                         }
                         KeyCode::PageUp => {
-                            picker.selected = picker.selected.saturating_sub(5);
+                            let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
+                            picker.selected = picker.selected.saturating_sub(step);
                             dirty = true;
                         }
                         KeyCode::PageDown => {
+                            let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
                             if !picker.items.is_empty() {
-                                picker.selected = (picker.selected + 5).min(picker.items.len() - 1);
+                                picker.selected = (picker.selected + step).min(picker.items.len() - 1);
                             }
                             dirty = true;
                         }
@@ -1768,11 +1774,13 @@ pub(crate) async fn run_interactive_repl(
                         dirty = true;
                     }
                     KeyCode::PageUp => {
-                        scroll_up(&mut transcript_scroll, 5);
+                        let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
+                        scroll_up(&mut transcript_scroll, step);
                         dirty = true;
                     }
                     KeyCode::PageDown => {
-                        scroll_down(&mut transcript_scroll, 5);
+                        let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
+                        scroll_down(&mut transcript_scroll, step);
                         dirty = true;
                     }
                     KeyCode::Home => {
@@ -1845,11 +1853,13 @@ pub(crate) async fn run_interactive_repl(
                     dirty = true;
                 }
                 KeyCode::PageUp => {
-                    scroll_up(&mut transcript_scroll, 5);
+                    let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
+                    scroll_up(&mut transcript_scroll, step);
                     dirty = true;
                 }
                 KeyCode::PageDown => {
-                    scroll_down(&mut transcript_scroll, 5);
+                    let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
+                    scroll_down(&mut transcript_scroll, step);
                     dirty = true;
                 }
                 KeyCode::Home if vim_state.is_insert() => {

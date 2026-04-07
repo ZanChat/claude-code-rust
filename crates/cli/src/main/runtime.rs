@@ -116,6 +116,41 @@ async fn maybe_auto_compact(
     Ok(outcome)
 }
 
+async fn execute_agent_tool_call(
+    tool_registry: &ToolRegistry,
+    tool_context: &ToolContext,
+    call: &ccrust_core::ToolCall,
+) -> (String, bool, Value) {
+    let input = match serde_json::from_str(&call.input_json) {
+        Ok(input) => input,
+        Err(error) => {
+            return (
+                format!("invalid tool input JSON: {error}"),
+                true,
+                Value::Null,
+            );
+        }
+    };
+
+    match tool_registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: call.name.clone(),
+                input,
+            },
+            tool_context,
+        )
+        .await
+    {
+        Ok(output) => (output.content, output.is_error, output.metadata),
+        Err(error) => (
+            format!("Error calling tool ({}): {error}", call.name),
+            true,
+            Value::Null,
+        ),
+    }
+}
+
 async fn run_agent_turns(
     store: &ActiveSessionStore,
     tool_registry: &ToolRegistry,
@@ -357,19 +392,8 @@ async fn run_agent_turns(
                 pending_tool_detail_from_call(&call),
                 TaskStatus::Running,
             );
-            let input = serde_json::from_str(&call.input_json).unwrap_or_else(|_| json!({}));
-            let output = tool_registry
-                .invoke(
-                    ToolCallRequest {
-                        tool_name: call.name.clone(),
-                        input,
-                    },
-                    &tool_context,
-                )
-                .await?;
-            let output_content = output.content;
-            let output_is_error = output.is_error;
-            let output_metadata = output.metadata;
+            let (output_content, output_is_error, output_metadata) =
+                execute_agent_tool_call(tool_registry, &tool_context, &call).await;
             let tool_message = build_tool_result_message(
                 session_id,
                 call.id.clone(),

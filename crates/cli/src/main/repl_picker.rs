@@ -1071,13 +1071,15 @@ fn handle_prompt_file_picker_key(
             true
         }
         KeyCode::PageUp => {
+            let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
             interaction_state.file_picker.selected =
-                interaction_state.file_picker.selected.saturating_sub(5);
+                interaction_state.file_picker.selected.saturating_sub(step);
             true
         }
         KeyCode::PageDown => {
+            let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
             interaction_state.file_picker.selected =
-                (interaction_state.file_picker.selected + 5).min(max_index);
+                (interaction_state.file_picker.selected + step).min(max_index);
             true
         }
         KeyCode::Home => {

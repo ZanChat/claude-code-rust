@@ -178,7 +178,7 @@ where
                         }
                     }
                 }
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
                     clear_prompt_mouse_anchor(interaction_state);
                     if is_paste_shortcut(&key) {
                         if let Some(search_state) = interaction_state.prompt_history_search.as_mut()
@@ -1158,8 +1158,14 @@ where
                             }
                             KeyCode::Up => scroll_up(transcript_scroll, 1),
                             KeyCode::Down => scroll_down(transcript_scroll, 1),
-                            KeyCode::PageUp => scroll_up(transcript_scroll, 5),
-                            KeyCode::PageDown => scroll_down(transcript_scroll, 5),
+                            KeyCode::PageUp => {
+                                let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
+                                scroll_up(transcript_scroll, step);
+                            }
+                            KeyCode::PageDown => {
+                                let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
+                                scroll_down(transcript_scroll, step);
+                            }
                             KeyCode::Home => *transcript_scroll = u16::MAX,
                             KeyCode::End => *transcript_scroll = 0,
                             _ => {}
@@ -1223,8 +1229,14 @@ where
                                 prompt_history_draft,
                             );
                         }
-                        KeyCode::PageUp => scroll_up(transcript_scroll, 5),
-                        KeyCode::PageDown => scroll_down(transcript_scroll, 5),
+                        KeyCode::PageUp => {
+                            let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
+                            scroll_up(transcript_scroll, step);
+                        }
+                        KeyCode::PageDown => {
+                            let step = if key.kind == KeyEventKind::Repeat { 15 } else { 5 };
+                            scroll_down(transcript_scroll, step);
+                        }
                         KeyCode::Home if vim_state.is_insert() => {
                             let _ = set_prompt_cursor(interaction_state, input_buffer, 0);
                         }

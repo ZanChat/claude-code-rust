@@ -276,10 +276,19 @@ fn compact_token_count(tokens: u64) -> String {
 }
 
 fn usage_totals_label(prefix: &str, totals: UsageTotals) -> String {
-    format!(
-        "{prefix} {} tok",
-        compact_token_count(totals.total_tokens())
-    )
+    let cached = totals.cache_read_input_tokens;
+    if cached > 0 {
+        format!(
+            "{prefix} {} tok ({} cached)",
+            compact_token_count(totals.total_tokens()),
+            compact_token_count(cached)
+        )
+    } else {
+        format!(
+            "{prefix} {} tok",
+            compact_token_count(totals.total_tokens())
+        )
+    }
 }
 
 pub(crate) fn repl_header_context_with_usage(
