@@ -1,6 +1,12 @@
 # ccrust
 
-The `code-agent-rust` repository builds the `ccrust` binary: a Rust-native reimplementation of Claude Code agent workflows with support for tasks, tools, plugins, MCP, and multiple providers.
+The `claude-code-rust` repository builds the `ccrust` binary: a Rust-native reimplementation of Claude Code agent workflows with support for tasks, tools, plugins, MCP, and multiple providers, for example Claude Code and Anthropic, OpenAI ChatGPT codex plan, and OpenAI-compatible providers like OpenRouter and Gemini Vertex AI. It is targeted fully compatible with Claude's official Claude Code with fully rewriting with Rust.
+
+You can use your own Codex Plan with Claude Code's agent workflow.
+
+We also introduced some prompt compacting but strictly keeping Claude Code's original prompt caching and format, and fixed some bugs of token cost in original Claude Code. It should work exactly the same way with original Claude Code.
+
+In ZanChat AI, we use this tool with Codex Plan for production-level development. As we are updating the tools everyday, so we recommend you to upgrade it frequently. We'll try our best to keep it stable.
 
 ## Installation
 
