@@ -1,4 +1,5 @@
 use super::*;
+use crossterm::event::KeyboardEnhancementFlags;
 
 #[test]
 fn parses_fixture_backed_slash_commands() {
@@ -670,6 +671,16 @@ fn repl_shortcut_routing_is_modifier_specific() {
         repl_shortcut_action_for_key(&ctrl_e, &interaction_state),
         Some(ReplShortcutAction::ToggleTranscriptDetails)
     );
+}
+
+#[test]
+fn repl_keyboard_enhancement_flags_cover_vscode_shortcuts() {
+    let flags = repl_keyboard_enhancement_flags();
+
+    assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+    assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+    assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
 }
 
 #[test]

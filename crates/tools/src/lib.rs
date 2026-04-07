@@ -20,7 +20,9 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 include!("tools/registry.rs");

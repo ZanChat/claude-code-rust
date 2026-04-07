@@ -173,6 +173,111 @@ impl Tool for EditTool {
     }
 }
 
+const SHELL_OUTPUT_CAPTURE_LIMIT: usize = 128 * 1024;
+const SHELL_OUTPUT_TRUNCATED_MARKER: &str = "\n\n[output truncated]";
+
+#[derive(Clone, Debug)]
+struct ShellCommandOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    truncated: bool,
+}
+
+async fn read_command_stream<R>(mut stream: R) -> Result<(Vec<u8>, bool)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    let mut truncated = false;
+
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+
+        let remaining = SHELL_OUTPUT_CAPTURE_LIMIT.saturating_sub(buffer.len());
+        if remaining > 0 {
+            let keep = read.min(remaining);
+            buffer.extend_from_slice(&chunk[..keep]);
+        }
+        if read > remaining {
+            truncated = true;
+        }
+    }
+
+    Ok((buffer, truncated))
+}
+
+fn combined_shell_output(stdout: &str, stderr: &str, truncated: bool) -> String {
+    let mut content = if stderr.is_empty() {
+        stdout.to_owned()
+    } else if stdout.is_empty() {
+        stderr.to_owned()
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+
+    if truncated {
+        if !content.is_empty() {
+            content.push_str(SHELL_OUTPUT_TRUNCATED_MARKER);
+        } else {
+            content = SHELL_OUTPUT_TRUNCATED_MARKER.trim_start().to_owned();
+        }
+    }
+
+    content
+}
+
+async fn run_shell_command(
+    shell: &str,
+    shell_args: &[&str],
+    command: &str,
+    context: &ToolContext,
+) -> Result<ShellCommandOutput> {
+    let mut child = Command::new(shell);
+    child
+        .kill_on_drop(true)
+        .args(shell_args)
+        .arg(command)
+        .current_dir(&context.cwd)
+        .envs(&context.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child
+        .spawn()
+        .with_context(|| format!("failed to execute {shell} command: {command}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture stdout for {shell} command"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture stderr for {shell} command"))?;
+
+    let stdout_task = tokio::spawn(async move { read_command_stream(stdout).await });
+    let stderr_task = tokio::spawn(async move { read_command_stream(stderr).await });
+    let status = child.wait().await?;
+    let (stdout, stdout_truncated) = stdout_task
+        .await
+        .map_err(|error| anyhow!("failed to join stdout capture task: {error}"))??;
+    let (stderr, stderr_truncated) = stderr_task
+        .await
+        .map_err(|error| anyhow!("failed to join stderr capture task: {error}"))??;
+
+    Ok(ShellCommandOutput {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code: status.code(),
+        truncated: stdout_truncated || stderr_truncated,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct BashTool;
 
@@ -194,30 +299,14 @@ impl Tool for BashTool {
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
         let command = shell_command_input(&input)?;
-        let output = Command::new("bash")
-            .kill_on_drop(true)
-            .arg("-lc")
-            .arg(&command)
-            .current_dir(&context.cwd)
-            .envs(&context.environment)
-            .output()
-            .await
-            .with_context(|| format!("failed to execute bash command: {command}"))?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let content = if stderr.is_empty() {
-            stdout.to_string()
-        } else if stdout.is_empty() {
-            stderr.to_string()
-        } else {
-            format!("{stdout}\n{stderr}")
-        };
+        let output = run_shell_command("bash", &["-lc"], &command, context).await?;
         Ok(ToolOutput {
-            content,
-            is_error: !output.status.success(),
+            content: combined_shell_output(&output.stdout, &output.stderr, output.truncated),
+            is_error: output.exit_code.unwrap_or(1) != 0,
             metadata: json!({
                 "command": command,
-                "exit_code": output.status.code(),
+                "exit_code": output.exit_code,
+                "truncated_output": output.truncated,
             }),
         })
     }
@@ -259,31 +348,14 @@ impl Tool for PowerShellTool {
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
         let command = shell_command_input(&input)?;
-        let output = Command::new("pwsh")
-            .kill_on_drop(true)
-            .arg("-NoLogo")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg(&command)
-            .current_dir(&context.cwd)
-            .envs(&context.environment)
-            .output()
-            .await
-            .with_context(|| format!("failed to execute pwsh command: {command}"))?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let output = run_shell_command("pwsh", &["-NoLogo", "-NoProfile", "-Command"], &command, context).await?;
         Ok(ToolOutput {
-            content: if stderr.is_empty() {
-                stdout.to_string()
-            } else if stdout.is_empty() {
-                stderr.to_string()
-            } else {
-                format!("{stdout}\n{stderr}")
-            },
-            is_error: !output.status.success(),
+            content: combined_shell_output(&output.stdout, &output.stderr, output.truncated),
+            is_error: output.exit_code.unwrap_or(1) != 0,
             metadata: json!({
                 "command": command,
-                "exit_code": output.status.code(),
+                "exit_code": output.exit_code,
+                "truncated_output": output.truncated,
             }),
         })
     }
@@ -315,13 +387,7 @@ impl Tool for TerminalCaptureTool {
                 let id = optional_string(&input, "id")
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 let shell = input_string_or(&input, "shell", "bash");
-                let output = Command::new(&shell)
-                    .kill_on_drop(true)
-                    .arg("-lc")
-                    .arg(&command)
-                    .current_dir(&context.cwd)
-                    .envs(&context.environment)
-                    .output()
+                let output = run_shell_command(&shell, &["-lc"], &command, context)
                     .await
                     .with_context(|| {
                         format!("failed to execute capture command with {shell}: {command}")
@@ -330,9 +396,10 @@ impl Tool for TerminalCaptureTool {
                     "id": id,
                     "shell": shell,
                     "command": command,
-                    "stdout": String::from_utf8_lossy(&output.stdout),
-                    "stderr": String::from_utf8_lossy(&output.stderr),
-                    "exit_code": output.status.code(),
+                    "stdout": output.stdout,
+                    "stderr": output.stderr,
+                    "exit_code": output.exit_code,
+                    "truncated_output": output.truncated,
                 });
                 let path = dir.join(format!(
                     "{}.json",
@@ -340,14 +407,14 @@ impl Tool for TerminalCaptureTool {
                 ));
                 fs::write(&path, serde_json::to_vec_pretty(&record)?)
                     .with_context(|| format!("failed to write {}", path.display()))?;
-                let content = record["stdout"]
-                    .as_str()
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| record["stderr"].as_str().unwrap_or_default())
-                    .to_owned();
+                let content = combined_shell_output(
+                    record["stdout"].as_str().unwrap_or_default(),
+                    record["stderr"].as_str().unwrap_or_default(),
+                    record["truncated_output"].as_bool().unwrap_or(false),
+                );
                 Ok(ToolOutput {
                     content,
-                    is_error: output.status.code().unwrap_or(1) != 0,
+                    is_error: output.exit_code.unwrap_or(1) != 0,
                     metadata: json!({ "path": path, "record": record }),
                 })
             }
@@ -358,11 +425,11 @@ impl Tool for TerminalCaptureTool {
                     .with_context(|| format!("failed to read {}", path.display()))?;
                 let value: Value = serde_json::from_str(&raw)?;
                 Ok(ToolOutput {
-                    content: value["stdout"]
-                        .as_str()
-                        .filter(|text| !text.is_empty())
-                        .unwrap_or_else(|| value["stderr"].as_str().unwrap_or_default())
-                        .to_owned(),
+                    content: combined_shell_output(
+                        value["stdout"].as_str().unwrap_or_default(),
+                        value["stderr"].as_str().unwrap_or_default(),
+                        value["truncated_output"].as_bool().unwrap_or(false),
+                    ),
                     is_error: value["exit_code"].as_i64().unwrap_or_default() != 0,
                     metadata: json!({ "path": path, "record": value }),
                 })

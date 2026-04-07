@@ -260,7 +260,12 @@ fn build_repl_ui_state_groups_pending_steps() {
     );
 
     assert_eq!(state.transcript_lines.len(), 1);
-    assert!(state.transcript_groups.is_empty());
+    assert_eq!(state.transcript_groups.len(), 1);
+    assert!(!state.transcript_groups[0].expanded);
+    assert_eq!(
+        state.transcript_groups[0].title,
+        "Step 1 · running list_dir · src/main.rs"
+    );
     assert_eq!(state.pending_step_count, 1);
     assert!(!state.pending_transcript_details);
     assert!(!state.task_items.is_empty());
@@ -652,12 +657,48 @@ fn toggle_pending_repl_transcript_details_switches_visibility() {
     {
         let state = pending_view.lock().unwrap();
         assert!(state.show_transcript_details);
+        assert!(state.steps[1].expanded);
         assert!(state.steps.iter().all(|entry| !entry.touched));
     }
 
     toggle_pending_repl_transcript_details(&pending_view);
     let state = pending_view.lock().unwrap();
     assert!(!state.show_transcript_details);
+    assert!(state.steps.iter().all(|entry| !entry.expanded));
+}
+
+#[test]
+fn toggle_pending_repl_group_updates_visibility_state() {
+    let pending_view = Arc::new(Mutex::new(PendingReplView {
+        messages: Vec::new(),
+        transcript_overlay_messages: Vec::new(),
+        spinner_verb: "Working".to_owned(),
+        progress_label: "Working".to_owned(),
+        steps: vec![PendingReplStep {
+            step: 1,
+            start_index: 0,
+            status_label: "working".to_owned(),
+            status_detail: None,
+            task_status: TaskStatus::Running,
+            expanded: false,
+            touched: false,
+        }],
+        queued_inputs: Vec::new(),
+        show_transcript_details: false,
+    }));
+
+    toggle_pending_repl_group(&pending_view, "pending-step-1");
+    {
+        let state = pending_view.lock().unwrap();
+        assert!(state.show_transcript_details);
+        assert!(state.steps[0].expanded);
+        assert!(state.steps[0].touched);
+    }
+
+    toggle_pending_repl_group(&pending_view, "pending-step-1");
+    let state = pending_view.lock().unwrap();
+    assert!(!state.show_transcript_details);
+    assert!(!state.steps[0].expanded);
 }
 
 #[test]

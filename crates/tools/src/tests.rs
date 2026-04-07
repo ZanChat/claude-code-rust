@@ -218,6 +218,33 @@ async fn bash_tool_accepts_string_and_alias_inputs() {
 }
 
 #[tokio::test]
+async fn bash_tool_truncates_large_output() {
+    let cwd = make_temp_dir("bash-truncate");
+    let registry = compatibility_tool_registry();
+    let context = ToolContext {
+        cwd,
+        ..ToolContext::default()
+    };
+
+    let output = registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "bash".to_owned(),
+                input: json!({
+                    "command": "printf 'x%.0s' {1..150000}"
+                }),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+
+    assert!(output.content.contains("[output truncated]"));
+    assert!(output.content.len() < 140_000);
+    assert_eq!(output.metadata["truncated_output"], true);
+}
+
+#[tokio::test]
 async fn task_output_reads_completed_task_output() {
     let cwd = make_temp_dir("task-output");
     let registry = compatibility_tool_registry();

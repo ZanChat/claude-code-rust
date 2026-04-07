@@ -54,68 +54,66 @@ fn build_repl_ui_state(
         state.transcript_preview = visible_transcript.transcript_preview;
         state.pending_step_count = pending_view.steps.len();
         state.pending_transcript_details = pending_view.show_transcript_details;
-        if pending_view.show_transcript_details {
-            state.transcript_groups = pending_view
-                .steps
-                .iter()
-                .enumerate()
-                .map(|(index, step)| {
-                    let end_index = pending_view
-                        .steps
-                        .get(index + 1)
-                        .map(|next| next.start_index)
-                        .unwrap_or(runtime_messages.len())
-                        .min(runtime_messages.len());
-                    let start_index = step.start_index.min(end_index);
-                    let slice = &runtime_messages[start_index..end_index];
-                    let assistant_count = slice
-                        .iter()
-                        .filter(|message| message.role == MessageRole::Assistant)
-                        .count();
-                    let tool_count = slice
-                        .iter()
-                        .filter(|message| message.role == MessageRole::Tool)
-                        .count();
-                    let mut detail_parts = vec![format!(
-                        "{} {}",
-                        slice.len(),
-                        if slice.len() == 1 {
-                            "message"
-                        } else {
-                            "messages"
-                        }
-                    )];
-                    if assistant_count > 0 {
-                        detail_parts.push(format!("{} assistant", assistant_count));
-                    }
-                    if tool_count > 0 {
-                        detail_parts.push(format!("{} tool", tool_count));
-                    }
-                    if let Some(detail) = step
-                        .status_detail
-                        .as_deref()
-                        .filter(|detail| !detail.trim().is_empty())
-                    {
-                        detail_parts.insert(0, detail.to_owned());
-                    }
-                    TranscriptGroup {
-                        id: step.id(),
-                        title: pending_step_title(step),
-                        subtitle: Some(detail_parts.join(" · ")),
-                        expanded: step.expanded,
-                        single_item: false,
-                        lines: UiState::from_messages(slice.to_vec()).transcript_lines,
-                    }
-                })
-                .collect();
-            state.transcript_items.extend(
-                state
-                    .transcript_groups
+        state.transcript_groups = pending_view
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let end_index = pending_view
+                    .steps
+                    .get(index + 1)
+                    .map(|next| next.start_index)
+                    .unwrap_or(runtime_messages.len())
+                    .min(runtime_messages.len());
+                let start_index = step.start_index.min(end_index);
+                let slice = &runtime_messages[start_index..end_index];
+                let assistant_count = slice
                     .iter()
-                    .cloned()
-                    .map(TranscriptItem::Group),
-            );
-        }
+                    .filter(|message| message.role == MessageRole::Assistant)
+                    .count();
+                let tool_count = slice
+                    .iter()
+                    .filter(|message| message.role == MessageRole::Tool)
+                    .count();
+                let mut detail_parts = vec![format!(
+                    "{} {}",
+                    slice.len(),
+                    if slice.len() == 1 {
+                        "message"
+                    } else {
+                        "messages"
+                    }
+                )];
+                if assistant_count > 0 {
+                    detail_parts.push(format!("{} assistant", assistant_count));
+                }
+                if tool_count > 0 {
+                    detail_parts.push(format!("{} tool", tool_count));
+                }
+                if let Some(detail) = step
+                    .status_detail
+                    .as_deref()
+                    .filter(|detail| !detail.trim().is_empty())
+                {
+                    detail_parts.insert(0, detail.to_owned());
+                }
+                TranscriptGroup {
+                    id: step.id(),
+                    title: pending_step_title(step),
+                    subtitle: Some(detail_parts.join(" · ")),
+                    expanded: pending_view.show_transcript_details && step.expanded,
+                    single_item: false,
+                    lines: UiState::from_messages(slice.to_vec()).transcript_lines,
+                }
+            })
+            .collect();
+        state.transcript_items.extend(
+            state
+                .transcript_groups
+                .iter()
+                .cloned()
+                .map(TranscriptItem::Group),
+        );
         state
             .transcript_items
             .extend(overlay_groups.into_iter().map(TranscriptItem::Group));

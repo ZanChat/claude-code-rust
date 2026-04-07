@@ -189,6 +189,7 @@ fn toggle_pending_repl_group(pending_view: &Arc<Mutex<PendingReplView>>, group_i
         if let Some(entry) = state.steps.iter_mut().find(|entry| entry.id() == group_id) {
             entry.expanded = !entry.expanded;
             entry.touched = true;
+            state.show_transcript_details = state.steps.iter().any(|step| step.expanded);
         }
     }
 }
@@ -196,6 +197,15 @@ fn toggle_pending_repl_group(pending_view: &Arc<Mutex<PendingReplView>>, group_i
 fn toggle_pending_repl_transcript_details(pending_view: &Arc<Mutex<PendingReplView>>) {
     if let Ok(mut state) = pending_view.lock() {
         state.show_transcript_details = !state.show_transcript_details;
+        let show_transcript_details = state.show_transcript_details;
+        for entry in &mut state.steps {
+            entry.expanded = show_transcript_details && !entry.touched;
+        }
+        if show_transcript_details {
+            if let Some(current) = state.steps.last_mut() {
+                current.expanded = true;
+            }
+        }
     }
 }
 

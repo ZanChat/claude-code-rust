@@ -34,6 +34,13 @@ fn drain_mouse_scroll_burst(
     Ok(burst)
 }
 
+pub(crate) fn repl_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+}
+
 pub(crate) async fn run_interactive_repl(
     store: &ActiveSessionStore,
     registry: &ccrust_core::CommandRegistry,
@@ -68,7 +75,8 @@ pub(crate) async fn run_interactive_repl(
         out,
         EnterAlternateScreen,
         Hide,
-        crossterm::event::EnableBracketedPaste
+        crossterm::event::EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(repl_keyboard_enhancement_flags())
     )?;
     if mouse_capture_enabled {
         execute!(out, EnableMouseCapture)?;
@@ -2070,6 +2078,7 @@ pub(crate) async fn run_interactive_repl(
             terminal.backend_mut(),
             Show,
             crossterm::event::DisableBracketedPaste,
+            PopKeyboardEnhancementFlags,
             DisableMouseCapture,
             LeaveAlternateScreen
         )
@@ -2079,6 +2088,7 @@ pub(crate) async fn run_interactive_repl(
             terminal.backend_mut(),
             Show,
             crossterm::event::DisableBracketedPaste,
+            PopKeyboardEnhancementFlags,
             LeaveAlternateScreen
         )
         .ok();
