@@ -288,6 +288,7 @@ fn provider_auth_status(provider: ApiProvider) -> (bool, Option<String>) {
                         match status.source {
                             ccrust_providers::GeminiAuthSource::GeminiApiKey => "GEMINI_API_KEY",
                             ccrust_providers::GeminiAuthSource::GoogleApiKey => "GOOGLE_API_KEY",
+                            ccrust_providers::GeminiAuthSource::OpenAiApiKey => "OPENAI_API_KEY",
                             ccrust_providers::GeminiAuthSource::None => "none",
                         }
                         .to_owned(),
@@ -1195,19 +1196,20 @@ fn login_draft_from_environment(provider: ApiProvider) -> LoginConfigDraft {
         anthropic_api_key: env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
         gemini_api_key: env::var("GEMINI_API_KEY")
             .or_else(|_| env::var("GOOGLE_API_KEY"))
+            .or_else(|_| env::var("OPENAI_API_KEY"))
             .unwrap_or_default(),
-        gemini_base_url: env::var("GEMINI_BASE_URL").unwrap_or_else(|_| get_gemini_base_url()),
+        gemini_base_url: get_gemini_base_url(),
         openai_api_key: env::var("OPENAI_API_KEY").unwrap_or_default(),
         openai_base_url: env::var("OPENAI_BASE_URL").unwrap_or_default(),
         openai_api_mode: get_openai_api_mode(provider),
         openai_transport: get_openai_transport_mode(),
         reasoning_model: if provider == ApiProvider::Gemini {
-            env::var("GEMINI_REASONING_MODEL").unwrap_or_else(|_| get_gemini_reasoning_model())
+            get_gemini_reasoning_model()
         } else {
             env::var("REASONING_MODEL").unwrap_or_else(|_| get_openai_reasoning_model())
         },
         completion_model: if provider == ApiProvider::Gemini {
-            env::var("GEMINI_COMPLETION_MODEL").unwrap_or_else(|_| get_gemini_completion_model())
+            get_gemini_completion_model()
         } else {
             env::var("COMPLETION_MODEL").unwrap_or_else(|_| get_openai_completion_model())
         },
@@ -1313,6 +1315,11 @@ fn managed_login_env_values(draft: &LoginConfigDraft) -> BTreeMap<String, String
                 ("GEMINI_BASE_URL", draft.gemini_base_url.trim()),
                 ("GEMINI_REASONING_MODEL", draft.reasoning_model.trim()),
                 ("GEMINI_COMPLETION_MODEL", draft.completion_model.trim()),
+                ("REASONING_MODEL_THINK", draft.reasoning_model_think.trim()),
+                (
+                    "COMPLETION_MODEL_THINK",
+                    draft.completion_model_think.trim(),
+                ),
             ] {
                 if !value.is_empty() {
                     values.insert(key.to_owned(), value.to_owned());

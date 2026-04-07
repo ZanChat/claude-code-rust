@@ -29,6 +29,49 @@ fn compact_target_tokens() -> u64 {
     )
 }
 
+fn provider_error_transcript_text(error: &anyhow::Error) -> String {
+    error
+        .downcast_ref::<ccrust_providers::ProviderRequestError>()
+        .map(|error| error.transcript_message().to_owned())
+        .unwrap_or_else(|| error.to_string())
+}
+
+async fn append_provider_error_message(
+    store: &ActiveSessionStore,
+    session_id: SessionId,
+    messages: &mut Vec<Message>,
+    parent_id: Option<uuid::Uuid>,
+    provider: ApiProvider,
+    model: &str,
+    prompt_metrics: &RuntimeSystemPromptMetrics,
+    response_text: String,
+    tool_calls: Vec<ccrust_core::ToolCall>,
+    error_text: String,
+) -> Result<()> {
+    let mut combined_text = response_text.trim().to_owned();
+    let error_text = error_text.trim().to_owned();
+
+    if combined_text.is_empty() {
+        combined_text = error_text;
+    } else if !error_text.is_empty() {
+        combined_text = format!("{combined_text}\n\n{error_text}");
+    }
+
+    let assistant_message = provider_assistant_message(
+        session_id,
+        parent_id,
+        combined_text,
+        tool_calls,
+        provider,
+        model,
+        None,
+        prompt_metrics,
+    );
+    store.append_message(session_id, &assistant_message).await?;
+    messages.push(assistant_message);
+    Ok(())
+}
+
 async fn apply_compaction_outcome(
     store: &ActiveSessionStore,
     session_id: SessionId,
@@ -113,9 +156,27 @@ async fn run_agent_turns(
             None,
             TaskStatus::Running,
         );
-        let provider_client = resolve_provider_client(provider, auth_configured).await?;
         let parent_id = messages.last().map(|message| message.id);
-        let mut stream = provider_client
+        let provider_client = match resolve_provider_client(provider, auth_configured).await {
+            Ok(provider_client) => provider_client,
+            Err(error) => {
+                append_provider_error_message(
+                    store,
+                    session_id,
+                    messages,
+                    parent_id,
+                    provider,
+                    &model,
+                    &system_prompt.metrics,
+                    String::new(),
+                    Vec::new(),
+                    provider_error_transcript_text(&error),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+        let mut stream = match provider_client
             .start_stream(ProviderRequest {
                 model: model.clone(),
                 system_prompt: system_prompt.blocks.clone(),
@@ -123,13 +184,50 @@ async fn run_agent_turns(
                 tools: provider_tools.clone(),
                 ..ProviderRequest::default()
             })
-            .await?;
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                append_provider_error_message(
+                    store,
+                    session_id,
+                    messages,
+                    parent_id,
+                    provider,
+                    &model,
+                    &system_prompt.metrics,
+                    String::new(),
+                    Vec::new(),
+                    provider_error_transcript_text(&error),
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         let mut response_text = String::new();
         let mut response_tool_calls = Vec::new();
         let mut latest_usage = None;
         let mut stop_reason = None;
 
-        while let Some(event) = stream.next_event().await? {
+        while let Some(event) = match stream.next_event().await {
+            Ok(event) => event,
+            Err(error) => {
+                append_provider_error_message(
+                    store,
+                    session_id,
+                    messages,
+                    parent_id,
+                    provider,
+                    &model,
+                    &system_prompt.metrics,
+                    response_text.clone(),
+                    response_tool_calls.clone(),
+                    provider_error_transcript_text(&error),
+                )
+                .await?;
+                return Err(error);
+            }
+        } {
             match event {
                 ProviderEvent::MessageDelta { text } => {
                     response_text.push_str(&text);
@@ -191,7 +289,22 @@ async fn run_agent_turns(
                     stop_reason = Some(reason);
                     break;
                 }
-                ProviderEvent::Error { message } => return Err(anyhow!(message)),
+                ProviderEvent::Error { message } => {
+                    append_provider_error_message(
+                        store,
+                        session_id,
+                        messages,
+                        parent_id,
+                        provider,
+                        &model,
+                        &system_prompt.metrics,
+                        response_text.clone(),
+                        response_tool_calls.clone(),
+                        message.clone(),
+                    )
+                    .await?;
+                    return Err(anyhow!(message));
+                }
             }
         }
 

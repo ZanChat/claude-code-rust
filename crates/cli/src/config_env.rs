@@ -368,13 +368,58 @@ pub(crate) fn managed_login_values_from_environment(
                 if !value.trim().is_empty() {
                     values.insert("GEMINI_API_KEY".to_owned(), value);
                 }
+            } else if let Ok(value) = env::var("OPENAI_API_KEY") {
+                if !value.trim().is_empty() {
+                    values.insert("GEMINI_API_KEY".to_owned(), value);
+                }
             }
 
-            for key in [
-                "GEMINI_BASE_URL",
-                "GEMINI_REASONING_MODEL",
-                "GEMINI_COMPLETION_MODEL",
-            ] {
+            let has_base_url = env::var("GEMINI_BASE_URL")
+                .ok()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+                || env::var("OPENAI_BASE_URL")
+                    .ok()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+            if has_base_url {
+                values.insert(
+                    "GEMINI_BASE_URL".to_owned(),
+                    ccrust_providers::get_gemini_base_url(),
+                );
+            }
+
+            let has_reasoning_model = env::var("GEMINI_REASONING_MODEL")
+                .ok()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+                || env::var("REASONING_MODEL")
+                    .ok()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+            if has_reasoning_model {
+                values.insert(
+                    "GEMINI_REASONING_MODEL".to_owned(),
+                    ccrust_providers::get_gemini_reasoning_model(),
+                );
+            }
+
+            let has_completion_model = env::var("GEMINI_COMPLETION_MODEL")
+                .ok()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+                || env::var("COMPLETION_MODEL")
+                    .ok()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+            if has_completion_model {
+                values.insert(
+                    "GEMINI_COMPLETION_MODEL".to_owned(),
+                    ccrust_providers::get_gemini_completion_model(),
+                );
+            }
+
+            for key in ["REASONING_MODEL_THINK", "COMPLETION_MODEL_THINK"] {
                 if let Ok(value) = env::var(key) {
                     if !value.trim().is_empty() {
                         values.insert(key.to_owned(), value);

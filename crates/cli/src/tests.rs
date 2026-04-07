@@ -1,21 +1,22 @@
 use super::{
-    accept_prompt_history_search, append_pending_repl_overlay_ui_event, apply_managed_login_env,
-    apply_runtime_prompt_metrics, build_command_choice_list, build_ide_choice_list,
-    build_repl_command_input_message, build_repl_command_output_message, build_repl_ui_state,
-    build_resume_choice_list, build_runtime_system_prompt, build_startup_screens,
-    build_startup_ui_state, build_text_message, build_tool_result_message,
-    cancel_prompt_history_search, choose_active_session, command_suggestions, current_time_ms,
-    delete_prompt_selection, enter_message_actions, handle_prompt_file_picker_key,
-    handle_prompt_mouse_action, handle_repl_slash_command, insert_onboarding_input_text,
-    insert_prompt_text, is_paste_shortcut, is_selection_copy_shortcut, load_command_settings,
-    load_session_metadata_for_path, message_action_copy_text, message_action_items_from_runtime,
-    message_actions_ui_state, message_primary_input, message_text, move_prompt_selection,
-    navigate_prompt_history_down, navigate_prompt_history_up, navigate_prompt_input_down,
-    navigate_prompt_input_up, open_prompt_history_search, pane_from_shortcut,
-    pane_from_shortcut_for_terminal, pending_btw_context_messages, pending_btw_provider_request,
-    pending_btw_question, pending_interrupt_messages, pending_transcript_group_id,
-    project_ccrust_env_path, prompt_file_picker_choice_list, prompt_history_from_messages,
-    prompt_history_search_matches, prompt_selection_text, render_advisor_command,
+    accept_prompt_history_search, append_pending_repl_overlay_ui_event,
+    append_provider_error_message, apply_managed_login_env, apply_runtime_prompt_metrics,
+    build_command_choice_list, build_ide_choice_list, build_repl_command_input_message,
+    build_repl_command_output_message, build_repl_ui_state, build_resume_choice_list,
+    build_runtime_system_prompt, build_startup_screens, build_startup_ui_state, build_text_message,
+    build_tool_result_message, cancel_prompt_history_search, choose_active_session,
+    command_suggestions, current_time_ms, delete_prompt_selection, enter_message_actions,
+    handle_prompt_file_picker_key, handle_prompt_mouse_action, handle_repl_slash_command,
+    insert_onboarding_input_text, insert_prompt_text, is_paste_shortcut,
+    is_selection_copy_shortcut, load_command_settings, load_session_metadata_for_path,
+    message_action_copy_text, message_action_items_from_runtime, message_actions_ui_state,
+    message_primary_input, message_text, move_prompt_selection, navigate_prompt_history_down,
+    navigate_prompt_history_up, navigate_prompt_input_down, navigate_prompt_input_up,
+    open_prompt_history_search, pane_from_shortcut, pane_from_shortcut_for_terminal,
+    pending_btw_context_messages, pending_btw_provider_request, pending_btw_question,
+    pending_interrupt_messages, pending_transcript_group_id, project_ccrust_env_path,
+    prompt_file_picker_choice_list, prompt_history_from_messages, prompt_history_search_matches,
+    prompt_selection_text, provider_error_transcript_text, render_advisor_command,
     render_auth_command_with_resume, render_chrome_command, render_command_help,
     render_effort_command, render_fast_command, render_ide_command_with_home,
     render_remote_control_command, render_session_command, render_theme_command,
@@ -47,7 +48,8 @@ use ccrust_core::{
     TaskRecord, TaskStatus, TaskStore, ToolCall,
 };
 use ccrust_providers::{
-    ApiProvider, DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
+    ApiProvider, ProviderRequestError, DEFAULT_OPENAI_COMPLETION_MODEL,
+    DEFAULT_OPENAI_REASONING_MODEL,
 };
 use ccrust_session::{materialize_runtime_messages, LocalSessionStore, SessionSummary};
 use ccrust_tools::compatibility_tool_registry;
@@ -85,6 +87,63 @@ fn build_tool_call_message(
     message.parent_id = parent_id;
     message
 }
+
+#[test]
+fn provider_error_transcript_text_prefers_rich_provider_errors() {
+    let error = anyhow::anyhow!(ProviderRequestError::new(
+        "brief summary",
+        "full transcript body",
+    ));
+
+    assert_eq!(
+        provider_error_transcript_text(&error),
+        "full transcript body"
+    );
+}
+
+#[tokio::test]
+async fn append_provider_error_message_records_assistant_output() {
+    let root = temp_session_root("provider-error-transcript");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+    let session_id = SessionId::new_v4();
+    let mut messages = Vec::new();
+    let user_message = build_text_message(session_id, MessageRole::User, "hello".to_owned(), None);
+    store
+        .append_message(session_id, &user_message)
+        .await
+        .unwrap();
+    messages.push(user_message.clone());
+
+    append_provider_error_message(
+        &store,
+        session_id,
+        &mut messages,
+        Some(user_message.id),
+        ApiProvider::Gemini,
+        "gemini-2.5-pro",
+        &RuntimeSystemPromptMetrics::default(),
+        "partial response".to_owned(),
+        Vec::new(),
+        "full provider error".to_owned(),
+    )
+    .await
+    .unwrap();
+
+    let persisted = store.load_session(session_id).await.unwrap();
+    assert_eq!(persisted.len(), 2);
+    assert_eq!(persisted[1].role, MessageRole::Assistant);
+    assert_eq!(persisted[1].metadata.provider.as_deref(), Some("gemini"));
+    assert_eq!(
+        persisted[1].metadata.model.as_deref(),
+        Some("gemini-2.5-pro")
+    );
+    assert!(persisted[1].blocks.iter().any(|block| matches!(
+        block,
+        ContentBlock::Text { text }
+            if text == "partial response\n\nfull provider error"
+    )));
+}
+
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};

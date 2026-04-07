@@ -98,7 +98,7 @@ The native Gemini provider defaults to:
 - fast model: `GEMINI_COMPLETION_MODEL` or `gemini-2.5-flash`
 - base URL: `GEMINI_BASE_URL` or `https://generativelanguage.googleapis.com/v1beta`
 
-`GOOGLE_API_KEY` is also accepted, but the interactive `/login` flow saves it as `GEMINI_API_KEY` so the setup stays provider-specific.
+`GOOGLE_API_KEY` and `OPENAI_API_KEY` are also accepted. For model/base URL compatibility, native Gemini also falls back to `REASONING_MODEL`, `COMPLETION_MODEL`, `REASONING_MODEL_THINK`, `COMPLETION_MODEL_THINK`, and `OPENAI_BASE_URL`. If `OPENAI_BASE_URL` points at Gemini's OpenAI-compatible `/openai` endpoint, `ccrust` normalizes it back to the native `generateContent` base URL automatically. The interactive `/login` flow still saves provider-specific Gemini keys by default.
 
 ### 4. ChatGPT Codex
 
@@ -144,7 +144,7 @@ ccrust --provider foundry
 | Variable | Description |
 |---|---|
 | `ANTHROPIC_API_KEY` | API key for Anthropic first-party provider |
-| `GEMINI_API_KEY` | API key for the native Gemini provider |
+| `GEMINI_API_KEY` | API key for the native Gemini provider (`GOOGLE_API_KEY` and `OPENAI_API_KEY` also work) |
 | `GOOGLE_API_KEY` | Alternative API key for the native Gemini provider |
 | `OPENAI_API_KEY` | API key / bearer token for OpenAI-family providers |
 | `AWS_ACCESS_KEY_ID` | AWS access key for Bedrock |
@@ -163,7 +163,7 @@ ccrust --provider foundry
 | Variable | Description | Default |
 |---|---|---|
 | `ANTHROPIC_BASE_URL` | Override Anthropic API endpoint | `https://api.anthropic.com` |
-| `GEMINI_BASE_URL` | Override Gemini API endpoint | `https://generativelanguage.googleapis.com/v1beta` |
+| `GEMINI_BASE_URL` | Override Gemini API endpoint (`OPENAI_BASE_URL` also works and `/openai` is normalized) | `https://generativelanguage.googleapis.com/v1beta` |
 | `OPENAI_BASE_URL` | Override OpenAI API endpoint | `https://api.openai.com/v1` |
 | `ANTHROPIC_BEDROCK_BASE_URL` / `BEDROCK_BASE_URL` | Override Bedrock endpoint | Auto-detected from region |
 | `ANTHROPIC_VERTEX_BASE_URL` / `VERTEX_BASE_URL` | Override Vertex AI endpoint | Auto-detected from project/region |
@@ -176,15 +176,15 @@ ccrust --provider foundry
 |---|---|---|
 | `REASONING_MODEL` | Model for thinking-enabled turns | `gpt-5.4` |
 | `COMPLETION_MODEL` | Model for standard and utility turns | `gpt-5.3-codex` |
-| `GEMINI_REASONING_MODEL` | Default model for native Gemini main turns | `gemini-2.5-pro` |
-| `GEMINI_COMPLETION_MODEL` | Default model for native Gemini fast turns | `gemini-2.5-flash` |
+| `GEMINI_REASONING_MODEL` | Default model for native Gemini main turns (`REASONING_MODEL` also works) | `gemini-2.5-pro` |
+| `GEMINI_COMPLETION_MODEL` | Default model for native Gemini fast turns (`COMPLETION_MODEL` also works) | `gemini-2.5-flash` |
 
 ### OpenAI Thinking
 
 | Variable | Description | Default |
 |---|---|---|
-| `REASONING_MODEL_THINK` | Reasoning effort for the reasoning model (`low`, `medium`, `high`, `xhigh`) | `xhigh` |
-| `COMPLETION_MODEL_THINK` | Reasoning effort for the completion model (`low`, `medium`, `high`, `xhigh`) | `xhigh` |
+| `REASONING_MODEL_THINK` | Reasoning effort for the reasoning model (`low`, `medium`, `high`, `xhigh`); native Gemini also uses this when `CLAUDE_CODE_API_PROVIDER=gemini` | `xhigh` |
+| `COMPLETION_MODEL_THINK` | Reasoning effort for the completion model (`low`, `medium`, `high`, `xhigh`); native Gemini also uses this when `CLAUDE_CODE_API_PROVIDER=gemini` | `xhigh` |
 
 ### Claude Thinking
 

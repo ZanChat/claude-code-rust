@@ -2,14 +2,16 @@ use super::{
     codex_auth_file_path, collect_provider_response, collect_provider_text,
     compatibility_model_catalog, decode_jwt_claims, events_from_anthropic_response,
     events_from_gemini_response, events_from_openai_response, events_from_openai_sse_body,
-    get_anthropic_auth_material, get_gemini_credential_hint, get_openai_api_mode,
-    get_openai_auth_status, get_openai_credential_hint, get_openai_family_capabilities,
-    get_openai_transport_mode, get_token_freshness, is_openai_provider, provider_base_url,
-    provider_descriptor, refresh_codex_access_token, resolve_api_provider, resolve_provider_model,
-    sign_bedrock_request, ApiProvider, AuthMaterial, AuthRequest, AuthResolver, EchoProvider,
-    EnvironmentAuthResolver, HttpProvider, ModelCatalog, OpenAIApiMode, OpenAIAuthSource,
-    OpenAIFamilyCapabilities, OpenAITokenFreshness, OpenAITransportMode, PromptBlockStability,
-    PromptCacheScope, ProviderRequest, ProviderToolDefinition, SystemPromptBlock,
+    get_anthropic_auth_material, get_gemini_auth_status, get_gemini_base_url,
+    get_gemini_completion_model, get_gemini_credential_hint, get_gemini_reasoning_model,
+    get_openai_api_mode, get_openai_auth_status, get_openai_credential_hint,
+    get_openai_family_capabilities, get_openai_transport_mode, get_token_freshness,
+    is_openai_provider, provider_base_url, provider_descriptor, refresh_codex_access_token,
+    resolve_api_provider, resolve_provider_model, sign_bedrock_request, ApiProvider, AuthMaterial,
+    AuthRequest, AuthResolver, EchoProvider, EnvironmentAuthResolver, HttpProvider, ModelCatalog,
+    OpenAIApiMode, OpenAIAuthSource, OpenAIFamilyCapabilities, OpenAITokenFreshness,
+    OpenAITransportMode, PromptBlockStability, PromptCacheScope, ProviderRequest,
+    ProviderRequestError, ProviderToolDefinition, SystemPromptBlock,
     DEFAULT_GEMINI_COMPLETION_MODEL, DEFAULT_GEMINI_REASONING_MODEL,
     DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
 };
@@ -133,6 +135,15 @@ fn write_json_response(stream: &mut TcpStream, body_string: &str) {
     stream.write_all(response.as_bytes()).unwrap();
 }
 
+fn write_json_response_with_status(stream: &mut TcpStream, status_line: &str, body_string: &str) {
+    let response = format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body_string.len(),
+        body_string
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
 async fn spawn_json_server(
     response_body: serde_json::Value,
 ) -> (String, std::thread::JoinHandle<CapturedHttpRequest>) {
@@ -143,6 +154,23 @@ async fn spawn_json_server(
         let (mut stream, _) = listener.accept().unwrap();
         let captured = read_captured_http_request(&mut stream);
         write_json_response(&mut stream, &body_string);
+        captured
+    });
+
+    (format!("http://{address}"), handle)
+}
+
+async fn spawn_json_server_with_status(
+    status_line: &'static str,
+    response_body: serde_json::Value,
+) -> (String, std::thread::JoinHandle<CapturedHttpRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let body_string = serde_json::to_string(&response_body).unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let captured = read_captured_http_request(&mut stream);
+        write_json_response_with_status(&mut stream, status_line, &body_string);
         captured
     });
 
@@ -422,6 +450,29 @@ fn openai_provider_hint_mentions_expected_setup() {
 #[test]
 fn gemini_provider_hint_mentions_expected_setup() {
     assert!(get_gemini_credential_hint().contains("GEMINI_API_KEY"));
+    assert!(get_gemini_credential_hint().contains("OPENAI_API_KEY"));
+}
+
+#[test]
+fn gemini_model_and_base_url_fall_back_to_openai_aliases() {
+    with_env_lock(|| {
+        let _gemini_base = set_env_var("GEMINI_BASE_URL", None);
+        let _gemini_reasoning = set_env_var("GEMINI_REASONING_MODEL", None);
+        let _gemini_completion = set_env_var("GEMINI_COMPLETION_MODEL", None);
+        let _openai_base = set_env_var(
+            "OPENAI_BASE_URL",
+            Some("https://generativelanguage.googleapis.com/v1beta/openai/"),
+        );
+        let _reasoning = set_env_var("REASONING_MODEL", Some("gemini-3.1-pro-preview"));
+        let _completion = set_env_var("COMPLETION_MODEL", Some("gemini-3.1-flash-preview"));
+
+        assert_eq!(
+            get_gemini_base_url(),
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(get_gemini_reasoning_model(), "gemini-3.1-pro-preview");
+        assert_eq!(get_gemini_completion_model(), "gemini-3.1-flash-preview");
+    });
 }
 
 #[test]
@@ -584,6 +635,76 @@ async fn resolves_gemini_auth_from_environment() {
 
     assert_eq!(auth.api_key.as_deref(), Some("gemini-key"));
     assert_eq!(auth.source.as_deref(), Some("GEMINI_API_KEY"));
+}
+
+#[tokio::test]
+async fn resolves_gemini_auth_from_openai_api_key_environment() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let _gemini = set_env_var("GEMINI_API_KEY", None);
+    let _google = set_env_var("GOOGLE_API_KEY", None);
+    let _openai = set_env_var("OPENAI_API_KEY", Some("openai-key"));
+
+    let status = get_gemini_auth_status();
+    assert!(status.has_credentials);
+
+    let resolver = EnvironmentAuthResolver;
+    let auth = resolver
+        .resolve_auth(AuthRequest {
+            provider: ApiProvider::Gemini,
+            profile: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(auth.api_key.as_deref(), Some("openai-key"));
+    assert_eq!(auth.source.as_deref(), Some("OPENAI_API_KEY"));
+}
+
+#[test]
+fn gemini_payload_uses_generic_think_env_aliases() {
+    with_env_lock(|| {
+        let _reasoning = set_env_var("REASONING_MODEL_THINK", Some("high"));
+        let _completion = set_env_var("COMPLETION_MODEL_THINK", Some("medium"));
+
+        let reasoning_payload = super::build_gemini_generate_content_payload(&ProviderRequest {
+            model: DEFAULT_GEMINI_REASONING_MODEL.to_owned(),
+            messages: vec![Message::new(
+                MessageRole::User,
+                vec![ContentBlock::Text {
+                    text: "hello gemini".to_owned(),
+                }],
+            )],
+            ..ProviderRequest::default()
+        });
+        let completion_payload = super::build_gemini_generate_content_payload(&ProviderRequest {
+            model: DEFAULT_GEMINI_COMPLETION_MODEL.to_owned(),
+            messages: vec![Message::new(
+                MessageRole::User,
+                vec![ContentBlock::Text {
+                    text: "hello fast gemini".to_owned(),
+                }],
+            )],
+            ..ProviderRequest::default()
+        });
+
+        assert_eq!(
+            reasoning_payload["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            json!(12_288)
+        );
+        assert_eq!(
+            reasoning_payload["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            json!(false)
+        );
+        assert_eq!(
+            completion_payload["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            json!(4_096)
+        );
+        assert_eq!(
+            completion_payload["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            json!(false)
+        );
+    });
 }
 
 #[tokio::test]
@@ -1289,6 +1410,64 @@ async fn sends_native_gemini_generate_content_requests() {
         body["tools"][0]["functionDeclarations"][0]["name"],
         "file_read"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gemini_http_errors_preserve_full_response_for_transcript() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let (base_url, server) = spawn_json_server_with_status(
+        "400 Bad Request",
+        json!({
+            "error": {
+                "message": "bad request",
+                "details": [
+                    {
+                        "field": "model",
+                        "description": "unsupported"
+                    }
+                ]
+            }
+        }),
+    )
+    .await;
+    let provider = HttpProvider::with_base_url(
+        ApiProvider::Gemini,
+        AuthMaterial {
+            api_key: Some("gemini-key".to_owned()),
+            ..AuthMaterial::default()
+        },
+        format!("{base_url}/v1beta"),
+    );
+    let request = ProviderRequest {
+        model: DEFAULT_GEMINI_REASONING_MODEL.to_owned(),
+        messages: vec![Message::new(
+            MessageRole::User,
+            vec![ContentBlock::Text {
+                text: "hello gemini".to_owned(),
+            }],
+        )],
+        ..ProviderRequest::default()
+    };
+
+    let error = collect_provider_response(&provider, request)
+        .await
+        .unwrap_err();
+    let captured = server.join().unwrap();
+
+    assert_eq!(
+        captured.path,
+        format!("/v1beta/models/{DEFAULT_GEMINI_REASONING_MODEL}:generateContent")
+    );
+    assert!(error
+        .to_string()
+        .contains("gemini request failed with status 400 Bad Request: bad request"));
+
+    let provider_error = error
+        .downcast_ref::<ProviderRequestError>()
+        .expect("expected a structured Gemini provider error");
+    assert!(provider_error.transcript_message().contains("\"details\""));
+    assert!(provider_error.transcript_message().contains("unsupported"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

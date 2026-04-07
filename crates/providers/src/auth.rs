@@ -111,6 +111,8 @@ pub enum GeminiAuthSource {
     GeminiApiKey,
     #[serde(rename = "GOOGLE_API_KEY")]
     GoogleApiKey,
+    #[serde(rename = "OPENAI_API_KEY")]
+    OpenAiApiKey,
     #[serde(rename = "none")]
     None,
 }
@@ -136,6 +138,16 @@ pub fn get_gemini_auth_status() -> GeminiAuthStatus {
         }
     }
 
+    if let Ok(api_key) = env::var("OPENAI_API_KEY") {
+        if !api_key.trim().is_empty() {
+            return GeminiAuthStatus {
+                has_credentials: true,
+                source: GeminiAuthSource::OpenAiApiKey,
+                api_key: Some(api_key),
+            };
+        }
+    }
+
     GeminiAuthStatus {
         has_credentials: false,
         source: GeminiAuthSource::None,
@@ -144,7 +156,7 @@ pub fn get_gemini_auth_status() -> GeminiAuthStatus {
 }
 
 pub fn get_gemini_credential_hint() -> String {
-    "Set GEMINI_API_KEY or GOOGLE_API_KEY.".to_owned()
+    "Set GEMINI_API_KEY, GOOGLE_API_KEY, or OPENAI_API_KEY.".to_owned()
 }
 
 #[async_trait]
@@ -160,6 +172,7 @@ impl AuthResolver for EnvironmentAuthResolver {
                             match status.source {
                                 GeminiAuthSource::GeminiApiKey => "GEMINI_API_KEY",
                                 GeminiAuthSource::GoogleApiKey => "GOOGLE_API_KEY",
+                                GeminiAuthSource::OpenAiApiKey => "OPENAI_API_KEY",
                                 GeminiAuthSource::None => "none",
                             }
                             .to_owned(),

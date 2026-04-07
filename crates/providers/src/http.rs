@@ -152,11 +152,13 @@ impl HttpProvider {
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(anyhow!(
+            let summary = format!(
                 "gemini request failed with status {}: {}",
                 status,
                 extract_gemini_error_detail(&body, &compact_error_body(&body))
-            ));
+            );
+            let transcript_message = provider_error_transcript_message("gemini", status, &body);
+            return Err(ProviderRequestError::new(summary, transcript_message).into());
         }
 
         let value: Value = serde_json::from_str(&body)?;
@@ -1169,6 +1171,31 @@ pub(crate) fn compact_error_body(body: &str) -> String {
     truncate_error_text(&compact, 600)
 }
 
+fn pretty_error_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| trimmed.to_owned())
+}
+
+fn provider_error_transcript_message(
+    provider_label: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> String {
+    let pretty_body = pretty_error_body(body);
+    if pretty_body.is_empty() {
+        return format!("{provider_label} request failed with status {status}");
+    }
+
+    format!("{provider_label} request failed with status {status}:\n{pretty_body}")
+}
+
 pub(crate) fn truncate_error_text(text: &str, max_len: usize) -> String {
     let mut compact = text.trim().to_owned();
     if compact.len() > max_len {
@@ -1807,6 +1834,91 @@ fn gemini_generate_content_url(base_url: &str, model: &str) -> String {
     format!("{trimmed}/models/{encoded_model}:generateContent")
 }
 
+fn gemini_thinking_budget_for_effort(effort: &str) -> u64 {
+    match effort {
+        "low" => 1_024,
+        "medium" => 4_096,
+        "high" => 12_288,
+        "xhigh" => 24_576,
+        _ => 24_576,
+    }
+}
+
+fn gemini_thinking_level_for_effort(effort: &str) -> &'static str {
+    match effort {
+        "low" => "LOW",
+        "medium" => "MEDIUM",
+        _ => "HIGH",
+    }
+}
+
+fn gemini_thinking_level_for_budget(budget_tokens: u64) -> &'static str {
+    if budget_tokens <= 1_024 {
+        "LOW"
+    } else if budget_tokens <= 4_096 {
+        "MEDIUM"
+    } else {
+        "HIGH"
+    }
+}
+
+fn build_gemini_thinking_config(request: &ProviderRequest) -> Option<Value> {
+    let configured_effort = get_gemini_configured_think_level(&request.model);
+    let uses_budget = request.model.to_ascii_lowercase().contains("gemini-2.5");
+
+    match &request.thinking {
+        ThinkingConfig::Disabled => configured_effort.map(|effort| {
+            if uses_budget {
+                json!({
+                    "includeThoughts": false,
+                    "thinkingBudget": gemini_thinking_budget_for_effort(&effort),
+                })
+            } else {
+                json!({
+                    "includeThoughts": false,
+                    "thinkingLevel": gemini_thinking_level_for_effort(&effort),
+                })
+            }
+        }),
+        ThinkingConfig::Adaptive => {
+            if let Some(effort) = configured_effort {
+                Some(if uses_budget {
+                    json!({
+                        "includeThoughts": true,
+                        "thinkingBudget": gemini_thinking_budget_for_effort(&effort),
+                    })
+                } else {
+                    json!({
+                        "includeThoughts": true,
+                        "thinkingLevel": gemini_thinking_level_for_effort(&effort),
+                    })
+                })
+            } else {
+                Some(json!({
+                    "includeThoughts": true,
+                }))
+            }
+        }
+        ThinkingConfig::Enabled { budget_tokens } => Some(if uses_budget {
+            json!({
+                "includeThoughts": true,
+                "thinkingBudget": configured_effort
+                    .as_deref()
+                    .map(gemini_thinking_budget_for_effort)
+                    .unwrap_or(*budget_tokens),
+            })
+        } else {
+            json!({
+                "includeThoughts": true,
+                "thinkingLevel": configured_effort
+                    .as_deref()
+                    .map(gemini_thinking_level_for_effort)
+                    .unwrap_or_else(|| gemini_thinking_level_for_budget(*budget_tokens)),
+            })
+        }),
+    }
+}
+
 fn extract_gemini_error_detail(raw_body: &str, fallback: &str) -> String {
     let parsed = serde_json::from_str::<Value>(raw_body).ok();
     let values = match parsed {
@@ -2004,25 +2116,8 @@ pub(crate) fn build_gemini_generate_content_payload(request: &ProviderRequest) -
             Value::Number(max_output_tokens.into()),
         );
     }
-    match &request.thinking {
-        ThinkingConfig::Adaptive => {
-            generation_config.insert(
-                "thinkingConfig".to_owned(),
-                json!({
-                    "includeThoughts": true,
-                }),
-            );
-        }
-        ThinkingConfig::Enabled { budget_tokens } => {
-            generation_config.insert(
-                "thinkingConfig".to_owned(),
-                json!({
-                    "includeThoughts": true,
-                    "thinkingBudget": budget_tokens,
-                }),
-            );
-        }
-        ThinkingConfig::Disabled => {}
+    if let Some(thinking_config) = build_gemini_thinking_config(request) {
+        generation_config.insert("thinkingConfig".to_owned(), thinking_config);
     }
     if !generation_config.is_empty() {
         payload["generationConfig"] = Value::Object(generation_config);

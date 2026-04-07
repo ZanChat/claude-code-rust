@@ -222,6 +222,33 @@ pub struct CollectedProviderResponse {
     pub stop_reason: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProviderRequestError {
+    summary: String,
+    transcript_message: String,
+}
+
+impl ProviderRequestError {
+    pub fn new(summary: impl Into<String>, transcript_message: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+            transcript_message: transcript_message.into(),
+        }
+    }
+
+    pub fn transcript_message(&self) -> &str {
+        &self.transcript_message
+    }
+}
+
+impl std::fmt::Display for ProviderRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.summary)
+    }
+}
+
+impl std::error::Error for ProviderRequestError {}
+
 #[async_trait]
 pub trait AuthResolver: Send + Sync {
     async fn resolve_auth(&self, request: AuthRequest) -> Result<AuthMaterial>;

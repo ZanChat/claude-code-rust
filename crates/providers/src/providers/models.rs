@@ -435,6 +435,20 @@ fn is_openrouter_openai_compatible_base_url(base_url: &str) -> bool {
     base_url.to_ascii_lowercase().contains("openrouter.ai")
 }
 
+fn normalize_gemini_base_url_candidate(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.ends_with("/openai") {
+        return Some(trimmed[..trimmed.len() - "/openai".len()].to_owned());
+    }
+
+    Some(trimmed.to_owned())
+}
+
 pub fn get_openai_api_mode(provider: ApiProvider) -> OpenAIApiMode {
     if let Some(mode) = parse_openai_api_mode(env::var("OPENAI_API_MODE").ok()) {
         return mode;
@@ -512,6 +526,11 @@ pub fn get_gemini_reasoning_model() -> String {
     env::var("GEMINI_REASONING_MODEL")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("REASONING_MODEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
         .unwrap_or_else(|| DEFAULT_GEMINI_REASONING_MODEL.to_owned())
 }
 
@@ -519,14 +538,23 @@ pub fn get_gemini_completion_model() -> String {
     env::var("GEMINI_COMPLETION_MODEL")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("COMPLETION_MODEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
         .unwrap_or_else(|| DEFAULT_GEMINI_COMPLETION_MODEL.to_owned())
 }
 
 pub fn get_gemini_base_url() -> String {
     env::var("GEMINI_BASE_URL")
         .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_owned())
-        .filter(|value| !value.is_empty())
+        .and_then(|value| normalize_gemini_base_url_candidate(&value))
+        .or_else(|| {
+            env::var("OPENAI_BASE_URL")
+                .ok()
+                .and_then(|value| normalize_gemini_base_url_candidate(&value))
+        })
         .unwrap_or_else(|| DEFAULT_GEMINI_BASE_URL.to_owned())
 }
 
@@ -546,6 +574,13 @@ fn parse_think_level(value: Option<String>, fallback: &str) -> String {
     }
 }
 
+fn configured_think_level(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| parse_think_level(Some(value), "xhigh"))
+}
+
 /// Returns the reasoning think level from `REASONING_MODEL_THINK` (default: `xhigh`).
 pub fn get_openai_reasoning_think_level() -> String {
     parse_think_level(env::var("REASONING_MODEL_THINK").ok(), "xhigh")
@@ -554,6 +589,14 @@ pub fn get_openai_reasoning_think_level() -> String {
 /// Returns the completion think level from `COMPLETION_MODEL_THINK` (default: `xhigh`).
 pub fn get_openai_completion_think_level() -> String {
     parse_think_level(env::var("COMPLETION_MODEL_THINK").ok(), "xhigh")
+}
+
+pub(crate) fn get_gemini_configured_think_level(model: &str) -> Option<String> {
+    if model == get_gemini_completion_model() {
+        configured_think_level("COMPLETION_MODEL_THINK")
+    } else {
+        configured_think_level("REASONING_MODEL_THINK")
+    }
 }
 
 // ---------------------------------------------------------------------------

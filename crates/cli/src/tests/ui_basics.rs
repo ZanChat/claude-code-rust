@@ -381,6 +381,53 @@ fn managed_login_values_from_environment_maps_google_api_key_to_gemini_key() {
 }
 
 #[test]
+fn managed_login_values_from_environment_maps_openai_aliases_to_gemini_settings() {
+    with_env_vars(
+        &[
+            ("GEMINI_API_KEY", None),
+            ("GOOGLE_API_KEY", None),
+            ("GEMINI_BASE_URL", None),
+            ("GEMINI_REASONING_MODEL", None),
+            ("GEMINI_COMPLETION_MODEL", None),
+            ("OPENAI_API_KEY", Some("openai-key")),
+            (
+                "OPENAI_BASE_URL",
+                Some("https://generativelanguage.googleapis.com/v1beta/openai/"),
+            ),
+            ("REASONING_MODEL", Some("gemini-3.1-pro-preview")),
+            ("COMPLETION_MODEL", Some("gemini-3.1-flash-preview")),
+            ("REASONING_MODEL_THINK", Some("high")),
+            ("COMPLETION_MODEL_THINK", Some("medium")),
+        ],
+        || {
+            let values = managed_login_values_from_environment(ApiProvider::Gemini);
+
+            assert_eq!(values.get("GEMINI_API_KEY"), Some(&"openai-key".to_owned()));
+            assert_eq!(
+                values.get("GEMINI_BASE_URL"),
+                Some(&"https://generativelanguage.googleapis.com/v1beta".to_owned())
+            );
+            assert_eq!(
+                values.get("GEMINI_REASONING_MODEL"),
+                Some(&"gemini-3.1-pro-preview".to_owned())
+            );
+            assert_eq!(
+                values.get("GEMINI_COMPLETION_MODEL"),
+                Some(&"gemini-3.1-flash-preview".to_owned())
+            );
+            assert_eq!(
+                values.get("REASONING_MODEL_THINK"),
+                Some(&"high".to_owned())
+            );
+            assert_eq!(
+                values.get("COMPLETION_MODEL_THINK"),
+                Some(&"medium".to_owned())
+            );
+        },
+    );
+}
+
+#[test]
 fn bare_launch_defaults_to_interactive_repl() {
     let cli = Cli::default();
     assert!(should_launch_interactive_repl(&cli, None));
