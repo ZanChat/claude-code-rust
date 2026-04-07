@@ -1386,6 +1386,29 @@ async fn pending_btw_side_question_uses_immediate_side_channel() {
 }
 
 #[test]
+fn pending_btw_provider_request_does_not_hard_cap_debug_output() {
+    let session_id = SessionId::new_v4();
+    let request = pending_btw_provider_request(
+        DEFAULT_OPENAI_REASONING_MODEL.to_owned(),
+        vec![ccrust_providers::SystemPromptBlock::new(
+            "system prompt".to_owned(),
+            ccrust_providers::PromptBlockStability::Static,
+            Some(ccrust_providers::PromptCacheScope::Global),
+        )],
+        vec![build_text_message(
+            session_id,
+            MessageRole::User,
+            "send back system prompt for debugging".to_owned(),
+            None,
+        )],
+    );
+
+    assert!(request.max_output_tokens.is_none());
+    assert!(request.tools.is_empty());
+    assert_eq!(request.messages.len(), 1);
+}
+
+#[test]
 fn settings_commands_persist_preferences_and_effort_env() {
     let home = temp_session_root("command-settings-home");
     let home_path = home.display().to_string();

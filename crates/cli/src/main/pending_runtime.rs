@@ -1511,16 +1511,10 @@ async fn run_pending_btw_side_question(
         parent_id,
     ));
     let provider_client = resolve_provider_client(provider, auth_configured).await?;
+    let request = pending_btw_provider_request(active_model, system_prompt, context_messages);
     let response = ccrust_providers::collect_provider_response(
         provider_client.as_ref(),
-        ProviderRequest {
-            model: active_model,
-            system_prompt,
-            messages: context_messages,
-            tools: Vec::new(),
-            max_output_tokens: Some(512),
-            ..ProviderRequest::default()
-        },
+        request,
     )
     .await?;
     let answer = response.text.trim().to_owned();
@@ -1528,6 +1522,21 @@ async fn run_pending_btw_side_question(
         bail!("No response received");
     }
     Ok(answer)
+}
+
+fn pending_btw_provider_request(
+    active_model: String,
+    system_prompt: Vec<SystemPromptBlock>,
+    context_messages: Vec<Message>,
+) -> ProviderRequest {
+    ProviderRequest {
+        model: active_model,
+        system_prompt,
+        messages: context_messages,
+        tools: Vec::new(),
+        max_output_tokens: None,
+        ..ProviderRequest::default()
+    }
 }
 
 enum PendingReplOperationResult<T> {

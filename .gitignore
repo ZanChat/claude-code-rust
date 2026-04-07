@@ -9,3 +9,12 @@ test
 *.diff
 *.py
 Cargo.lock
+.DS_Store
+.idea/
+.vscode/
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.swn
