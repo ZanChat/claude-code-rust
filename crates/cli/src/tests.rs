@@ -6,6 +6,7 @@ use super::{
     build_runtime_system_prompt, build_startup_screens, build_startup_ui_state, build_text_message,
     build_tool_result_message, cancel_prompt_history_search, choose_active_session,
     command_suggestions, current_time_ms, delete_prompt_selection, enter_message_actions,
+    execute_local_turn,
     handle_prompt_file_picker_key, handle_prompt_mouse_action, handle_repl_slash_command,
     insert_onboarding_input_text, insert_prompt_text, is_paste_shortcut,
     is_selection_copy_shortcut, load_command_settings, load_session_metadata_for_path,
@@ -142,6 +143,76 @@ async fn append_provider_error_message_records_assistant_output() {
         ContentBlock::Text { text }
             if text == "partial response\n\nfull provider error"
     )));
+}
+
+#[tokio::test]
+async fn execute_local_turn_refreshes_raw_messages_after_provider_error() {
+    struct EnvVarsGuard {
+        previous: Vec<(String, Option<String>)>,
+    }
+
+    impl Drop for EnvVarsGuard {
+        fn drop(&mut self) {
+            for (key, previous) in self.previous.iter().rev() {
+                match previous {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    let root = temp_session_root("execute-local-turn-provider-error");
+    let env_restore = EnvVarsGuard {
+        previous: vec![
+            ("CODEX_HOME".to_owned(), env::var("CODEX_HOME").ok()),
+            (
+                "GEMINI_API_KEY".to_owned(),
+                env::var("GEMINI_API_KEY").ok(),
+            ),
+            (
+                "GOOGLE_API_KEY".to_owned(),
+                env::var("GOOGLE_API_KEY").ok(),
+            ),
+            (
+                "OPENAI_API_KEY".to_owned(),
+                env::var("OPENAI_API_KEY").ok(),
+            ),
+        ],
+    };
+    env::set_var("CODEX_HOME", root.join("codex-home"));
+    env::remove_var("GEMINI_API_KEY");
+    env::remove_var("GOOGLE_API_KEY");
+    env::remove_var("OPENAI_API_KEY");
+
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+    let session_id = SessionId::new_v4();
+    let tool_registry = compatibility_tool_registry();
+    let mut raw_messages = Vec::new();
+
+    let error = execute_local_turn(
+        &store,
+        &tool_registry,
+        root.clone(),
+        None,
+        ApiProvider::Gemini,
+        "gemini-2.5-pro".to_owned(),
+        session_id,
+        &mut raw_messages,
+        "hello".to_owned(),
+        true,
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    drop(env_restore);
+
+    assert!(error.to_string().contains("GEMINI_API_KEY"));
+    assert_eq!(raw_messages.len(), 2);
+    assert_eq!(raw_messages[1].role, MessageRole::Assistant);
+    assert!(message_text(&raw_messages[1]).contains("GEMINI_API_KEY"));
 }
 
 use serde::Deserialize;

@@ -154,6 +154,56 @@ impl HttpProvider {
         }
     }
 
+    async fn send_request_with_retry<F>(
+        &self,
+        request_label: &str,
+        url: &str,
+        build_request: F,
+    ) -> Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let max_retries = provider_request_max_retries();
+        let mut attempt = 0usize;
+
+        loop {
+            attempt += 1;
+
+            match build_request().send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let retry_after = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+
+                    if should_retry_provider_status(status) && attempt <= max_retries {
+                        let _ = response.bytes().await;
+                        sleep(provider_request_retry_delay(
+                            attempt,
+                            retry_after.as_deref(),
+                        ))
+                        .await;
+                        continue;
+                    }
+
+                    return Ok(response);
+                }
+                Err(error) => {
+                    if should_retry_provider_send_error(&error) && attempt <= max_retries {
+                        sleep(provider_request_retry_delay(attempt, None)).await;
+                        continue;
+                    }
+
+                    return Err(
+                        provider_send_request_error(request_label, url, attempt, &error).into(),
+                    );
+                }
+            }
+        }
+    }
+
     async fn start_anthropic_stream(
         &self,
         request: ProviderRequest,
@@ -198,21 +248,20 @@ impl HttpProvider {
             );
         }
 
+        let headers = self.anthropic_headers(&request.extra_headers)?;
         let response = self
-            .client
-            .post(url)
-            .headers(self.anthropic_headers(&request.extra_headers)?)
-            .json(&payload)
-            .send()
+            .send_request_with_retry("anthropic", &url, || {
+                self.client
+                    .post(url.clone())
+                    .headers(headers.clone())
+                    .json(&payload)
+            })
             .await?;
+
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(anyhow!(
-                "anthropic request failed with status {}: {}",
-                status,
-                compact_error_body(&body)
-            ));
+            return Err(provider_status_request_error("anthropic", status, &body).into());
         }
         let value: Value = serde_json::from_str(&body)?;
         Ok(Box::new(StaticProviderStream::new(
@@ -231,22 +280,23 @@ impl HttpProvider {
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
 
         let response = self
-            .client
-            .post(url)
-            .headers(headers)
-            .json(&payload)
-            .send()
+            .send_request_with_retry("gemini", &url, || {
+                self.client
+                    .post(url.clone())
+                    .headers(headers.clone())
+                    .json(&payload)
+            })
             .await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await?;
-            let summary = format!(
-                "gemini request failed with status {}: {}",
+            return Err(provider_status_request_error_with_detail(
+                "gemini",
                 status,
-                extract_gemini_error_detail(&body, &compact_error_body(&body))
-            );
-            let transcript_message = provider_error_transcript_message("gemini", status, &body);
-            return Err(ProviderRequestError::new(summary, transcript_message).into());
+                &body,
+                extract_gemini_error_detail(&body, &compact_error_body(&body)),
+            )
+            .into());
         }
 
         Ok(Box::new(GeminiSseStream::new(response)))
@@ -397,12 +447,12 @@ impl HttpProvider {
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(anyhow!(
-                "{} request failed with status {}: {}",
+            return Err(provider_status_request_error(
                 openai_request_failure_label(self.provider),
                 status,
-                compact_error_body(&body)
-            ));
+                &body,
+            )
+            .into());
         }
 
         let value: Value = serde_json::from_str(&body)?;
@@ -473,12 +523,12 @@ impl HttpProvider {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await?;
-            return Err(anyhow!(
-                "{} request failed with status {}: {}",
+            return Err(provider_status_request_error(
                 openai_request_failure_label(self.provider),
                 status,
-                compact_error_body(&body)
-            ));
+                &body,
+            )
+            .into());
         }
 
         Ok(Box::new(OpenAIResponsesSseStream::new(response)))
@@ -504,12 +554,12 @@ impl HttpProvider {
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(anyhow!(
-                "{} request failed with status {}: {}",
+            return Err(provider_status_request_error(
                 openai_request_failure_label(self.provider),
                 status,
-                compact_error_body(&body)
-            ));
+                &body,
+            )
+            .into());
         }
 
         let value: Value = serde_json::from_str(&body)?;
@@ -576,56 +626,13 @@ impl HttpProvider {
         payload: &Value,
     ) -> Result<reqwest::Response> {
         let headers = self.openai_headers(extra_headers)?;
-        let max_retries = openai_responses_max_retries();
-        let mut attempt = 0usize;
-
-        loop {
-            attempt += 1;
-            match self
-                .client
-                .post(url)
+        self.send_request_with_retry(openai_request_failure_label(self.provider), url, || {
+            self.client
+                .post(url.to_owned())
                 .headers(headers.clone())
                 .json(payload)
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    let status = response.status();
-                    let retry_after = response
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_owned);
-
-                    if should_retry_openai_responses_status(status) && attempt <= max_retries {
-                        let _ = response.bytes().await;
-                        sleep(openai_responses_retry_delay(
-                            attempt,
-                            retry_after.as_deref(),
-                        ))
-                        .await;
-                        continue;
-                    }
-
-                    return Ok(response);
-                }
-                Err(error) => {
-                    if should_retry_openai_send_error(&error) && attempt <= max_retries {
-                        sleep(openai_responses_retry_delay(attempt, None)).await;
-                        continue;
-                    }
-
-                    return Err(anyhow!(
-                        "{} request failed while sending request to {} after {} attempt{}: {}",
-                        openai_request_failure_label(self.provider),
-                        url,
-                        attempt,
-                        if attempt == 1 { "" } else { "s" },
-                        error
-                    ));
-                }
-            }
-        }
+        })
+        .await
     }
 
     async fn start_bedrock_stream(
@@ -649,20 +656,17 @@ impl HttpProvider {
             .await?;
 
         let response = self
-            .client
-            .post(url)
-            .headers(headers)
-            .body(body)
-            .send()
+            .send_request_with_retry("bedrock", &url, || {
+                self.client
+                    .post(url.clone())
+                    .headers(headers.clone())
+                    .body(body.clone())
+            })
             .await?;
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(anyhow!(
-                "bedrock request failed with status {}: {}",
-                status,
-                compact_error_body(&body)
-            ));
+            return Err(provider_status_request_error("bedrock", status, &body).into());
         }
         let value: Value = serde_json::from_str(&body)?;
         Ok(Box::new(StaticProviderStream::new(
@@ -686,21 +690,20 @@ impl HttpProvider {
         );
         payload.as_object_mut().map(|object| object.remove("model"));
 
+        let headers = self.vertex_headers(&request.extra_headers).await?;
+
         let response = self
-            .client
-            .post(url)
-            .headers(self.vertex_headers(&request.extra_headers).await?)
-            .json(&payload)
-            .send()
+            .send_request_with_retry("vertex", &url, || {
+                self.client
+                    .post(url.clone())
+                    .headers(headers.clone())
+                    .json(&payload)
+            })
             .await?;
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(anyhow!(
-                "vertex request failed with status {}: {}",
-                status,
-                compact_error_body(&body)
-            ));
+            return Err(provider_status_request_error("vertex", status, &body).into());
         }
         let value: Value = serde_json::from_str(&body)?;
         Ok(Box::new(StaticProviderStream::new(
@@ -722,21 +725,20 @@ impl HttpProvider {
             Some(("anthropic_version", Value::String("2023-06-01".to_owned()))),
         );
 
+        let headers = self.foundry_headers(&request.extra_headers).await?;
+
         let response = self
-            .client
-            .post(url)
-            .headers(self.foundry_headers(&request.extra_headers).await?)
-            .json(&payload)
-            .send()
+            .send_request_with_retry("foundry", &url, || {
+                self.client
+                    .post(url.clone())
+                    .headers(headers.clone())
+                    .json(&payload)
+            })
             .await?;
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(anyhow!(
-                "foundry request failed with status {}: {}",
-                status,
-                compact_error_body(&body)
-            ));
+            return Err(provider_status_request_error("foundry", status, &body).into());
         }
         let value: Value = serde_json::from_str(&body)?;
         Ok(Box::new(StaticProviderStream::new(
@@ -1281,6 +1283,47 @@ fn provider_error_transcript_message(
     format!("{provider_label} request failed with status {status}:\n{pretty_body}")
 }
 
+fn provider_status_request_error(
+    provider_label: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> ProviderRequestError {
+    provider_status_request_error_with_detail(
+        provider_label,
+        status,
+        body,
+        compact_error_body(body),
+    )
+}
+
+fn provider_status_request_error_with_detail(
+    provider_label: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+    detail: impl Into<String>,
+) -> ProviderRequestError {
+    ProviderRequestError::new(
+        format!(
+            "{provider_label} request failed with status {status}: {}",
+            detail.into()
+        ),
+        provider_error_transcript_message(provider_label, status, body),
+    )
+}
+
+fn provider_send_request_error(
+    provider_label: &str,
+    url: &str,
+    attempt: usize,
+    error: &reqwest::Error,
+) -> ProviderRequestError {
+    let summary = format!(
+        "{provider_label} request failed while sending request to {url} after {attempt} attempt{}: {error}",
+        if attempt == 1 { "" } else { "s" },
+    );
+    ProviderRequestError::new(summary.clone(), summary)
+}
+
 pub(crate) fn truncate_error_text(text: &str, max_len: usize) -> String {
     let mut compact = text.trim().to_owned();
     if compact.len() > max_len {
@@ -1529,6 +1572,25 @@ pub(crate) fn openai_request_failure_label(provider: ApiProvider) -> &'static st
         ApiProvider::OpenAICompatible => "OpenAI-compatible",
         _ => "OpenAI-compatible",
     }
+}
+
+pub(crate) fn provider_request_max_retries() -> usize {
+    openai_responses_max_retries()
+}
+
+pub(crate) fn should_retry_provider_status(status: reqwest::StatusCode) -> bool {
+    should_retry_openai_responses_status(status)
+}
+
+pub(crate) fn should_retry_provider_send_error(error: &reqwest::Error) -> bool {
+    should_retry_openai_send_error(error)
+}
+
+pub(crate) fn provider_request_retry_delay(
+    attempt: usize,
+    retry_after_header: Option<&str>,
+) -> Duration {
+    openai_responses_retry_delay(attempt, retry_after_header)
 }
 
 pub(crate) fn openai_responses_max_retries() -> usize {

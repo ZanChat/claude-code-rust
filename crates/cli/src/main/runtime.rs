@@ -457,7 +457,7 @@ async fn execute_local_turn(
         .map(|outcome| outcome.estimated_tokens_after)
         .unwrap_or_else(|| estimate_message_tokens(&materialize_runtime_messages(raw_messages)));
     let mut runtime_messages = materialize_runtime_messages(raw_messages);
-    let (_, turn_count, stop_reason) = run_agent_turns(
+    let turn_result = run_agent_turns(
         store,
         tool_registry,
         cwd,
@@ -469,8 +469,10 @@ async fn execute_local_turn(
         live_runtime,
         pending_view.as_ref(),
     )
-    .await?;
+    .await;
     *raw_messages = store.load_session(session_id).await.unwrap_or_default();
+
+    let (_, turn_count, stop_reason) = turn_result?;
 
     Ok((
         applied_compaction,

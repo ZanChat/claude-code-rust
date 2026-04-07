@@ -223,6 +223,27 @@ async fn spawn_flaky_json_server(
     (format!("http://{address}"), handle)
 }
 
+async fn spawn_flaky_sse_server(
+    response_body: String,
+) -> (
+    String,
+    std::thread::JoinHandle<(usize, CapturedHttpRequest)>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        drop(stream);
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let captured = read_captured_http_request(&mut stream);
+        write_sse_response(&mut stream, &response_body);
+        (2, captured)
+    });
+
+    (format!("http://{address}"), handle)
+}
+
 async fn spawn_openai_transport_fallback_server(
     response_body: serde_json::Value,
 ) -> (String, std::thread::JoinHandle<Vec<CapturedHttpRequest>>) {
@@ -1316,6 +1337,61 @@ async fn sends_openai_responses_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retries_anthropic_send_failures() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let (base_url, server) = spawn_flaky_json_server(json!({
+        "content": [
+            {
+                "type": "text",
+                "text": "retry ok"
+            }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 8,
+            "output_tokens": 2
+        }
+    }))
+    .await;
+    let provider = HttpProvider::with_base_url(
+        ApiProvider::FirstParty,
+        AuthMaterial {
+            api_key: Some("anthropic-key".to_owned()),
+            ..AuthMaterial::default()
+        },
+        base_url,
+    );
+    let request = ProviderRequest {
+        model: "claude-sonnet-4-20250514".to_owned(),
+        system_prompt: vec![SystemPromptBlock::new(
+            "Anthropic instructions",
+            PromptBlockStability::Static,
+            Some(PromptCacheScope::Global),
+        )],
+        messages: vec![Message::new(
+            MessageRole::User,
+            vec![ContentBlock::Text {
+                text: "hello anthropic".to_owned(),
+            }],
+        )],
+        ..ProviderRequest::default()
+    };
+
+    let collected = collect_provider_response(&provider, request).await.unwrap();
+    let (attempts, captured) = server.join().unwrap();
+
+    assert_eq!(attempts, 2);
+    assert_eq!(collected.text, "retry ok");
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/v1/messages");
+    assert_eq!(
+        captured.headers.get("x-api-key").map(String::as_str),
+        Some("anthropic-key")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retries_openai_compatible_chat_completions_send_failures() {
     let _guard = ENV_LOCK.lock().await;
 
@@ -1376,6 +1452,49 @@ async fn retries_openai_compatible_chat_completions_send_failures() {
     assert_eq!(body["messages"][0]["role"], "system");
     assert_eq!(body["messages"][0]["content"], "Gemini instructions");
     assert_eq!(body["messages"][1]["role"], "user");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retries_native_gemini_send_failures() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"retry ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":8,\"candidatesTokenCount\":2}}\n\n"
+    );
+    let (base_url, server) = spawn_flaky_sse_server(body.to_owned()).await;
+    let provider = HttpProvider::with_base_url(
+        ApiProvider::Gemini,
+        AuthMaterial {
+            api_key: Some("gemini-key".to_owned()),
+            ..AuthMaterial::default()
+        },
+        format!("{base_url}/v1beta"),
+    );
+    let request = ProviderRequest {
+        model: DEFAULT_GEMINI_REASONING_MODEL.to_owned(),
+        messages: vec![Message::new(
+            MessageRole::User,
+            vec![ContentBlock::Text {
+                text: "hello gemini".to_owned(),
+            }],
+        )],
+        ..ProviderRequest::default()
+    };
+
+    let collected = collect_provider_response(&provider, request).await.unwrap();
+    let (attempts, captured) = server.join().unwrap();
+
+    assert_eq!(attempts, 2);
+    assert_eq!(collected.text, "retry ok");
+    assert_eq!(captured.method, "POST");
+    assert_eq!(
+        captured.path,
+        format!("/v1beta/models/{DEFAULT_GEMINI_REASONING_MODEL}:streamGenerateContent?alt=sse")
+    );
+    assert_eq!(
+        captured.headers.get("x-goog-api-key").map(String::as_str),
+        Some("gemini-key")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1533,6 +1652,47 @@ async fn gemini_http_errors_preserve_full_response_for_transcript() {
         .expect("expected a structured Gemini provider error");
     assert!(provider_error.transcript_message().contains("\"details\""));
     assert!(provider_error.transcript_message().contains("unsupported"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gemini_send_failures_return_structured_provider_errors() {
+    let _guard = ENV_LOCK.lock().await;
+    let _retries = set_env_var("CLAUDE_CODE_MAX_RETRIES", Some("0"));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+
+    let provider = HttpProvider::with_base_url(
+        ApiProvider::Gemini,
+        AuthMaterial {
+            api_key: Some("gemini-key".to_owned()),
+            ..AuthMaterial::default()
+        },
+        format!("http://{address}/v1beta"),
+    );
+    let request = ProviderRequest {
+        model: DEFAULT_GEMINI_REASONING_MODEL.to_owned(),
+        messages: vec![Message::new(
+            MessageRole::User,
+            vec![ContentBlock::Text {
+                text: "hello gemini".to_owned(),
+            }],
+        )],
+        ..ProviderRequest::default()
+    };
+
+    let error = collect_provider_response(&provider, request)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("gemini request failed while sending request to"));
+
+    let provider_error = error
+        .downcast_ref::<ProviderRequestError>()
+        .expect("expected a structured Gemini provider send error");
+    assert_eq!(provider_error.transcript_message(), error.to_string());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
