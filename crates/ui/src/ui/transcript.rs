@@ -304,6 +304,13 @@ fn pane_shortcut_label() -> &'static str {
 }
 
 fn pending_details_toggle_label(state: &UiState) -> Option<&'static str> {
+    if resolved_transcript_items(state)
+        .into_iter()
+        .any(|item| matches!(item, TranscriptItem::Group(group) if group.single_item))
+    {
+        return None;
+    }
+
     (state.pending_step_count > 0).then_some(if state.pending_transcript_details {
         "Ctrl+E hide details"
     } else {
@@ -867,6 +874,16 @@ fn single_item_group_detail_lines(group: &TranscriptGroup, width: u16) -> Vec<Li
 
         if transcript_line.role == "history_tool_call" && !lines.is_empty() {
             lines.push(Line::from(""));
+        }
+
+        if !matches!(
+            transcript_line.role.as_str(),
+            "history_tool_call" | "history_tool_error" | "history_tool_result"
+        ) {
+            for line in wrapped_transcript_lines(transcript_line, width.saturating_sub(2)) {
+                lines.push(indent_line(line, "  "));
+            }
+            continue;
         }
 
         let (first_prefix, continuation_prefix, content_width) = match transcript_line.role.as_str()

@@ -94,7 +94,9 @@ where
                                     ) =>
                                 {
                                     clear_prompt_mouse_anchor(interaction_state);
-                                    if is_history_transcript_group_id(&group_id) {
+                                    if is_history_transcript_group_id(&group_id)
+                                        || is_pending_transcript_group_id(&group_id)
+                                    {
                                         toggle_history_transcript_group(
                                             interaction_state,
                                             &group_id,
@@ -376,7 +378,15 @@ where
                                 }
                             }
                             ReplShortcutAction::ToggleTranscriptDetails => {
-                                if !pending_snapshot.steps.is_empty() {
+                                let overlay_group_ids = pending_transcript_group_ids(
+                                    &pending_snapshot.transcript_overlay_messages,
+                                );
+                                if !overlay_group_ids.is_empty() {
+                                    let _ = toggle_all_history_transcript_groups(
+                                        interaction_state,
+                                        &overlay_group_ids,
+                                    );
+                                } else if !pending_snapshot.steps.is_empty() {
                                     toggle_pending_repl_transcript_details(&pending_view);
                                 } else {
                                     let group_ids =
@@ -1316,13 +1326,17 @@ where
                                     } else if let Some(question) =
                                         pending_btw_question(&invocation)
                                     {
-                                        append_pending_repl_overlay_ui_event(
+                                        if let Some(group_id) = append_pending_repl_overlay_ui_event(
                                             &pending_view,
                                             session_id,
                                             invocation.raw_input.clone(),
                                             "command",
                                             None,
-                                        );
+                                        ) {
+                                            interaction_state
+                                                .expanded_history_groups
+                                                .insert(group_id);
+                                        }
                                         compact_banner = Some("answering /btw".to_owned());
                                         let system_prompt = build_runtime_system_prompt(
                                             cwd,
@@ -1409,7 +1423,7 @@ where
             }, if side_question_task.is_some() => {
                 match result {
                     Some(Ok(Ok(answer))) => {
-                        append_pending_repl_overlay_ui_event(
+                        let _ = append_pending_repl_overlay_ui_event(
                             &pending_view,
                             session_id,
                             answer,
@@ -1419,7 +1433,7 @@ where
                         compact_banner = None;
                     }
                     Some(Ok(Err(error))) => {
-                        append_pending_repl_overlay_ui_event(
+                        let _ = append_pending_repl_overlay_ui_event(
                             &pending_view,
                             session_id,
                             format!("error: {error}"),
@@ -1429,7 +1443,7 @@ where
                         compact_banner = None;
                     }
                     Some(Err(error)) => {
-                        append_pending_repl_overlay_ui_event(
+                        let _ = append_pending_repl_overlay_ui_event(
                             &pending_view,
                             session_id,
                             format!("task failed: {error}"),

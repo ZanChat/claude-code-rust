@@ -123,6 +123,7 @@ fn should_append_pending_interrupt_message(queued_inputs: &[String]) -> bool {
 }
 
 const PENDING_TRANSCRIPT_OVERLAY_TAG: &str = "pending_transcript_overlay";
+const PENDING_TRANSCRIPT_GROUP_PREFIX: &str = "pending-transcript-group-";
 
 fn append_pending_repl_overlay_ui_event(
     pending_view: &Arc<Mutex<PendingReplView>>,
@@ -130,20 +131,26 @@ fn append_pending_repl_overlay_ui_event(
     text: impl Into<String>,
     ui_role: &str,
     ui_author: Option<String>,
-) {
+) -> Option<String> {
     if let Ok(mut state) = pending_view.lock() {
         let parent_id = state
             .transcript_overlay_messages
             .last()
             .map(|message| message.id)
             .or_else(|| state.messages.last().map(|message| message.id));
-        let mut message = build_ui_event_message(session_id, parent_id, text.into(), ui_role, ui_author);
+        let text = text.into();
+        let mut message = build_ui_event_message(session_id, parent_id, text.clone(), ui_role, ui_author);
         message
             .metadata
             .tags
             .push(PENDING_TRANSCRIPT_OVERLAY_TAG.to_owned());
+        let group_id =
+            (ui_role == "command" && text.trim_start().starts_with("/btw"))
+                .then(|| pending_transcript_group_id(&message));
         state.transcript_overlay_messages.push(message);
+        return group_id;
     }
+    None
 }
 
 fn is_pending_transcript_overlay_message(message: &Message) -> bool {
@@ -152,6 +159,29 @@ fn is_pending_transcript_overlay_message(message: &Message) -> bool {
         .tags
         .iter()
         .any(|tag| tag == PENDING_TRANSCRIPT_OVERLAY_TAG)
+}
+
+fn pending_transcript_group_id(message: &Message) -> String {
+    format!("{PENDING_TRANSCRIPT_GROUP_PREFIX}{}", message.id)
+}
+
+fn is_pending_transcript_group_id(group_id: &str) -> bool {
+    group_id.starts_with(PENDING_TRANSCRIPT_GROUP_PREFIX)
+}
+
+fn pending_transcript_group_ids(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| {
+            message
+                .metadata
+                .attributes
+                .get(UI_ROLE_ATTRIBUTE)
+                .is_some_and(|role| role == "command")
+                && message_text(message).trim_start().starts_with("/btw")
+        })
+        .map(pending_transcript_group_id)
+        .collect()
 }
 
 fn toggle_pending_repl_group(pending_view: &Arc<Mutex<PendingReplView>>, group_id: &str) {

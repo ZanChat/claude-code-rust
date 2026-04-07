@@ -277,15 +277,16 @@ fn build_repl_ui_state_shows_pending_overlay_messages_in_transcript() {
     let registry = compatibility_command_registry();
     let session_id = SessionId::new_v4();
     let user = build_text_message(session_id, MessageRole::User, "main task".to_owned(), None);
+    let command = build_repl_command_input_message(session_id, Some(user.id), "/btw what changed?");
     let pending_view = PendingReplView {
         messages: materialize_runtime_messages(std::slice::from_ref(&user)),
         transcript_overlay_messages: vec![
-            build_repl_command_input_message(session_id, Some(user.id), "/btw what changed?"),
+            command.clone(),
             build_repl_command_output_message(
                 session_id,
-                None,
+                Some(command.id),
                 "btw",
-                "This is the side-question answer.",
+                "This is the side-question answer.\nIt should stay fully visible while expanded.",
             ),
         ],
         spinner_verb: "Working".to_owned(),
@@ -323,13 +324,18 @@ fn build_repl_ui_state_shows_pending_overlay_messages_in_transcript() {
         Vec::new(),
         0,
         0,
-        &ReplInteractionState::default(),
+        &ReplInteractionState {
+            expanded_history_groups: BTreeSet::from([pending_transcript_group_id(&command)]),
+            ..ReplInteractionState::default()
+        },
     );
 
     let rendered = ccrust_ui::render_to_string(&state, 100, 24).unwrap();
 
     assert!(rendered.contains("/btw what changed?"));
+    assert!(rendered.contains("/btw"));
     assert!(rendered.contains("This is the side-question answer."));
+    assert!(rendered.contains("It should stay fully visible while expanded."));
 }
 
 #[test]

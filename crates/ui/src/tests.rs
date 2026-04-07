@@ -23,7 +23,7 @@ fn renders_transcript_empty_state_and_commands() {
     let rendered = render_to_string(&state, 100, 24).unwrap();
 
     assert!(rendered.contains("Start a conversation"));
-    assert!(rendered.contains("/help") || rendered.contains("/clear"));
+    assert!(rendered.contains("start with / to browse commands"));
 }
 
 #[test]
@@ -241,6 +241,42 @@ fn footer_advertises_pending_detail_toggle_while_working() {
     assert_eq!(
         footer_primary_text(&state, false),
         "Working · Ctrl+C to interrupt · Ctrl+E hide details"
+    );
+}
+
+#[test]
+fn footer_prefers_single_item_group_toggle_while_pending() {
+    let mut state = RatatuiApp::new("pending-btw-toggle").initial_state();
+    state.show_input = true;
+    state.vim_state.enabled = true;
+    state.vim_state.enter_normal();
+    state.progress_message = Some("/ Waiting for response".to_owned());
+    state.pending_step_count = 1;
+    state.transcript_items = vec![TranscriptItem::Group(TranscriptGroup {
+        id: "pending-transcript-group-1".to_owned(),
+        title: "/btw what changed?".to_owned(),
+        subtitle: Some("short answer preview".to_owned()),
+        expanded: true,
+        single_item: true,
+        lines: vec![TranscriptLine {
+            role: "assistant".to_owned(),
+            text: "full side answer".to_owned(),
+            author_label: Some("/btw".to_owned()),
+            token_label: None,
+        }],
+    })];
+
+    assert_eq!(
+        footer_primary_text(&state, false),
+        "Working · Ctrl+C to interrupt · Ctrl+E collapse history"
+    );
+
+    if let TranscriptItem::Group(group) = &mut state.transcript_items[0] {
+        group.expanded = false;
+    }
+    assert_eq!(
+        footer_primary_text(&state, false),
+        "Working · Ctrl+C to interrupt · Ctrl+E expand history"
     );
 }
 

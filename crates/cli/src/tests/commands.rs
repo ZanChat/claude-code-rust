@@ -1318,14 +1318,15 @@ fn pending_overlay_ui_events_chain_after_runtime_messages() {
         "working",
     )));
 
-    append_pending_repl_overlay_ui_event(
+    let group_id = append_pending_repl_overlay_ui_event(
         &pending_view,
         session_id,
         "/btw what changed?",
         "command",
         None,
-    );
-    append_pending_repl_overlay_ui_event(
+    )
+    .expect("expected /btw group id");
+    let _ = append_pending_repl_overlay_ui_event(
         &pending_view,
         session_id,
         "side answer",
@@ -1335,6 +1336,10 @@ fn pending_overlay_ui_events_chain_after_runtime_messages() {
 
     let state = pending_view.lock().unwrap();
     assert_eq!(state.transcript_overlay_messages.len(), 2);
+    assert_eq!(
+        group_id,
+        pending_transcript_group_id(&state.transcript_overlay_messages[0])
+    );
     assert_eq!(
         state.transcript_overlay_messages[0].parent_id,
         Some(base.id)

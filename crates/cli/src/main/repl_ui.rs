@@ -34,8 +34,10 @@ fn build_repl_ui_state(
             .collect();
     }
     if let Some(pending_view) = pending_view.filter(|view| !view.steps.is_empty()) {
-        let overlay_transcript =
-            UiState::from_messages(pending_view.transcript_overlay_messages.clone());
+        let overlay_groups = pending_overlay_transcript_groups(
+            &pending_view.transcript_overlay_messages,
+            &interaction_state.expanded_history_groups,
+        );
         let first_step_start = pending_view
             .steps
             .first()
@@ -50,9 +52,6 @@ fn build_repl_ui_state(
         state.transcript_lines = visible_transcript.transcript_lines;
         state.transcript_items = visible_history.items;
         state.transcript_preview = visible_transcript.transcript_preview;
-        state
-            .transcript_lines
-            .extend(overlay_transcript.transcript_lines.clone());
         state.pending_step_count = pending_view.steps.len();
         state.pending_transcript_details = pending_view.show_transcript_details;
         if pending_view.show_transcript_details {
@@ -119,7 +118,7 @@ fn build_repl_ui_state(
         }
         state
             .transcript_items
-            .extend(overlay_transcript.transcript_items);
+            .extend(overlay_groups.into_iter().map(TranscriptItem::Group));
     } else {
         state.transcript_items = build_history_transcript_presentation(
             &runtime_messages,
@@ -211,6 +210,100 @@ fn build_repl_ui_state(
         });
     }
     state
+}
+
+#[derive(Clone, Debug)]
+struct PendingOverlayTranscriptGroupAccumulator {
+    input_message: Message,
+    output_messages: Vec<Message>,
+}
+
+impl PendingOverlayTranscriptGroupAccumulator {
+    fn new(input_message: &Message) -> Self {
+        Self {
+            input_message: input_message.clone(),
+            output_messages: Vec::new(),
+        }
+    }
+
+    fn push_output(&mut self, message: &Message) {
+        self.output_messages.push(message.clone());
+    }
+
+    fn into_group(self, expanded_groups: &BTreeSet<String>) -> TranscriptGroup {
+        let group_id = pending_transcript_group_id(&self.input_message);
+        let title = message_text(&self.input_message);
+        let lines = if self.output_messages.is_empty() {
+            vec![TranscriptLine {
+                role: "assistant".to_owned(),
+                text: "Answering...".to_owned(),
+                author_label: Some("/btw".to_owned()),
+                token_label: None,
+            }]
+        } else {
+            self.output_messages
+                .iter()
+                .map(pending_overlay_output_line)
+                .collect()
+        };
+        let subtitle = lines
+            .iter()
+            .find_map(|line| preview_detail(&line.text, 1, 72))
+            .or_else(|| Some("Answering...".to_owned()));
+
+        TranscriptGroup {
+            id: group_id.clone(),
+            title,
+            subtitle,
+            expanded: expanded_groups.contains(&group_id),
+            single_item: true,
+            lines,
+        }
+    }
+}
+
+fn pending_overlay_output_line(message: &Message) -> TranscriptLine {
+    let mut line = transcript_line_from_message(message);
+    if line.role == "command_output" {
+        line.role = "assistant".to_owned();
+    }
+    if line.author_label.is_none() {
+        line.author_label = Some("/btw".to_owned());
+    }
+    line
+}
+
+fn pending_overlay_transcript_groups(
+    overlay_messages: &[Message],
+    expanded_groups: &BTreeSet<String>,
+) -> Vec<TranscriptGroup> {
+    let mut groups = Vec::new();
+    let mut current_group: Option<PendingOverlayTranscriptGroupAccumulator> = None;
+
+    for message in overlay_messages {
+        let role = message
+            .metadata
+            .attributes
+            .get(UI_ROLE_ATTRIBUTE)
+            .map(String::as_str);
+        if role == Some("command") && message_text(message).trim_start().starts_with("/btw") {
+            if let Some(group) = current_group.take() {
+                groups.push(group.into_group(expanded_groups));
+            }
+            current_group = Some(PendingOverlayTranscriptGroupAccumulator::new(message));
+            continue;
+        }
+
+        if let Some(group) = current_group.as_mut() {
+            group.push_output(message);
+        }
+    }
+
+    if let Some(group) = current_group.take() {
+        groups.push(group.into_group(expanded_groups));
+    }
+
+    groups
 }
 
 fn draw_repl_state(
