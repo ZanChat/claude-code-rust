@@ -553,7 +553,7 @@ fn renders_runtime_header() {
     let mut state = RatatuiApp::new("header").initial_state();
     state.header_title = Some("ccrust v0.1.0".to_owned());
     state.header_subtitle = Some("gemini-3.1-pro-preview · openai-compatible".to_owned());
-    state.header_context = Some("/Users/pengfeiduan/workspace/code-agent-rust".to_owned());
+    state.header_context = Some("~/workspace/code-agent-rust".to_owned());
 
     let rendered = render_to_string(&state, 80, 24).unwrap();
 
@@ -569,7 +569,7 @@ fn wraps_long_runtime_header_content() {
     state.header_subtitle =
         Some("gemini-3.1-pro-preview · openai-compatible · reasoning".to_owned());
     state.header_context =
-        Some("/Users/pengfeiduan/workspace/code-agent-rust/examples/very/long/path".to_owned());
+        Some("~/workspace/code-agent-rust/examples/very/long/path".to_owned());
 
     let rendered = render_to_string(&state, 48, 20).unwrap();
 

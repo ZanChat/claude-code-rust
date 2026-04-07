@@ -53,10 +53,7 @@ pub(crate) async fn handle_repl_slash_command(
     match invocation.name.as_str() {
         "help" => Ok(render_command_help(registry, remote_mode)),
         "version" => Ok(env!("CARGO_PKG_VERSION").to_owned()),
-        "add-dir" => render_simple_compat_command(
-            "add-dir",
-            "Working-directory expansion is not modeled yet in the Rust runtime. Reopen the session from the target path when you need to pivot into another directory.",
-        ),
+        "add-dir" => render_add_dir_command(cwd),
         "branch" => render_branch_command(store, repl_session, &invocation, raw_messages).await,
         "config" => {
             if matches!(invocation.args.first().map(String::as_str), Some("migrate")) {
@@ -156,18 +153,9 @@ pub(crate) async fn handle_repl_slash_command(
         "skills" => render_skills_command(cwd, plugin_root).await,
         "reload-plugins" => render_skills_command(cwd, plugin_root).await,
         "hooks" => render_hooks_command(cwd, plugin_root),
-        "feedback" => render_simple_compat_command(
-            "feedback",
-            "Interactive feedback submission is not bundled into the Rust runtime yet.",
-        ),
-        "install-github-app" => render_simple_compat_command(
-            "install-github-app",
-            "The GitHub Actions setup UI is not bundled into the Rust runtime yet.",
-        ),
-        "longtask" => render_simple_compat_command(
-            "longtask",
-            "The long-running wrapper REPL is not modeled separately in the Rust runtime yet.",
-        ),
+        "feedback" => render_feedback_command(),
+        "install-github-app" => render_install_github_app_command(),
+        "longtask" => render_longtask_command(),
         "output-style" => render_output_style_command(),
         "mcp" => {
             render_mcp_command(
@@ -194,10 +182,7 @@ pub(crate) async fn handle_repl_slash_command(
             cwd,
         ),
         "statusline" => render_statusline_command(provider, active_model, repl_session.session_id),
-        "color" => render_simple_compat_command(
-            "color",
-            "Prompt-bar color overrides are not implemented in the Rust runtime yet. Use /theme for terminal palette changes.",
-        ),
+        "color" => render_color_command(&invocation),
         "theme" => render_theme_command(&invocation),
         "vim" => {
             vim_state.enabled = !vim_state.enabled;
@@ -209,10 +194,7 @@ pub(crate) async fn handle_repl_slash_command(
             render_vim_command(vim_state.enabled)
         }
         "plan" => render_plan_command(cwd, &invocation),
-        "doctor" => render_simple_compat_command(
-            "doctor",
-            "Compatibility diagnostics are still minimal in the Rust runtime. Use /status, /config, /mcp, /plugin, and /skills to inspect the active setup.",
-        ),
+        "doctor" => render_doctor_command(cwd),
         "fast" => {
             let outcome = render_fast_command(&invocation, provider, active_model)?;
             if let Some(model) = outcome.next_model {
@@ -220,10 +202,7 @@ pub(crate) async fn handle_repl_slash_command(
             }
             Ok(outcome.message)
         }
-        "passes" => render_simple_compat_command(
-            "passes",
-            "Pass-count tuning is not yet modeled separately in the Rust runtime.",
-        ),
+        "passes" => render_passes_command(),
         "effort" => render_effort_command(cwd, &invocation),
         "context" => render_context_command(raw_messages, provider, active_model),
         "tag" => render_tag_command(store, repl_session.session_id, &invocation).await,
@@ -241,23 +220,14 @@ pub(crate) async fn handle_repl_slash_command(
         "mobile" => render_mobile_command(store, repl_session.session_id).await,
         "desktop" => render_desktop_command(store, repl_session.session_id).await,
         "chrome" => render_chrome_command(&invocation),
-        "release-notes" => render_simple_compat_command(
-            "release-notes",
-            "A dedicated release-notes viewer is not bundled into the Rust runtime yet.",
-        ),
+        "release-notes" => render_release_notes_command(cwd),
         "reload-auth" => render_reload_auth_command(provider),
-        "sandbox" => render_simple_compat_command(
-            "sandbox",
-            "Sandbox policy toggles are not wired into the Rust runtime yet. Use the surrounding shell or launch configuration to control sandboxing.",
-        ),
+        "sandbox" => render_sandbox_command(),
         "stickers" => render_simple_compat_command(
             "stickers",
             "Sticker ordering is not available in the Rust runtime.",
         ),
-        "terminal-setup" => render_simple_compat_command(
-            "terminal-setup",
-            "Terminal keybinding installers are not bundled into the Rust runtime yet. Configure your terminal to send a dedicated newline shortcut if you need one.",
-        ),
+        "terminal-setup" => render_terminal_setup_command(),
         "tasks" => render_tasks_command(&invocation, cwd),
         "agents" => {
             render_agents_command(
@@ -287,7 +257,7 @@ pub(crate) async fn handle_repl_slash_command(
             .await
         }
         "advisor" => render_advisor_command(&invocation),
-        "voice" => Ok("voice features are intentionally deferred in this build".to_owned()),
+        "voice" => render_voice_command(),
         "exit" | "quit" => Ok("exit".to_owned()),
         other => Err(anyhow!("unknown registered REPL command: {other}")),
     }

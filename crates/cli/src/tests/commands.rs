@@ -1906,14 +1906,34 @@ async fn targeted_command_outputs_do_not_use_placeholder_copy() {
 
     let cases = vec![
         CommandInvocation {
+            name: "add-dir".to_owned(),
+            args: vec![],
+            raw_input: "/add-dir".to_owned(),
+        },
+        CommandInvocation {
             name: "theme".to_owned(),
             args: vec![],
             raw_input: "/theme".to_owned(),
         },
         CommandInvocation {
+            name: "color".to_owned(),
+            args: vec![],
+            raw_input: "/color".to_owned(),
+        },
+        CommandInvocation {
             name: "fast".to_owned(),
             args: vec![],
             raw_input: "/fast".to_owned(),
+        },
+        CommandInvocation {
+            name: "doctor".to_owned(),
+            args: vec![],
+            raw_input: "/doctor".to_owned(),
+        },
+        CommandInvocation {
+            name: "passes".to_owned(),
+            args: vec![],
+            raw_input: "/passes".to_owned(),
         },
         CommandInvocation {
             name: "effort".to_owned(),
@@ -1946,9 +1966,44 @@ async fn targeted_command_outputs_do_not_use_placeholder_copy() {
             raw_input: "/advisor".to_owned(),
         },
         CommandInvocation {
+            name: "feedback".to_owned(),
+            args: vec![],
+            raw_input: "/feedback".to_owned(),
+        },
+        CommandInvocation {
+            name: "install-github-app".to_owned(),
+            args: vec![],
+            raw_input: "/install-github-app".to_owned(),
+        },
+        CommandInvocation {
+            name: "longtask".to_owned(),
+            args: vec![],
+            raw_input: "/longtask".to_owned(),
+        },
+        CommandInvocation {
+            name: "release-notes".to_owned(),
+            args: vec![],
+            raw_input: "/release-notes".to_owned(),
+        },
+        CommandInvocation {
             name: "reload-auth".to_owned(),
             args: vec![],
             raw_input: "/reload-auth".to_owned(),
+        },
+        CommandInvocation {
+            name: "sandbox".to_owned(),
+            args: vec![],
+            raw_input: "/sandbox".to_owned(),
+        },
+        CommandInvocation {
+            name: "terminal-setup".to_owned(),
+            args: vec![],
+            raw_input: "/terminal-setup".to_owned(),
+        },
+        CommandInvocation {
+            name: "voice".to_owned(),
+            args: vec![],
+            raw_input: "/voice".to_owned(),
         },
     ];
     let banned = [
@@ -1956,6 +2011,11 @@ async fn targeted_command_outputs_do_not_use_placeholder_copy() {
         "compatibility state",
         "not persisted yet",
         "intentionally deferred",
+        "not bundled",
+        "not implemented",
+        "not modeled",
+        "still minimal",
+        "not yet",
     ];
 
     for invocation in cases {

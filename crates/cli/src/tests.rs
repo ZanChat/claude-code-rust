@@ -6,9 +6,8 @@ use super::{
     build_runtime_system_prompt, build_startup_screens, build_startup_ui_state, build_text_message,
     build_tool_result_message, cancel_prompt_history_search, choose_active_session,
     command_suggestions, current_time_ms, delete_prompt_selection, enter_message_actions,
-    execute_local_turn,
-    handle_prompt_file_picker_key, handle_prompt_mouse_action, handle_repl_slash_command,
-    insert_onboarding_input_text, insert_prompt_text, is_paste_shortcut,
+    execute_local_turn, handle_prompt_file_picker_key, handle_prompt_mouse_action,
+    handle_repl_slash_command, insert_onboarding_input_text, insert_prompt_text, is_paste_shortcut,
     is_selection_copy_shortcut, load_command_settings, load_session_metadata_for_path,
     message_action_copy_text, message_action_items_from_runtime, message_actions_ui_state,
     message_primary_input, message_text, move_prompt_selection, navigate_prompt_history_down,
@@ -167,18 +166,9 @@ async fn execute_local_turn_refreshes_raw_messages_after_provider_error() {
     let env_restore = EnvVarsGuard {
         previous: vec![
             ("CODEX_HOME".to_owned(), env::var("CODEX_HOME").ok()),
-            (
-                "GEMINI_API_KEY".to_owned(),
-                env::var("GEMINI_API_KEY").ok(),
-            ),
-            (
-                "GOOGLE_API_KEY".to_owned(),
-                env::var("GOOGLE_API_KEY").ok(),
-            ),
-            (
-                "OPENAI_API_KEY".to_owned(),
-                env::var("OPENAI_API_KEY").ok(),
-            ),
+            ("GEMINI_API_KEY".to_owned(), env::var("GEMINI_API_KEY").ok()),
+            ("GOOGLE_API_KEY".to_owned(), env::var("GOOGLE_API_KEY").ok()),
+            ("OPENAI_API_KEY".to_owned(), env::var("OPENAI_API_KEY").ok()),
         ],
     };
     env::set_var("CODEX_HOME", root.join("codex-home"));
@@ -410,6 +400,7 @@ fn noninteractive_handled_command_names() -> BTreeSet<&'static str> {
 }
 
 mod commands;
+mod parity;
 mod remote;
 mod session_ui;
 mod ui_basics;

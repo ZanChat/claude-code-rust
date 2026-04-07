@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 include!("commands/clipboard.rs");
 include!("commands/renderers.rs");
+include!("commands/parity.rs");
 include!("commands/repl_submit.rs");
 include!("commands/repl_loop.rs");
 include!("commands/noninteractive.rs");

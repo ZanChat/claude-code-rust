@@ -138,6 +138,15 @@ fn suggested_session_title(raw_messages: &[Message]) -> Option<String> {
         .map(|text| preview_lines_from_text(text, 1, 64).join(" "))
 }
 
+pub(crate) fn render_add_dir_command(cwd: &Path) -> Result<String> {
+    Ok([
+        "Add directory".to_owned(),
+        format!("Current session cwd: {}", cwd.display()),
+        "The Rust rewrite keeps one working tree per session. Start or resume a session from another directory when you need to pivot.".to_owned(),
+    ]
+    .join("\n"))
+}
+
 fn write_transcript_messages(path: &Path, messages: &[Message]) -> Result<()> {
     if messages.is_empty() {
         if path.exists() {
@@ -911,6 +920,12 @@ pub(crate) fn render_theme_command(invocation: &CommandInvocation) -> Result<Str
     Ok(format!("Theme preference saved as {}.", preset.label))
 }
 
+pub(crate) fn render_color_command(invocation: &CommandInvocation) -> Result<String> {
+    let mut lines = vec![render_theme_command(invocation)?];
+    lines.push("/color is a compatibility alias for /theme in the Rust rewrite.".to_owned());
+    Ok(lines.join("\n"))
+}
+
 pub(crate) fn render_fast_command(
     invocation: &CommandInvocation,
     provider: ApiProvider,
@@ -1307,6 +1322,98 @@ pub(crate) fn render_plan_command(cwd: &Path, invocation: &CommandInvocation) ->
 
 pub(crate) fn render_simple_compat_command(name: &str, message: &str) -> Result<String> {
     Ok(format!("/{name}\n{message}"))
+}
+
+pub(crate) fn render_feedback_command() -> Result<String> {
+    Ok([
+        "Feedback".to_owned(),
+        "The Rust rewrite does not ship an in-app feedback form.".to_owned(),
+        "Use your normal issue tracker or review workflow for feedback on this runtime.".to_owned(),
+    ]
+    .join("\n"))
+}
+
+pub(crate) fn render_install_github_app_command() -> Result<String> {
+    Ok([
+        "GitHub app".to_owned(),
+        "The Rust rewrite does not ship the GitHub Actions installer wizard.".to_owned(),
+        "Install the GitHub app outside the runtime, then use /plugin or /review once the repo is configured.".to_owned(),
+    ]
+    .join("\n"))
+}
+
+pub(crate) fn render_longtask_command() -> Result<String> {
+    Ok([
+        "Long task".to_owned(),
+        "Long-running work uses the normal REPL, /tasks, and background agent tasks in the Rust rewrite.".to_owned(),
+        "There is no separate longtask wrapper shell.".to_owned(),
+    ]
+    .join("\n"))
+}
+
+pub(crate) fn render_passes_command() -> Result<String> {
+    Ok([
+        "Passes".to_owned(),
+        "Reasoning depth is controlled by /effort [low|medium|high] and /fast.".to_owned(),
+        "The Rust rewrite does not expose a separate numeric pass counter.".to_owned(),
+    ]
+    .join("\n"))
+}
+
+pub(crate) fn render_release_notes_command(cwd: &Path) -> Result<String> {
+    if let Some(changelog_path) = find_rewrite_workspace_root(cwd)
+        .map(|root| root.join("CHANGELOG.md"))
+        .filter(|path| path.is_file())
+    {
+        return Ok([
+            "Release notes".to_owned(),
+            format!("Changelog: {}", changelog_path.display()),
+        ]
+        .join("\n"));
+    }
+
+    Ok([
+        "Release notes".to_owned(),
+        "Check CHANGELOG.md in the rewrite repository for release notes.".to_owned(),
+    ]
+    .join("\n"))
+}
+
+pub(crate) fn render_sandbox_command() -> Result<String> {
+    let sandbox_mode = env::var("CODEX_SANDBOX").unwrap_or_else(|_| "unmanaged".to_owned());
+    let network_access = match env::var("CODEX_SANDBOX_NETWORK_DISABLED").as_deref() {
+        Ok("1") => "disabled",
+        Ok(_) => "restricted",
+        Err(_) => "default",
+    };
+    Ok([
+        "Sandbox".to_owned(),
+        format!("mode: {sandbox_mode}"),
+        format!("network access: {network_access}"),
+        "Sandbox policy is controlled outside the REPL by the launch environment.".to_owned(),
+    ]
+    .join("\n"))
+}
+
+pub(crate) fn render_terminal_setup_command() -> Result<String> {
+    let term_program = env::var("TERM_PROGRAM").unwrap_or_else(|_| "unknown".to_owned());
+    Ok([
+        "Terminal setup".to_owned(),
+        format!("Detected terminal: {term_program}"),
+        "Configure a manual newline shortcut such as Ctrl+J or Alt+Enter if you want multiline prompt input.".to_owned(),
+        "The Rust rewrite does not install terminal keybindings for you.".to_owned(),
+    ]
+    .join("\n"))
+}
+
+pub(crate) fn render_voice_command() -> Result<String> {
+    Ok([
+        "Voice".to_owned(),
+        "CLI input: --voice-text TEXT or --voice-file PATH [--voice-format MIME]".to_owned(),
+        "Bridge input: remote voice frames are accepted and persisted with the session.".to_owned(),
+        "The REPL has no in-app capture or playback toggle.".to_owned(),
+    ]
+    .join("\n"))
 }
 
 pub(crate) fn render_hooks_command(cwd: &Path, plugin_root: Option<&PathBuf>) -> Result<String> {
