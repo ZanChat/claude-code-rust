@@ -1,18 +1,18 @@
 use super::{
-    codex_auth_file_path, collect_provider_response, collect_provider_text,
-    compatibility_model_catalog, decode_jwt_claims, events_from_anthropic_response,
-    events_from_gemini_response, events_from_gemini_sse_body, events_from_openai_response,
-    events_from_openai_sse_body, get_anthropic_auth_material, get_gemini_auth_status,
-    get_gemini_base_url, get_gemini_completion_model, get_gemini_credential_hint,
-    get_gemini_reasoning_model, get_openai_api_mode, get_openai_auth_status,
-    get_openai_credential_hint, get_openai_family_capabilities, get_openai_transport_mode,
-    get_token_freshness, is_openai_provider, provider_base_url, provider_descriptor,
-    refresh_codex_access_token, resolve_api_provider, resolve_provider_model, sign_bedrock_request,
-    ApiProvider, AuthMaterial, AuthRequest, AuthResolver, EchoProvider, EnvironmentAuthResolver,
-    HttpProvider, ModelCatalog, OpenAIApiMode, OpenAIAuthSource, OpenAIFamilyCapabilities,
-    OpenAITokenFreshness, OpenAITransportMode, PromptBlockStability, PromptCacheScope,
-    ProviderRequest, ProviderRequestError, ProviderToolDefinition, SystemPromptBlock,
-    DEFAULT_GEMINI_COMPLETION_MODEL, DEFAULT_GEMINI_REASONING_MODEL,
+    code_agent_auth_snapshot_path, codex_auth_file_path, collect_provider_response,
+    collect_provider_text, compatibility_model_catalog, decode_jwt_claims,
+    events_from_anthropic_response, events_from_gemini_response, events_from_gemini_sse_body,
+    events_from_openai_response, events_from_openai_sse_body, get_anthropic_auth_material,
+    get_gemini_auth_status, get_gemini_base_url, get_gemini_completion_model,
+    get_gemini_credential_hint, get_gemini_reasoning_model, get_openai_api_mode,
+    get_openai_auth_status, get_openai_credential_hint, get_openai_family_capabilities,
+    get_openai_transport_mode, get_token_freshness, is_openai_provider, provider_base_url,
+    provider_descriptor, refresh_codex_access_token, resolve_api_provider, resolve_provider_model,
+    sign_bedrock_request, ApiProvider, AuthMaterial, AuthRequest, AuthResolver, EchoProvider,
+    EnvironmentAuthResolver, HttpProvider, ModelCatalog, OpenAIApiMode, OpenAIAuthSource,
+    OpenAIFamilyCapabilities, OpenAITokenFreshness, OpenAITransportMode, PromptBlockStability,
+    PromptCacheScope, ProviderRequest, ProviderRequestError, ProviderToolDefinition,
+    SystemPromptBlock, DEFAULT_GEMINI_COMPLETION_MODEL, DEFAULT_GEMINI_REASONING_MODEL,
     DEFAULT_OPENAI_COMPLETION_MODEL, DEFAULT_OPENAI_REASONING_MODEL,
 };
 use ccrust_core::{ContentBlock, Message, MessageRole, ToolCall};
@@ -328,6 +328,60 @@ fn uses_codex_home_for_auth_path() {
                 codex_auth_file_path(),
                 PathBuf::from("/tmp/codex-home/auth.json")
             );
+        });
+    });
+}
+
+#[test]
+fn uses_claude_code_codex_home_for_auth_path() {
+    with_env_lock(|| {
+        with_env_var("CODEX_HOME", None, || {
+            with_env_var(
+                "CLAUDE_CODE_CODEX_HOME",
+                Some("/tmp/claude-codex-home"),
+                || {
+                    assert_eq!(
+                        codex_auth_file_path(),
+                        PathBuf::from("/tmp/claude-codex-home/auth.json")
+                    );
+                },
+            );
+        });
+    });
+}
+
+#[test]
+fn uses_explicit_codex_auth_json_path_overrides() {
+    with_env_lock(|| {
+        with_env_var("CODEX_HOME", Some("/tmp/codex-home"), || {
+            with_env_var(
+                "CODEX_AUTH_JSON_PATH",
+                Some("/tmp/shared/auth.json"),
+                || {
+                    assert_eq!(
+                        codex_auth_file_path(),
+                        PathBuf::from("/tmp/shared/auth.json")
+                    );
+                },
+            );
+        });
+    });
+}
+
+#[test]
+fn keeps_private_auth_snapshot_separate_from_shared_codex_auth_file() {
+    with_env_lock(|| {
+        with_env_var("CODEX_HOME", Some("/tmp/codex-home"), || {
+            with_env_var("CLAUDE_CONFIG_DIR", Some("/tmp/claude-config"), || {
+                assert_eq!(
+                    codex_auth_file_path(),
+                    PathBuf::from("/tmp/codex-home/auth.json")
+                );
+                assert_eq!(
+                    code_agent_auth_snapshot_path(),
+                    PathBuf::from("/tmp/claude-config/ccrust/code-agent-auth.json")
+                );
+            });
         });
     });
 }

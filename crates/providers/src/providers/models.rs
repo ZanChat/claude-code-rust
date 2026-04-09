@@ -46,7 +46,14 @@ pub fn config_migration_report(provider: ApiProvider) -> ConfigMigrationReport {
         }
     }
 
-    let auth_snapshot_path = code_agent_auth_snapshot_path();
+    let auth_snapshot_path = {
+        let current = code_agent_auth_snapshot_path();
+        if current.exists() {
+            current
+        } else {
+            legacy_code_agent_auth_snapshot_path()
+        }
+    };
     let codex_auth_path = codex_auth_file_path();
     ConfigMigrationReport {
         provider,

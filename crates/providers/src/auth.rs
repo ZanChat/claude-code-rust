@@ -261,6 +261,9 @@ pub fn codex_home_dir() -> PathBuf {
     if let Some(home) = env::var_os("CODEX_HOME") {
         return PathBuf::from(home);
     }
+    if let Some(home) = env::var_os("CLAUDE_CODE_CODEX_HOME") {
+        return PathBuf::from(home);
+    }
 
     match env::var_os("HOME") {
         Some(home) => PathBuf::from(home).join(".codex"),
@@ -268,31 +271,72 @@ pub fn codex_home_dir() -> PathBuf {
     }
 }
 
+pub(crate) fn claude_config_home_dir() -> PathBuf {
+    if let Some(path) = env::var_os("CLAUDE_CONFIG_DIR") {
+        return PathBuf::from(path);
+    }
+
+    match env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".claude"),
+        None => PathBuf::from(".claude"),
+    }
+}
+
 pub fn codex_auth_file_path() -> PathBuf {
+    if let Some(path) = env::var_os("CODEX_AUTH_JSON_PATH") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = env::var_os("CLAUDE_CODE_CODEX_AUTH_JSON_PATH") {
+        return PathBuf::from(path);
+    }
     codex_home_dir().join("auth.json")
 }
 
-pub fn code_agent_auth_snapshot_path() -> PathBuf {
+pub(crate) fn legacy_code_agent_auth_snapshot_path() -> PathBuf {
     codex_home_dir().join("code-agent-auth.json")
 }
 
+pub fn code_agent_auth_snapshot_path() -> PathBuf {
+    claude_config_home_dir()
+        .join("ccrust")
+        .join("code-agent-auth.json")
+}
+
 pub fn clear_auth_snapshot(provider: ApiProvider) -> Result<bool> {
-    let path = code_agent_auth_snapshot_path();
-    if !path.exists() {
-        return Ok(false);
-    }
-    let mut providers = read_auth_snapshot().unwrap_or_default();
-    let removed = match provider {
-        ApiProvider::OpenAICompatible => {
-            providers.remove(provider.as_str()).is_some() | providers.remove("openai").is_some()
+    let mut cleared = false;
+    for path in [
+        code_agent_auth_snapshot_path(),
+        legacy_code_agent_auth_snapshot_path(),
+    ] {
+        if !path.exists() {
+            continue;
         }
-        _ => providers.remove(provider.as_str()).is_some(),
-    };
-    fs::write(
-        &path,
-        serde_json::to_vec_pretty(&AuthSnapshotFile { providers })?,
-    )?;
-    Ok(removed)
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let mut providers = match serde_json::from_str::<AuthSnapshotFile>(&raw) {
+            Ok(snapshot) => snapshot.providers,
+            Err(_) => continue,
+        };
+        let removed = match provider {
+            ApiProvider::OpenAICompatible => {
+                providers.remove(provider.as_str()).is_some() | providers.remove("openai").is_some()
+            }
+            _ => providers.remove(provider.as_str()).is_some(),
+        };
+        if removed {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&AuthSnapshotFile { providers })?,
+            )?;
+            cleared = true;
+        }
+    }
+    Ok(cleared)
 }
 
 pub fn write_auth_snapshot(provider: ApiProvider, auth: &AuthMaterial) -> Result<PathBuf> {

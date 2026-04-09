@@ -95,10 +95,18 @@ pub fn read_codex_auth_file(path: Option<&std::path::Path>) -> Option<CodexAuthF
 }
 
 pub fn read_auth_snapshot() -> Option<BTreeMap<String, AuthMaterial>> {
-    let raw = fs::read_to_string(code_agent_auth_snapshot_path()).ok()?;
-    serde_json::from_str::<AuthSnapshotFile>(&raw)
-        .ok()
-        .map(|snapshot| snapshot.providers)
+    for path in [
+        code_agent_auth_snapshot_path(),
+        legacy_code_agent_auth_snapshot_path(),
+    ] {
+        let Some(raw) = fs::read_to_string(path).ok() else {
+            continue;
+        };
+        if let Ok(snapshot) = serde_json::from_str::<AuthSnapshotFile>(&raw) {
+            return Some(snapshot.providers);
+        }
+    }
+    None
 }
 
 pub fn read_provider_auth_snapshot(provider: ApiProvider) -> Option<AuthMaterial> {
