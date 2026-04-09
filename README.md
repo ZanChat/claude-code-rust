@@ -49,6 +49,16 @@ If no provider is configured, bare `ccrust` opens onboarding automatically.
 Inside the REPL, `/login` opens the same onboarding flow and `/logout` clears
 the tracked `*.env.ccrust` config for that session.
 
+For OpenAI-family auth compatibility, `ccrust` uses the same shared Codex
+credentials file as the TS version and official `codex login`: `auth.json` is
+resolved from `CODEX_AUTH_JSON_PATH`, then
+`CLAUDE_CODE_CODEX_AUTH_JSON_PATH`, then `CODEX_HOME` /
+`CLAUDE_CODE_CODEX_HOME`, and finally `~/.codex/auth.json`.
+
+Any ccrust-only fallback auth snapshot is stored separately at
+`~/.claude/ccrust/code-agent-auth.json` by default, so using `ccrust` does not
+move or replace the shared `auth.json` that other tools continue to use.
+
 ## Supported API Providers & Authentication
 
 ### 1. Anthropic (First-Party) — Default
@@ -102,11 +112,17 @@ The native Gemini provider defaults to:
 
 ### 4. ChatGPT Codex
 
-Uses `~/.codex/auth.json` for authentication with automatic token refresh:
+Uses the shared Codex `auth.json` for authentication with automatic token
+refresh. Path resolution matches the TS version and official Codex tooling:
+`CODEX_AUTH_JSON_PATH` -> `CLAUDE_CODE_CODEX_AUTH_JSON_PATH` -> `CODEX_HOME` /
+`CLAUDE_CODE_CODEX_HOME` -> `~/.codex/auth.json`.
 
 ```bash
 ccrust --provider chatgpt-codex
 ```
+
+`/logout` does not delete the shared Codex `auth.json`; it only clears
+ccrust-managed local config and fallback snapshot state.
 
 ### 5. Amazon Bedrock
 
@@ -157,6 +173,10 @@ ccrust --provider foundry
 | `AZURE_API_KEY` | Alternative API key for Azure AI Foundry |
 | `AZURE_AUTH_TOKEN` | Bearer token for Azure AI Foundry |
 | `FOUNDRY_AUTH_TOKEN` | Alternative bearer token for Foundry |
+| `CODEX_AUTH_JSON_PATH` | Explicit path to the shared Codex/OpenAI auth file |
+| `CLAUDE_CODE_CODEX_AUTH_JSON_PATH` | Alternate explicit path to the shared Codex/OpenAI auth file |
+| `CODEX_HOME` | Base directory for Codex state such as `auth.json` |
+| `CLAUDE_CODE_CODEX_HOME` | Alternate base directory for Codex state such as `auth.json` |
 
 ### Base URLs
 
