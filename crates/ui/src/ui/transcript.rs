@@ -53,18 +53,135 @@ fn transcript_token_label(message: &Message) -> Option<String> {
     (estimated > 0).then(|| format!("~{} ctx tok", compact_token_count(estimated)))
 }
 
+fn extract_tag_content(input: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = input.find(&start_tag)? + start_tag.len();
+    let end = input[start..].find(&end_tag)? + start;
+    Some(input[start..end].trim().to_owned())
+}
+
+fn merged_output_text(parts: [Option<String>; 2]) -> Option<String> {
+    let parts = parts
+        .into_iter()
+        .flatten()
+        .map(|part| part.trim().to_owned())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn unwrap_persisted_output(text: &str) -> String {
+    extract_tag_content(text, "persisted-output").unwrap_or_else(|| text.trim().to_owned())
+}
+
+fn tagged_command_text(text: &str) -> Option<String> {
+    let command = extract_tag_content(text, "command-message")
+        .or_else(|| extract_tag_content(text, "command-name"))?
+        .trim()
+        .to_owned();
+    if command.is_empty() {
+        return None;
+    }
+
+    if extract_tag_content(text, "skill-format").as_deref() == Some("true") {
+        return Some(format!("Skill({command})"));
+    }
+
+    let args = extract_tag_content(text, "command-args")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" {value}"))
+        .unwrap_or_default();
+    Some(format!("/{command}{args}"))
+}
+
+fn tagged_transcript_line(text: &str) -> Option<TranscriptLine> {
+    if let Some(command) = tagged_command_text(text) {
+        return Some(TranscriptLine {
+            role: "command".to_owned(),
+            text: command,
+            author_label: None,
+            token_label: None,
+        });
+    }
+
+    if let Some(input) = extract_tag_content(text, "bash-input").filter(|value| !value.is_empty())
+    {
+        return Some(TranscriptLine {
+            role: "command".to_owned(),
+            text: format!("! {input}"),
+            author_label: None,
+            token_label: None,
+        });
+    }
+
+    let local_stdout = extract_tag_content(text, "local-command-stdout");
+    let local_stderr = extract_tag_content(text, "local-command-stderr");
+    if let Some(output) = merged_output_text([local_stdout, local_stderr]) {
+        return Some(TranscriptLine {
+            role: "command_output".to_owned(),
+            text: output,
+            author_label: Some("Local command".to_owned()),
+            token_label: None,
+        });
+    }
+
+    let bash_stdout = extract_tag_content(text, "bash-stdout")
+        .map(|value| unwrap_persisted_output(&value));
+    let bash_stderr = extract_tag_content(text, "bash-stderr");
+    if let Some(output) = merged_output_text([bash_stdout, bash_stderr]) {
+        return Some(TranscriptLine {
+            role: "command_output".to_owned(),
+            text: output,
+            author_label: Some("Shell".to_owned()),
+            token_label: None,
+        });
+    }
+
+    if text.contains("<task-notification") {
+        if let Some(summary) = extract_tag_content(text, "summary")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(TranscriptLine {
+                role: "task".to_owned(),
+                text: summary,
+                author_label: None,
+                token_label: None,
+            });
+        }
+    }
+
+    None
+}
+
+fn normalize_transcript_line(
+    role: String,
+    text: String,
+    author_label: Option<String>,
+) -> TranscriptLine {
+    tagged_transcript_line(&text).unwrap_or(TranscriptLine {
+        role,
+        text,
+        author_label,
+        token_label: None,
+    })
+}
+
 pub fn transcript_line_from_message(message: &Message) -> TranscriptLine {
-    TranscriptLine {
-        role: transcript_role(message),
-        text: message
+    let mut line = normalize_transcript_line(
+        transcript_role(message),
+        message
             .blocks
             .iter()
             .filter_map(content_block_text)
             .collect::<Vec<_>>()
             .join("\n\n"),
-        author_label: transcript_author_label(message),
-        token_label: transcript_token_label(message),
-    }
+        transcript_author_label(message),
+    );
+    line.token_label = transcript_token_label(message);
+    line
 }
 
 fn content_block_text(block: &ContentBlock) -> Option<String> {

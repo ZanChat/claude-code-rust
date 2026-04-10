@@ -549,6 +549,47 @@ fn attachment_ui_events_render_with_custom_roles_and_authors() {
 }
 
 #[test]
+fn legacy_tagged_user_messages_render_command_and_task_shapes() {
+    let state = RatatuiApp::new("legacy-tags").state_from_messages(
+        vec![
+            Message::new(
+                MessageRole::User,
+                vec![ContentBlock::Text {
+                    text: "<command-message>review</command-message><command-args>src/lib.rs</command-args>".to_owned(),
+                }],
+            ),
+            Message::new(
+                MessageRole::User,
+                vec![ContentBlock::Text {
+                    text: "<bash-input>cargo test -p ccrust</bash-input>".to_owned(),
+                }],
+            ),
+            Message::new(
+                MessageRole::User,
+                vec![ContentBlock::Text {
+                    text: "<local-command-stdout>formatted output</local-command-stdout><local-command-stderr>warning line</local-command-stderr>".to_owned(),
+                }],
+            ),
+            Message::new(
+                MessageRole::User,
+                vec![ContentBlock::Text {
+                    text: "<task-notification><summary>Worker finished lint fix</summary><status>completed</status></task-notification>".to_owned(),
+                }],
+            ),
+        ],
+        &compatibility_command_registry().all(),
+    );
+    let rendered = render_to_string(&state, 100, 24).unwrap();
+
+    assert!(rendered.contains("/review src/lib.rs"));
+    assert!(rendered.contains("! cargo test -p ccrust"));
+    assert!(rendered.contains("Local command"));
+    assert!(rendered.contains("formatted output"));
+    assert!(rendered.contains("warning line"));
+    assert!(rendered.contains("Worker finished lint fix"));
+}
+
+#[test]
 fn renders_runtime_header() {
     let mut state = RatatuiApp::new("header").initial_state();
     state.header_title = Some("ccrust v0.1.0".to_owned());
@@ -568,8 +609,7 @@ fn wraps_long_runtime_header_content() {
     state.header_title = Some("ccrust v0.1.0".to_owned());
     state.header_subtitle =
         Some("gemini-3.1-pro-preview · openai-compatible · reasoning".to_owned());
-    state.header_context =
-        Some("~/workspace/code-agent-rust/examples/very/long/path".to_owned());
+    state.header_context = Some("~/workspace/code-agent-rust/examples/very/long/path".to_owned());
 
     let rendered = render_to_string(&state, 48, 20).unwrap();
 

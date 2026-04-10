@@ -20,6 +20,12 @@ mod startup;
 use startup::*;
 mod session;
 use session::*;
+mod cli_graph;
+use cli_graph::*;
+mod cli_contract;
+use cli_contract::*;
+mod top_level_commands;
+use top_level_commands::*;
 mod cli_args;
 use cli_args::*;
 mod reports;
@@ -27,8 +33,9 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use ccrust_bridge::{
     base64_decode, base64_encode, connect_and_exchange, serve_bridge_session, serve_direct_session,
-    AssistantDirective, BridgeServerConfig, BridgeSessionHandler, RemoteEndpoint, RemoteEnvelope,
-    RemoteMode, RemotePermissionRequest, RemoteSessionState, ResumeSessionRequest, VoiceFrame,
+    AssistantDirective, BridgeServerConfig, BridgeSessionHandler, BridgeSessionRecord,
+    RemoteEndpoint, RemoteEnvelope, RemoteMode, RemotePermissionRequest, RemoteSessionState,
+    ResumeSessionRequest, VoiceFrame,
 };
 use ccrust_core::{
     compatibility_command_registry, coordinator_tasks, create_coordinator_synthesis_task,
@@ -55,7 +62,9 @@ use ccrust_session::{
     materialize_runtime_messages, CompactionConfig, CompactionOutcome, JsonlTranscriptCodec,
     SessionSummary, TranscriptCodec,
 };
-use ccrust_tools::{compatibility_tool_registry, ToolCallRequest, ToolContext, ToolRegistry};
+use ccrust_tools::{
+    compatibility_tool_registry, ToolCallRequest, ToolContext, ToolPermissionMode, ToolRegistry,
+};
 use ccrust_ui::{
     draw_terminal as draw_tui, mouse_action_for_position, render_to_string as render_tui_to_string,
     transcript_line_from_message, transcript_search_match_items, transcript_search_scroll_for_view,
@@ -87,6 +96,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::future::Future;
+use std::io::{BufRead, IsTerminal, Read};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

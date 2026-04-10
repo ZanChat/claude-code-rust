@@ -90,6 +90,7 @@ struct LocalBridgeHandler<'a> {
     session_id: SessionId,
     raw_messages: Vec<Message>,
     live_runtime: bool,
+    runtime_options: RuntimeCliOptions,
     allow_remote_tools: bool,
     pending_permission: Option<PendingRemoteTool>,
     voice_streams: BTreeMap<String, Vec<u8>>,
@@ -285,7 +286,7 @@ impl<'a> LocalBridgeHandler<'a> {
 
     async fn execute_prompt(&mut self, prompt_text: String) -> Result<Vec<RemoteEnvelope>> {
         let start_index = self.raw_messages.len();
-        let (applied_compaction, _, _, _, _) = execute_local_turn(
+        let (applied_compaction, _, _, _, _) = execute_local_turn_with_options(
             self.store,
             self.tool_registry,
             self.cwd.clone(),
@@ -296,6 +297,7 @@ impl<'a> LocalBridgeHandler<'a> {
             &mut self.raw_messages,
             prompt_text,
             self.live_runtime,
+            &self.runtime_options,
             None,
         )
         .await?;
@@ -365,7 +367,7 @@ impl<'a> LocalBridgeHandler<'a> {
                 tasks.len(),
                 task
             );
-            let (applied_compaction, _, _, _, _) = execute_local_turn(
+            let (applied_compaction, _, _, _, _) = execute_local_turn_with_options(
                 self.store,
                 self.tool_registry,
                 self.cwd.clone(),
@@ -376,6 +378,7 @@ impl<'a> LocalBridgeHandler<'a> {
                 &mut self.raw_messages,
                 worker_prompt,
                 self.live_runtime,
+                &self.runtime_options,
                 None,
             )
             .await?;
@@ -418,7 +421,7 @@ impl<'a> LocalBridgeHandler<'a> {
             directive.instruction.trim(),
             worker_summaries.join("\n")
         );
-        let (applied_compaction, _, _, _, _) = execute_local_turn(
+        let (applied_compaction, _, _, _, _) = execute_local_turn_with_options(
             self.store,
             self.tool_registry,
             self.cwd.clone(),
@@ -429,6 +432,7 @@ impl<'a> LocalBridgeHandler<'a> {
             &mut self.raw_messages,
             synthesis_prompt,
             self.live_runtime,
+            &self.runtime_options,
             None,
         )
         .await?;

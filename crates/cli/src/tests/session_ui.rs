@@ -344,6 +344,63 @@ fn build_repl_ui_state_shows_pending_overlay_messages_in_transcript() {
 }
 
 #[test]
+fn build_repl_ui_state_formats_legacy_command_and_task_messages_for_resume() {
+    let app = ccrust_ui::RatatuiApp::new("resume-ui");
+    let registry = compatibility_command_registry();
+    let session_id = SessionId::new_v4();
+    let messages = vec![
+        build_text_message(
+            session_id,
+            MessageRole::User,
+            "<command-name>review</command-name><command-args>src/lib.rs</command-args>"
+                .to_owned(),
+            None,
+        ),
+        build_text_message(
+            session_id,
+            MessageRole::User,
+            "<bash-input>cargo test -p ccrust</bash-input>".to_owned(),
+            None,
+        ),
+        build_text_message(
+            session_id,
+            MessageRole::User,
+            "<task-notification><summary>Worker finished lint fix</summary><status>completed</status></task-notification>"
+                .to_owned(),
+            None,
+        ),
+    ];
+
+    let state = build_repl_ui_state(
+        &app,
+        &registry,
+        &messages,
+        None,
+        Path::new("."),
+        ApiProvider::ChatGPTCodex,
+        DEFAULT_OPENAI_REASONING_MODEL,
+        session_id,
+        UsageTotals::default(),
+        &ccrust_ui::InputBuffer::new(),
+        "status",
+        None,
+        ccrust_ui::PaneKind::Transcript,
+        None,
+        0,
+        None,
+        Vec::new(),
+        0,
+        0,
+        &ReplInteractionState::default(),
+    );
+    let rendered = ccrust_ui::render_to_string(&state, 100, 24).unwrap();
+
+    assert!(rendered.contains("/review src/lib.rs"));
+    assert!(rendered.contains("! cargo test -p ccrust"));
+    assert!(rendered.contains("Worker finished lint fix"));
+}
+
+#[test]
 fn build_repl_ui_state_collapses_history_tool_runs_into_single_group() {
     let app = ccrust_ui::RatatuiApp::new("repl");
     let registry = compatibility_command_registry();

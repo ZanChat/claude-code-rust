@@ -2258,6 +2258,7 @@ pub(crate) async fn render_remote_control_command(
                 session_id,
                 raw_messages: raw_messages.to_vec(),
                 live_runtime,
+                runtime_options: cli.runtime_options(),
                 allow_remote_tools: true,
                 pending_permission: None,
                 voice_streams: BTreeMap::new(),

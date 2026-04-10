@@ -161,6 +161,7 @@ async fn run_agent_turns(
     session_id: SessionId,
     messages: &mut Vec<Message>,
     auth_configured: bool,
+    runtime_options: &RuntimeCliOptions,
     pending_view: Option<&Arc<Mutex<PendingReplView>>>,
 ) -> Result<(Option<ccrust_core::TokenUsage>, usize, Option<String>)> {
     const MAX_AGENT_STEPS: usize = 100;
@@ -174,6 +175,7 @@ async fn run_agent_turns(
         cwd: cwd.clone(),
         provider: Some(provider.to_string()),
         model: Some(model.clone()),
+        permission_mode: runtime_options.tool_permission_mode.clone(),
         ..ToolContext::default()
     };
 
@@ -449,6 +451,13 @@ async fn run_agent_turns(
             messages.push(checkpoint_message);
         }
 
+        if runtime_options
+            .max_turns
+            .is_some_and(|max_turns| step >= max_turns)
+        {
+            return Ok((latest_usage, step, Some("max_turns".to_owned())));
+        }
+
         step += 1;
     }
 }
@@ -464,6 +473,37 @@ async fn execute_local_turn(
     raw_messages: &mut Vec<Message>,
     prompt_text: String,
     live_runtime: bool,
+    pending_view: Option<Arc<Mutex<PendingReplView>>>,
+) -> Result<(Option<CompactionOutcome>, usize, Option<String>, u64, u64)> {
+    execute_local_turn_with_options(
+        store,
+        tool_registry,
+        cwd,
+        plugin_root,
+        provider,
+        active_model,
+        session_id,
+        raw_messages,
+        prompt_text,
+        live_runtime,
+        &RuntimeCliOptions::default(),
+        pending_view,
+    )
+    .await
+}
+
+async fn execute_local_turn_with_options(
+    store: &ActiveSessionStore,
+    tool_registry: &ToolRegistry,
+    cwd: PathBuf,
+    plugin_root: Option<&PathBuf>,
+    provider: ApiProvider,
+    active_model: String,
+    session_id: SessionId,
+    raw_messages: &mut Vec<Message>,
+    prompt_text: String,
+    live_runtime: bool,
+    runtime_options: &RuntimeCliOptions,
     pending_view: Option<Arc<Mutex<PendingReplView>>>,
 ) -> Result<(Option<CompactionOutcome>, usize, Option<String>, u64, u64)> {
     let parent_id = raw_messages.last().map(|message| message.id);
@@ -491,6 +531,7 @@ async fn execute_local_turn(
         session_id,
         &mut runtime_messages,
         live_runtime,
+        runtime_options,
         pending_view.as_ref(),
     )
     .await;
@@ -589,9 +630,996 @@ async fn load_plugin_report(root: PathBuf) -> Result<PluginReport> {
     })
 }
 
+fn canonical_top_level_command_name(name: &str) -> &str {
+    match name {
+        "plugins" => "plugin",
+        "rc" => "remote-control",
+        other => other,
+    }
+}
+
+fn build_top_level_invocation(name: &str, args: &[String]) -> CommandInvocation {
+    let canonical = canonical_top_level_command_name(name);
+    let raw_input = if args.is_empty() {
+        canonical.to_owned()
+    } else {
+        format!("{canonical} {}", args.join(" "))
+    };
+
+    CommandInvocation {
+        name: canonical.to_owned(),
+        args: args.to_vec(),
+        raw_input,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedServerCommand {
+    bind_address: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedOpenCommand {
+    address: String,
+    prompt: Option<String>,
+    output_mode: OutputMode,
+}
+
+fn parse_long_command_option(arg: &str) -> Option<(&str, Option<&str>)> {
+    let option = arg.strip_prefix("--")?;
+    if option.is_empty() {
+        return None;
+    }
+
+    option
+        .split_once('=')
+        .map_or_else(|| Some((option, None)), |(name, value)| Some((name, Some(value))))
+}
+
+fn consume_command_value(
+    args: &[String],
+    index: &mut usize,
+    display: &str,
+    inline_value: Option<&str>,
+) -> Result<String> {
+    if let Some(value) = inline_value {
+        return Ok(value.to_owned());
+    }
+
+    let next_index = *index + 1;
+    let value = args
+        .get(next_index)
+        .ok_or_else(|| anyhow!("missing value for {display}"))?;
+    if value.starts_with('-') {
+        bail!("missing value for {display}");
+    }
+    *index = next_index;
+    Ok(value.clone())
+}
+
+fn parse_output_mode_value(display: &str, value: &str) -> Result<OutputMode> {
+    match value {
+        "text" => Ok(OutputMode::Text),
+        "json" => Ok(OutputMode::Json),
+        "stream-json" => Ok(OutputMode::StreamJson),
+        _ => bail!(
+            "invalid value for {display}: {value} (expected one of: text, json, stream-json)"
+        ),
+    }
+}
+
+fn parse_server_command_args(args: &[String]) -> Result<ParsedServerCommand> {
+    let mut host = "0.0.0.0".to_owned();
+    let mut port = 0u16;
+    let mut index = 0usize;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some((name, inline_value)) = parse_long_command_option(arg) {
+            match name {
+                "host" => {
+                    host = consume_command_value(args, &mut index, "--host", inline_value)?;
+                }
+                "port" => {
+                    let value = consume_command_value(args, &mut index, "--port", inline_value)?;
+                    port = value.parse::<u16>().map_err(|error| {
+                        anyhow!("invalid value for --port: {value} ({error})")
+                    })?;
+                }
+                "auth-token" | "unix" | "workspace" | "idle-timeout" | "max-sessions" => {
+                    bail!(
+                        "ccrust server --{name} is not implemented yet in the Rust CLI"
+                    );
+                }
+                _ => bail!("unknown option: {arg}"),
+            }
+        } else {
+            bail!("unexpected argument for server: {arg}");
+        }
+
+        index += 1;
+    }
+
+    Ok(ParsedServerCommand {
+        bind_address: format!("tcp://{host}:{port}"),
+    })
+}
+
+fn parse_open_command_args(
+    args: &[String],
+    default_output_mode: OutputMode,
+    global_print_enabled: bool,
+) -> Result<ParsedOpenCommand> {
+    let mut target = None;
+    let mut prompt = None;
+    let mut output_mode = default_output_mode;
+    let mut print_enabled = global_print_enabled;
+    let mut index = 0usize;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "-p" {
+            print_enabled = true;
+            if target.is_some() {
+                let next_index = index + 1;
+                if let Some(value) = args.get(next_index) {
+                    if !value.starts_with('-') {
+                        prompt = Some(value.clone());
+                        index = next_index;
+                    }
+                }
+            }
+        } else if let Some((name, inline_value)) = parse_long_command_option(arg) {
+            match name {
+                "print" => {
+                    print_enabled = true;
+                    if let Some(value) = inline_value {
+                        prompt = Some(value.to_owned());
+                    } else if target.is_some() {
+                        let next_index = index + 1;
+                        if let Some(value) = args.get(next_index) {
+                            if !value.starts_with('-') {
+                                prompt = Some(value.clone());
+                                index = next_index;
+                            }
+                        }
+                    }
+                }
+                "output-format" => {
+                    let value =
+                        consume_command_value(args, &mut index, "--output-format", inline_value)?;
+                    output_mode = parse_output_mode_value("--output-format", &value)?;
+                }
+                _ => bail!("unknown option: {arg}"),
+            }
+        } else if arg.starts_with('-') {
+            bail!("unknown option: {arg}");
+        } else if target.is_none() {
+            target = Some(arg.clone());
+        } else {
+            bail!("unexpected argument for open: {arg}");
+        }
+
+        index += 1;
+    }
+
+    let target = target.ok_or_else(|| anyhow!("open requires a target address"))?;
+    if target.starts_with("cc://") || target.starts_with("cc+unix://") {
+        bail!(
+            "cc:// direct-connect URLs are not implemented yet in the Rust CLI; use tcp://, direct://, ide://, ws://, or wss:// endpoints instead"
+        );
+    }
+    if !print_enabled {
+        bail!(
+            "interactive open is not implemented yet in the Rust CLI; use 'ccrust open <address> -p [prompt]'"
+        );
+    }
+
+    Ok(ParsedOpenCommand {
+        address: if target.contains("://") {
+            target
+        } else {
+            format!("tcp://{target}")
+        },
+        prompt,
+        output_mode,
+    })
+}
+
+fn ensure_ssh_command_supported(args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "-p" || arg == "--print") {
+        bail!("headless (-p/--print) mode is not supported with ccrust ssh");
+    }
+
+    if args.iter().all(|arg| arg.starts_with('-')) {
+        bail!("Usage: ccrust ssh <user@host | ssh-config-alias> [dir]");
+    }
+
+    bail!(
+        "ssh remote execution is not implemented yet in the Rust CLI; the current rewrite has no SSH session manager"
+    )
+}
+
+async fn connect_remote_endpoint_for_cli(
+    cli: &Cli,
+    address: &str,
+    session_id: SessionId,
+    prompt: Option<String>,
+) -> Result<Vec<RemoteEnvelope>> {
+    connect_and_exchange(
+        remote_endpoint(address, session_id),
+        build_remote_outbound(cli, session_id, prompt, cli.resume.as_deref())?,
+        cli.bridge_receive_count.unwrap_or(1),
+    )
+    .await
+}
+
+fn print_remote_envelopes(inbound: &[RemoteEnvelope], output_mode: &OutputMode) -> Result<()> {
+    match output_mode {
+        OutputMode::Json => println!("{}", serde_json::to_string_pretty(inbound)?),
+        OutputMode::StreamJson => {
+            for envelope in inbound {
+                println!("{}", serde_json::to_string(envelope)?);
+            }
+        }
+        OutputMode::Text => {
+            let lines = inbound
+                .iter()
+                .filter_map(|envelope| match envelope {
+                    RemoteEnvelope::Message { message } if message.role == MessageRole::Assistant => {
+                        let text = message_text(message);
+                        (!text.trim().is_empty()).then_some(text)
+                    }
+                    RemoteEnvelope::Ack { note } => Some(note.clone()),
+                    RemoteEnvelope::Error { message } => Some(format!("error: {message}")),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            if lines.is_empty() {
+                println!("{}", serde_json::to_string_pretty(inbound)?);
+            } else {
+                println!("{}", lines.join("\n\n"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct HeadlessUsageReport {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct HeadlessTranscriptEvent {
+    r#type: &'static str,
+    subtype: &'static str,
+    session_id: SessionId,
+    message_id: uuid::Uuid,
+    parent_id: Option<uuid::Uuid>,
+    role: &'static str,
+    text: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct HeadlessResultEvent {
+    r#type: &'static str,
+    subtype: &'static str,
+    duration_ms: u64,
+    duration_api_ms: u64,
+    is_error: bool,
+    num_turns: usize,
+    stop_reason: Option<String>,
+    session_id: SessionId,
+    total_cost_usd: f64,
+    usage: HeadlessUsageReport,
+    permission_denials: Vec<Value>,
+    result: String,
+    structured_output: Option<Value>,
+    errors: Vec<String>,
+}
+
+fn headless_usage_report_from_totals(totals: UsageTotals) -> HeadlessUsageReport {
+    HeadlessUsageReport {
+        input_tokens: totals.input_tokens,
+        output_tokens: totals.output_tokens,
+        cache_creation_input_tokens: totals.cache_creation_input_tokens,
+        cache_read_input_tokens: totals.cache_read_input_tokens,
+    }
+}
+
+fn validate_root_print_mode(contract: &CliContract) -> Result<()> {
+    let print_mode = &contract.global.print_mode;
+    if print_mode.input_mode == InputMode::StreamJson
+        && print_mode.output_mode != OutputMode::StreamJson
+    {
+        bail!("Error: --input-format=stream-json requires output-format=stream-json.");
+    }
+    if print_mode.replay_user_messages
+        && (print_mode.input_mode != InputMode::StreamJson
+            || print_mode.output_mode != OutputMode::StreamJson)
+    {
+        bail!(
+            "Error: --replay-user-messages requires both --input-format=stream-json and --output-format=stream-json."
+        );
+    }
+    if print_mode.include_partial_messages
+        && (!print_mode.enabled || print_mode.output_mode != OutputMode::StreamJson)
+    {
+        bail!(
+            "Error: --include-partial-messages requires --print and --output-format=stream-json."
+        );
+    }
+    if !contract.global.resume.session_persistence && !print_mode.enabled {
+        bail!("Error: --no-session-persistence can only be used with --print mode.");
+    }
+    Ok(())
+}
+
+fn read_text_input_from_stdin(prompt: Option<&str>) -> Result<String> {
+    let mut combined = prompt.unwrap_or_default().to_owned();
+    if !std::io::stdin().is_terminal() {
+        let mut stdin_text = String::new();
+        std::io::stdin().read_to_string(&mut stdin_text)?;
+        let stdin_text = stdin_text.trim_end_matches('\0');
+        if !stdin_text.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(stdin_text);
+        }
+    }
+    Ok(combined)
+}
+
+fn stream_json_prompt_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                return Some(text.to_owned());
+            }
+            if let Some(prompt) = map.get("prompt").and_then(Value::as_str) {
+                return Some(prompt.to_owned());
+            }
+            if let Some(message) = map.get("message").and_then(Value::as_object) {
+                if let Some(text) = message.get("text").and_then(Value::as_str) {
+                    return Some(text.to_owned());
+                }
+                if let Some(content) = message.get("content").and_then(Value::as_array) {
+                    let mut parts = Vec::new();
+                    for item in content {
+                        if let Some(text) = item
+                            .as_object()
+                            .and_then(|item| item.get("text"))
+                            .and_then(Value::as_str)
+                        {
+                            parts.push(text);
+                        }
+                    }
+                    if !parts.is_empty() {
+                        return Some(parts.join(""));
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn collect_stream_json_prompts(prompt: Option<&str>) -> Result<Vec<String>> {
+    if std::io::stdin().is_terminal() {
+        return Ok(prompt
+            .map(str::to_owned)
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .collect());
+    }
+
+    let stdin = std::io::stdin();
+    let reader = std::io::BufReader::new(stdin.lock());
+    let mut prompts = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)
+            .map_err(|error| anyhow!("invalid stream-json input line: {error}"))?;
+        if let Some(prompt) = stream_json_prompt_from_value(&value) {
+            if !prompt.trim().is_empty() {
+                prompts.push(prompt);
+            }
+        }
+    }
+
+    if prompts.is_empty() {
+        if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) {
+            prompts.push(prompt.to_owned());
+        }
+    }
+
+    Ok(prompts)
+}
+
+fn collect_print_mode_prompts(prompt: Option<&str>, input_mode: &InputMode) -> Result<Vec<String>> {
+    match input_mode {
+        InputMode::Text => {
+            let combined = read_text_input_from_stdin(prompt)?;
+            Ok((!combined.trim().is_empty())
+                .then_some(combined)
+                .into_iter()
+                .collect())
+        }
+        InputMode::StreamJson => collect_stream_json_prompts(prompt),
+    }
+}
+
+fn resume_cutoff_index(messages: &[Message], target: &str) -> Result<usize> {
+    let message_id =
+        uuid::Uuid::parse_str(target).map_err(|error| anyhow!("invalid message id '{target}': {error}"))?;
+    messages
+        .iter()
+        .position(|message| message.id == message_id && message.role == MessageRole::Assistant)
+        .map(|index| index + 1)
+        .ok_or_else(|| anyhow!("could not find assistant message '{target}' in the resumed session"))
+}
+
+fn apply_resume_message_cutoff(messages: &mut Vec<Message>, target: Option<&str>) -> Result<()> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    let cutoff = resume_cutoff_index(messages, target)?;
+    messages.truncate(cutoff);
+    Ok(())
+}
+
+fn headless_structured_output(
+    json_schema: Option<&str>,
+    result_text: &str,
+) -> Result<Option<Value>> {
+    let Some(schema) = json_schema else {
+        return Ok(None);
+    };
+    let schema_value: Value = serde_json::from_str(schema)
+        .map_err(|error| anyhow!("invalid JSON schema supplied to --json-schema: {error}"))?;
+    if !schema_value.is_object() {
+        bail!("invalid JSON schema supplied to --json-schema: expected a JSON object");
+    }
+    let output: Value = serde_json::from_str(result_text)
+        .map_err(|error| anyhow!("assistant output is not valid JSON for --json-schema: {error}"))?;
+    Ok(Some(output))
+}
+
+fn headless_transcript_events(
+    messages: &[Message],
+    include_partial_messages: bool,
+) -> Vec<HeadlessTranscriptEvent> {
+    let mut events = Vec::new();
+    for message in messages {
+        let role = match message.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+            _ => continue,
+        };
+        let text = message_text(message);
+        if text.trim().is_empty() {
+            continue;
+        }
+        if include_partial_messages && message.role == MessageRole::Assistant {
+            events.push(HeadlessTranscriptEvent {
+                r#type: "message_delta",
+                subtype: "assistant_delta",
+                session_id: message.session_id.unwrap_or_default(),
+                message_id: message.id,
+                parent_id: message.parent_id,
+                role,
+                text: text.clone(),
+            });
+        }
+        events.push(HeadlessTranscriptEvent {
+            r#type: "message",
+            subtype: role,
+            session_id: message.session_id.unwrap_or_default(),
+            message_id: message.id,
+            parent_id: message.parent_id,
+            role,
+            text,
+        });
+    }
+    events
+}
+
+fn emit_headless_error(output_mode: &OutputMode, session_id: SessionId, error: &str) -> Result<()> {
+    let result = HeadlessResultEvent {
+        r#type: "result",
+        subtype: "error_during_execution",
+        duration_ms: 0,
+        duration_api_ms: 0,
+        is_error: true,
+        num_turns: 0,
+        stop_reason: None,
+        session_id,
+        total_cost_usd: 0.0,
+        usage: HeadlessUsageReport {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+        permission_denials: Vec::new(),
+        result: String::new(),
+        structured_output: None,
+        errors: vec![error.to_owned()],
+    };
+    match output_mode {
+        OutputMode::Text => eprintln!("{error}"),
+        OutputMode::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputMode::StreamJson => println!("{}", serde_json::to_string(&result)?),
+    }
+    Ok(())
+}
+
+async fn run_root_print_mode(
+    contract: &CliContract,
+    store: &ActiveSessionStore,
+    tool_registry: &ToolRegistry,
+    cwd: &Path,
+    plugin_root: Option<&PathBuf>,
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    raw_messages: &mut Vec<Message>,
+    prompt: Option<&str>,
+    live_runtime: bool,
+    runtime_options: &RuntimeCliOptions,
+) -> Result<()> {
+    validate_root_print_mode(contract)?;
+    let prompts = collect_print_mode_prompts(prompt, &contract.global.print_mode.input_mode)?;
+    if prompts.is_empty() && raw_messages.is_empty() {
+        bail!("print mode requires a prompt or stdin input");
+    }
+
+    let mut last_result = None;
+    for prompt_text in prompts {
+        let existing_len = raw_messages.len();
+        if contract.global.print_mode.replay_user_messages
+            && contract.global.print_mode.output_mode == OutputMode::StreamJson
+        {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "type": "message",
+                    "subtype": "user",
+                    "session_id": session_id,
+                    "text": prompt_text,
+                }))?
+            );
+        }
+
+        let started = std::time::Instant::now();
+        let turn = execute_local_turn_with_options(
+            store,
+            tool_registry,
+            cwd.to_path_buf(),
+            plugin_root,
+            provider,
+            active_model.to_owned(),
+            session_id,
+            raw_messages,
+            prompt_text,
+            live_runtime,
+            runtime_options,
+            None,
+        )
+        .await;
+
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let (turn_count, stop_reason, is_error) = match turn {
+            Ok((_, turn_count, stop_reason, _, _)) => (turn_count, stop_reason, false),
+            Err(error) => {
+                emit_headless_error(
+                    &contract.global.print_mode.output_mode,
+                    session_id,
+                    &error.to_string(),
+                )?;
+                return Ok(());
+            }
+        };
+
+        let new_messages = raw_messages
+            .get(existing_len..)
+            .map_or_else(Vec::new, ToOwned::to_owned);
+        if contract.global.print_mode.output_mode == OutputMode::StreamJson {
+            for event in headless_transcript_events(
+                &new_messages,
+                contract.global.print_mode.include_partial_messages,
+            ) {
+                println!("{}", serde_json::to_string(&event)?);
+            }
+        }
+
+        let result_text = new_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .map(message_text)
+            .unwrap_or_default();
+        let structured_output = headless_structured_output(
+            contract.global.print_mode.json_schema.as_deref(),
+            &result_text,
+        )?;
+        let usage = headless_usage_report_from_totals(usage_totals_for_messages(&new_messages));
+        let result = HeadlessResultEvent {
+            r#type: "result",
+            subtype: if is_error {
+                "error_during_execution"
+            } else {
+                "success"
+            },
+            duration_ms,
+            duration_api_ms: duration_ms,
+            is_error,
+            num_turns: turn_count,
+            stop_reason,
+            session_id,
+            total_cost_usd: 0.0,
+            usage,
+            permission_denials: Vec::new(),
+            result: result_text,
+            structured_output,
+            errors: Vec::new(),
+        };
+
+        match contract.global.print_mode.output_mode {
+            OutputMode::Text => last_result = Some(result),
+            OutputMode::Json => last_result = Some(result),
+            OutputMode::StreamJson => println!("{}", serde_json::to_string(&result)?),
+        }
+    }
+
+    if let Some(result) = last_result {
+        match contract.global.print_mode.output_mode {
+            OutputMode::Text => {
+                if !result.result.is_empty() {
+                    println!("{}", result.result);
+                } else if let Some(reason) = result.stop_reason {
+                    println!("stopped: {reason}");
+                }
+            }
+            OutputMode::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+            OutputMode::StreamJson => {}
+        }
+    }
+
+    Ok(())
+}
+
+async fn serve_bridge_session_for_cli(
+    store: &ActiveSessionStore,
+    tool_registry: &ToolRegistry,
+    provider: ApiProvider,
+    active_model: &str,
+    session_id: SessionId,
+    raw_messages: &[Message],
+    live_runtime: bool,
+    cwd: &Path,
+    runtime_options: &RuntimeCliOptions,
+    bind_address: String,
+) -> Result<BridgeSessionRecord> {
+    let mode = remote_mode_for_address(&bind_address);
+    let allow_remote_tools = true;
+    let handler = LocalBridgeHandler {
+        store,
+        tool_registry,
+        cwd: cwd.to_path_buf(),
+        provider,
+        active_model: active_model.to_owned(),
+        session_id,
+        raw_messages: raw_messages.to_vec(),
+        live_runtime,
+        runtime_options: runtime_options.clone(),
+        allow_remote_tools,
+        pending_permission: None,
+        voice_streams: BTreeMap::new(),
+    };
+    let config = BridgeServerConfig {
+        bind_address,
+        session_id: Some(session_id),
+        allow_remote_tools,
+    };
+
+    match mode {
+        RemoteMode::DirectConnect | RemoteMode::IdeBridge => serve_direct_session(config, handler).await,
+        _ => serve_bridge_session(config, handler).await,
+    }
+}
+
+async fn dispatch_auth_subcommand(
+    provider: ApiProvider,
+    cwd: &Path,
+    store: &ActiveSessionStore,
+    args: &[String],
+) -> Result<()> {
+    let wants_text = args.iter().any(|arg| arg == "--text");
+    let subcommand = args
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+        .unwrap_or("status");
+
+    match subcommand {
+        "login" => println!("{}", render_auth_command(provider, "login").await?),
+        "logout" => {
+            println!(
+                "{}",
+                render_auth_command_with_resume(provider, "logout", latest_resume_hint(store).await?)
+                    .await?
+            );
+        }
+        "status" => {
+            let resolver = EnvironmentAuthResolver;
+            let auth = resolver
+                .resolve_auth(AuthRequest {
+                    provider,
+                    profile: None,
+                })
+                .await
+                .ok();
+            let config_path = existing_managed_login_env_path(cwd);
+            let snapshot_path = code_agent_auth_snapshot_path();
+            let snapshot = snapshot_path.exists().then_some(snapshot_path);
+            let report = AuthCommandReport {
+                provider: provider.to_string(),
+                status: if auth.is_some() {
+                    "ready".to_owned()
+                } else {
+                    "missing".to_owned()
+                },
+                auth_source: auth.as_ref().and_then(|value| value.source.clone()),
+                hint: Some(auth_hint_for_provider(provider)),
+                config_path,
+                snapshot_path: snapshot,
+                resume_session_id: None,
+                resume_transcript_path: None,
+                resume_command: None,
+            };
+            if wants_text {
+                println!("provider={}", report.provider);
+                println!("status={}", report.status);
+                if let Some(source) = report.auth_source.as_deref() {
+                    println!("auth_source={source}");
+                }
+                if let Some(hint) = report.hint.as_deref() {
+                    println!("hint={hint}");
+                }
+            } else {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+        }
+        other => bail!("unknown auth subcommand: {other}"),
+    }
+
+    Ok(())
+}
+
+async fn dispatch_top_level_command(
+    contract: &CliContract,
+    registry: &CommandRegistry,
+    cli: &Cli,
+    store: &ActiveSessionStore,
+    tool_registry: &ToolRegistry,
+    provider: ApiProvider,
+    model: Option<String>,
+    active_model: &str,
+    session_id: SessionId,
+    raw_messages: &[Message],
+    live_runtime: bool,
+    cwd: &Path,
+    _auth_source: Option<String>,
+    runtime_options: &RuntimeCliOptions,
+) -> Result<bool> {
+    if let Some(fast_path) = &contract.fast_path {
+        match fast_path {
+            FastPathCommand::SubcommandHelp { name } => {
+                println!("{}", render_top_level_command_help_text(*name));
+                return Ok(true);
+            }
+            FastPathCommand::Server(_) => {
+                let parsed = parse_server_command_args(
+                    match &contract.command {
+                        TopLevelCommand::Named { args, .. } => args,
+                        _ => &[],
+                    },
+                )?;
+                let record = serve_bridge_session_for_cli(
+                    store,
+                    tool_registry,
+                    provider,
+                    active_model,
+                    session_id,
+                    raw_messages,
+                    live_runtime,
+                    cwd,
+                    runtime_options,
+                    parsed.bind_address,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&record)?);
+                return Ok(true);
+            }
+            FastPathCommand::Open { args } => {
+                let parsed = parse_open_command_args(
+                    args,
+                    contract.global.print_mode.output_mode.clone(),
+                    contract.global.print_mode.enabled,
+                )?;
+                let inbound = connect_remote_endpoint_for_cli(
+                    cli,
+                    &parsed.address,
+                    session_id,
+                    parsed.prompt,
+                )
+                .await?;
+                print_remote_envelopes(&inbound, &parsed.output_mode)?;
+                return Ok(true);
+            }
+            FastPathCommand::OpenUrl { .. } => {
+                bail!(
+                    "cc:// direct-connect URLs are not implemented yet in the Rust CLI"
+                );
+            }
+            FastPathCommand::Ssh { args } => {
+                ensure_ssh_command_supported(args)?;
+            }
+            FastPathCommand::Update(command) => {
+                match command.name.as_str() {
+                    "update" | "upgrade" => println!("{}", render_update_command()?),
+                    "install" => println!("{}", render_install_command(&command.args)?),
+                    "rollback" => println!("{}", render_rollback_command(&command.args)?),
+                    "up" => {
+                        bail!("project bootstrap via 'ccrust up' is not implemented yet in the Rust CLI")
+                    }
+                    other => bail!("top-level command '{other}' is not implemented yet in the Rust CLI"),
+                }
+                return Ok(true);
+            }
+            FastPathCommand::Completion { args } => {
+                println!("{}", render_completion_command(args)?);
+                return Ok(true);
+            }
+            FastPathCommand::RemoteControl { .. } => {}
+        }
+    }
+
+    let TopLevelCommand::Named {
+        name,
+        command_name,
+        args,
+    } = &contract.command
+    else {
+        return Ok(false);
+    };
+
+    if name == "auth" {
+        dispatch_auth_subcommand(provider, cwd, store, args).await?;
+        return Ok(true);
+    }
+
+    let invocation = build_top_level_invocation(name, args);
+
+    if let Some(resolved) = command_name {
+        match resolved {
+            TopLevelCommandName::Mcp => {
+                println!(
+                    "{}",
+                    render_mcp_command(
+                        &invocation,
+                        cli.plugin_root.as_ref(),
+                        tool_registry,
+                        cwd,
+                        provider,
+                        model.clone(),
+                    )
+                    .await?
+                );
+                return Ok(true);
+            }
+            TopLevelCommandName::Plugin => {
+                println!(
+                    "{}",
+                    render_plugin_command(&invocation, cli.plugin_root.as_ref(), cwd).await?
+                );
+                return Ok(true);
+            }
+            TopLevelCommandName::SetupToken => {
+                println!("{}", render_auth_command(provider, "login").await?);
+                return Ok(true);
+            }
+            TopLevelCommandName::Agents => {
+                println!(
+                    "{}",
+                    render_agents_command(
+                        &invocation,
+                        tool_registry,
+                        cwd,
+                        provider,
+                        model.clone(),
+                        session_id,
+                    )
+                    .await?
+                );
+                return Ok(true);
+            }
+            TopLevelCommandName::RemoteControl => {
+                println!(
+                    "{}",
+                    render_remote_control_command(
+                        registry,
+                        &invocation,
+                        cli,
+                        store,
+                        tool_registry,
+                        cwd,
+                        provider,
+                        active_model,
+                        session_id,
+                        raw_messages,
+                        live_runtime,
+                    )
+                    .await?
+                );
+                return Ok(true);
+            }
+            TopLevelCommandName::Doctor => {
+                println!("{}", render_doctor_command(cwd)?);
+                return Ok(true);
+            }
+            TopLevelCommandName::Task => {
+                println!("{}", render_task_cli_command(cwd, args)?);
+                return Ok(true);
+            }
+            TopLevelCommandName::Export => {
+                println!("{}", render_export_cli_command(store, args).await?);
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(false)
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
-    let mut cli = parse_cli();
+async fn main() {
+    let exit_code = match run_main().await {
+        Ok(()) => 0,
+        Err(error) => {
+            let message = error.to_string();
+            if let Some(option) = message.strip_prefix("unknown option: ") {
+                eprintln!("{}", render_unknown_option_error(option));
+            } else {
+                eprintln!("error: {message}");
+            }
+            1
+        }
+    };
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+async fn run_main() -> Result<()> {
+    let mut cli = parse_cli()?;
+    let contract = build_cli_contract(&cli);
     let cwd = env::current_dir()?;
     apply_saved_ui_theme_preference();
     let mut login_config = apply_managed_login_env(&cwd);
@@ -599,8 +1627,8 @@ async fn main() -> Result<()> {
     let provider_selection =
         resolve_launch_provider(cli.provider.as_deref(), &startup_preferences, &login_config)?;
     let provider = provider_selection.provider;
-    let project_dir = get_project_dir(&cwd);
     let prompt = (!cli.prompt.is_empty()).then(|| cli.prompt.join(" "));
+    let runtime_options = cli.runtime_options();
     let tool_registry = compatibility_tool_registry();
     let store = ActiveSessionStore::new(
         cwd.clone(),
@@ -612,7 +1640,7 @@ async fn main() -> Result<()> {
     let registry = resolved_command_registry(&cwd, cli.plugin_root.as_ref()).await;
 
     if cli.list_commands {
-        println!("{}", render_command_help(&registry, false));
+        println!("{}", render_root_help_text());
         return Ok(());
     }
 
@@ -645,6 +1673,11 @@ async fn main() -> Result<()> {
         let plugin = runtime.load_manifest(&root).await?;
         let parsed = parse_mcp_server_configs(&plugin.manifest.mcp_servers);
         println!("{}", serde_json::to_string_pretty(&parsed)?);
+        return Ok(());
+    }
+
+    if let Some(FastPathCommand::SubcommandHelp { name }) = &contract.fast_path {
+        println!("{}", render_top_level_command_help_text(*name));
         return Ok(());
     }
 
@@ -693,6 +1726,7 @@ async fn main() -> Result<()> {
             cwd.clone(),
             provider,
             cli.model.clone(),
+            runtime_options.tool_permission_mode.clone(),
         )
         .await?;
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -708,16 +1742,6 @@ async fn main() -> Result<()> {
         .await
         .ok();
     let auth_source = auth.as_ref().and_then(|value| value.source.clone());
-    let parsed_command = prompt
-        .as_deref()
-        .and_then(|input| registry.parse_slash_command(input))
-        .map(|command| {
-            if command.args.is_empty() {
-                command.name
-            } else {
-                format!("{} {}", command.name, command.args.join(" "))
-            }
-        });
 
     let explicit_resume = match cli.resume.as_deref() {
         Some(target) => Some(store.load_resume_target(target).await?),
@@ -725,6 +1749,10 @@ async fn main() -> Result<()> {
     };
     let (session_id, transcript_path, mut existing_messages) =
         choose_active_session(&cli, explicit_resume)?;
+    apply_resume_message_cutoff(
+        &mut existing_messages,
+        contract.global.resume.resume_session_at.as_deref(),
+    )?;
     let command_settings = load_command_settings();
     let active_model = cli
         .model
@@ -739,37 +1767,64 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("no compatibility model catalog entries for {provider}"))?;
     let live_runtime = auth.is_some() && provider_supports_live_runtime(provider);
 
+    if dispatch_top_level_command(
+        &contract,
+        &registry,
+        &cli,
+        &store,
+        &tool_registry,
+        provider,
+        cli.model.clone(),
+        &active_model,
+        session_id,
+        &existing_messages,
+        live_runtime,
+        &cwd,
+        auth_source.clone(),
+        &runtime_options,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
     if let Some(bind_address) = cli.bridge_server.clone() {
         if existing_messages.is_empty() && transcript_path.is_some() {
             existing_messages = store.load_session(session_id).await.unwrap_or_default();
         }
-        let mode = remote_mode_for_address(&bind_address);
-        let allow_remote_tools = true;
-        let handler = LocalBridgeHandler {
-            store: &store,
-            tool_registry: &tool_registry,
-            cwd: cwd.clone(),
+        let record = serve_bridge_session_for_cli(
+            &store,
+            &tool_registry,
             provider,
-            active_model: active_model.clone(),
+            &active_model,
             session_id,
-            raw_messages: existing_messages,
+            &existing_messages,
             live_runtime,
-            allow_remote_tools,
-            pending_permission: None,
-            voice_streams: BTreeMap::new(),
-        };
-        let config = BridgeServerConfig {
+            &cwd,
+            &runtime_options,
             bind_address,
-            session_id: Some(session_id),
-            allow_remote_tools,
-        };
-        let record = match mode {
-            RemoteMode::DirectConnect | RemoteMode::IdeBridge => {
-                serve_direct_session(config, handler).await?
-            }
-            _ => serve_bridge_session(config, handler).await?,
-        };
+        )
+        .await?;
         println!("{}", serde_json::to_string_pretty(&record)?);
+        return Ok(());
+    }
+
+    if contract.global.print_mode.enabled {
+        run_root_print_mode(
+            &contract,
+            &store,
+            &tool_registry,
+            &cwd,
+            cli.plugin_root.as_ref(),
+            provider,
+            &active_model,
+            session_id,
+            &mut existing_messages,
+            prompt.as_deref(),
+            live_runtime,
+            &runtime_options,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -816,6 +1871,7 @@ async fn main() -> Result<()> {
             session_id,
             &mut existing_messages,
             live_runtime,
+            &runtime_options,
             transcript_path.clone(),
             provider_selection.configured,
             matches!(
@@ -864,7 +1920,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        let transcript_path = match transcript_path {
+        let _transcript_path = match transcript_path {
             Some(path) => path,
             None => store.transcript_path(session_id).await?,
         };
@@ -877,19 +1933,11 @@ async fn main() -> Result<()> {
         );
         store.append_message(session_id, &user_message).await?;
         existing_messages.push(user_message.clone());
-        let estimated_tokens_before =
-            estimate_message_tokens(&materialize_runtime_messages(&existing_messages));
-        let applied_compaction =
+        let _applied_compaction =
             maybe_auto_compact(&store, session_id, &mut existing_messages).await?;
-        let estimated_tokens_after = applied_compaction
-            .as_ref()
-            .map(|outcome| outcome.estimated_tokens_after)
-            .or(Some(estimate_message_tokens(
-                &materialize_runtime_messages(&existing_messages),
-            )));
         let mut runtime_messages = materialize_runtime_messages(&existing_messages);
 
-        let (_assistant_usage, turn_count, stop_reason) = run_agent_turns(
+        let (_assistant_usage, _turn_count, stop_reason) = run_agent_turns(
             &store,
             &tool_registry,
             cwd.clone(),
@@ -899,53 +1947,25 @@ async fn main() -> Result<()> {
             session_id,
             &mut runtime_messages,
             live_runtime,
+            &runtime_options,
             None,
         )
         .await?;
 
-        let report = StartupReport {
-            provider: provider.to_string(),
-            model: Some(active_model),
-            cwd,
-            project_dir,
-            session_root: store.root_dir().to_path_buf(),
-            command_count: registry.all().len(),
-            prompt: Some(prompt_text),
-            parsed_command: None,
-            active_session_id: Some(session_id),
-            transcript_path: Some(transcript_path),
-            auth_source: auth_source.clone(),
-            turn_count,
-            stop_reason,
-            applied_compaction: applied_compaction.as_ref().and_then(compaction_kind_name),
-            estimated_tokens_before: Some(estimated_tokens_before),
-            estimated_tokens_after,
-            note: "Provider-backed runtime is active. Sessions, compaction, slash commands, tool execution, TUI REPL, MCP transport execution, bridge server/client flows, and multi-step agent turns now persist locally.",
-        };
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let updated_messages = store.load_session(session_id).await.unwrap_or_default();
+        if let Some(last_assistant) = updated_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .map(message_text)
+            .filter(|text| !text.trim().is_empty())
+        {
+            println!("{last_assistant}");
+        } else if let Some(reason) = stop_reason {
+            println!("stopped: {reason}");
+        }
         return Ok(());
     }
-
-    let report = StartupReport {
-        provider: provider.to_string(),
-        model: cli.model.clone(),
-        cwd,
-        project_dir,
-        session_root: store.root_dir().to_path_buf(),
-        command_count: registry.all().len(),
-        prompt,
-        parsed_command,
-        active_session_id: Some(session_id),
-        transcript_path,
-        auth_source,
-        turn_count: 0,
-        stop_reason: None,
-        applied_compaction: None,
-        estimated_tokens_before: None,
-        estimated_tokens_after: None,
-        note: "Local runtime shell is active. Use --list-sessions, --resume, --tool, --repl, or a slash command prompt to exercise persisted sessions, tools, plugins, MCP, and remote-control flows.",
-    };
-    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 

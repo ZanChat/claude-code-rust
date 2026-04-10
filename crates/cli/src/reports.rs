@@ -4,27 +4,6 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize)]
-pub(crate) struct StartupReport {
-    pub(crate) provider: String,
-    pub(crate) model: Option<String>,
-    pub(crate) cwd: PathBuf,
-    pub(crate) project_dir: PathBuf,
-    pub(crate) session_root: PathBuf,
-    pub(crate) command_count: usize,
-    pub(crate) prompt: Option<String>,
-    pub(crate) parsed_command: Option<String>,
-    pub(crate) active_session_id: Option<SessionId>,
-    pub(crate) transcript_path: Option<PathBuf>,
-    pub(crate) auth_source: Option<String>,
-    pub(crate) turn_count: usize,
-    pub(crate) stop_reason: Option<String>,
-    pub(crate) applied_compaction: Option<String>,
-    pub(crate) estimated_tokens_before: Option<u64>,
-    pub(crate) estimated_tokens_after: Option<u64>,
-    pub(crate) note: &'static str,
-}
-
-#[derive(Debug, Serialize)]
 pub(crate) struct ResumeReport {
     pub(crate) session_id: SessionId,
     pub(crate) transcript_path: PathBuf,

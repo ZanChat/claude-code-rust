@@ -1,0 +1,50 @@
+Usage: ccrust [options] [prompt]
+       ccrust [options] <command> [command-options]
+
+Claude Code - starts an interactive session by default, use -p/--print for non-interactive output
+
+Commands:
+  agents             List configured agents
+  auth               Manage authentication
+  completion         Generate shell completions
+  doctor             Check rewrite and runtime health
+  export             Export a transcript to text
+  install            Install ccrust into ~/.cargo/bin
+  mcp                Configure and manage MCP servers
+  open               Connect to a Claude Code server
+  plugin             Manage Claude Code plugins
+  rollback           Restore a previous local install snapshot
+  server             Start a Claude Code session server
+  setup-token        Set up a long-lived authentication token
+  task               Manage local task records
+  update             Install the current build and refresh rollback history
+
+Options:
+  -h, --help                         Display help for command
+  -v, --version                      Output the version number
+  --provider <provider>              Provider override for this launch
+  --session-root <path>              Use an explicit session storage directory
+  -p, --print                        Print response and exit
+  --output-format <format>           Output format: text, json, stream-json
+  --input-format <format>            Input format: text, stream-json
+  --json-schema <schema>             JSON Schema for structured output
+  --include-hook-events              Include hook lifecycle events in stream-json output
+  --include-partial-messages         Include assistant message deltas in stream-json output
+  -c, --continue                     Continue the most recent conversation
+  -r, --resume [value]               Resume a conversation by session ID or search term
+  --fork-session                     Fork the resumed conversation into a new session
+  --resume-session-at <message-id>   Resume only through the selected assistant message
+  --rewind-files <user-message-id>   Restore files to the selected user turn and exit
+  --no-session-persistence           Disable transcript persistence in print mode
+  --permission-mode <mode>           Permission mode for the session
+  --model <model>                    Model for the current session
+  --settings <file-or-json>          Additional settings sources
+  --add-dir <directories...>         Additional directories to allow tool access to
+  --mcp-config <configs...>          Load MCP servers from JSON files or JSON strings
+  --plugin-root <path>               Override the plugin root for this launch
+  --ide                              Auto-connect to the IDE when exactly one bridge is available
+  --strict-mcp-config                Only use MCP servers provided by --mcp-config
+  --plugin-dir <path>                Load a plugin directory for this session only
+  --file <specs...>                  Download file resources before starting the session
+  --tool <name>                      Invoke a tool directly
+  --input <json>                     Tool input JSON for --tool

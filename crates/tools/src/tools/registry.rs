@@ -98,6 +98,22 @@ impl ToolRegistry {
         let tool = self
             .get(&request.tool_name)
             .ok_or_else(|| anyhow!("unknown tool: {}", request.tool_name))?;
+        let spec = tool.spec();
+        if spec.needs_permission
+            && matches!(context.permission_mode, Some(ToolPermissionMode::Deny))
+        {
+            return Ok(ToolOutput {
+                content: format!(
+                    "tool '{}' was blocked by the active permission mode",
+                    request.tool_name
+                ),
+                is_error: true,
+                metadata: json!({
+                    "permission": "denied",
+                    "tool": request.tool_name,
+                }),
+            });
+        }
         tool.invoke(request.input, context).await
     }
 }

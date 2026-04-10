@@ -681,6 +681,7 @@ async fn run_tool(
     cwd: PathBuf,
     provider: ApiProvider,
     model: Option<String>,
+    permission_mode: Option<ToolPermissionMode>,
 ) -> Result<ToolRunReport> {
     let registry = compatibility_tool_registry();
     let output = registry
@@ -693,6 +694,7 @@ async fn run_tool(
                 cwd,
                 provider: Some(provider.to_string()),
                 model,
+                permission_mode,
                 ..ToolContext::default()
             },
         )

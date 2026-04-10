@@ -1,6 +1,6 @@
 use super::{
     compatibility_tool_registry, compatibility_tool_specs, glob_matches, ToolCallRequest,
-    ToolContext, ToolKind,
+    ToolContext, ToolKind, ToolPermissionMode,
 };
 use serde_json::json;
 use std::fs;
@@ -127,6 +127,38 @@ async fn reads_and_writes_files_via_registry() {
         .unwrap();
 
     assert_eq!(read.content, "hello from rust");
+}
+
+#[tokio::test]
+async fn deny_permission_mode_blocks_permissioned_tools() {
+    let cwd = make_temp_dir("deny-permission-mode");
+    let registry = compatibility_tool_registry();
+    let context = ToolContext {
+        cwd: cwd.clone(),
+        permission_mode: Some(ToolPermissionMode::Deny),
+        ..ToolContext::default()
+    };
+
+    let output = registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "file_write".to_owned(),
+                input: json!({
+                    "path": "blocked.txt",
+                    "content": "should not be written"
+                }),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+
+    assert!(output.is_error);
+    assert!(output
+        .content
+        .contains("blocked by the active permission mode"));
+    assert_eq!(output.metadata["permission"], json!("denied"));
+    assert!(!cwd.join("blocked.txt").exists());
 }
 
 #[tokio::test]

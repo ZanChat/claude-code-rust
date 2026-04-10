@@ -38,12 +38,26 @@ ccrust
 
 # Non-interactive prompt
 ccrust 'Refactor the auth logic in src/auth.rs'
+
+# Headless JSON output
+ccrust --print --output-format json 'Summarize the current diff'
+
+# Pick a provider explicitly for one launch
+ccrust --provider chatgpt-codex
 ```
 
 `ccrust` loads saved login config from `~/.claude/.env.ccrust` and then
 `./.claude/.env.ccrust`. Later sources override earlier ones:
 project-local config overrides user config, real environment variables override
 saved config, and CLI flags override all of them.
+
+The top-level CLI now exposes real backends for these command families:
+- `ccrust mcp`, `ccrust plugin`, `ccrust agents`, `ccrust doctor`, `ccrust setup-token`
+- `ccrust server` and headless `ccrust open <endpoint> -p [prompt]`
+- `ccrust update`, `ccrust install`, `ccrust rollback`
+- `ccrust task`, `ccrust export`, `ccrust completion`
+
+Current compatibility gap: TS direct-connect `cc://` and `cc+unix://` URLs still are not implemented in the Rust rewrite, and `ccrust ssh` still reports that remote SSH session orchestration is not available yet.
 
 If no provider is configured, bare `ccrust` opens onboarding automatically.
 Inside the REPL, `/login` opens the same onboarding flow and `/logout` clears
@@ -251,6 +265,39 @@ Inside the REPL:
 | `/clear` | Reset conversation |
 | `/compact` | Compact context to save tokens |
 | `/help` | Show all available commands including plugins |
+
+## Top-Level Command Notes
+
+### Print Mode
+
+`ccrust --print` runs the root command in non-interactive mode. The Rust CLI supports the TS-style print contract for:
+- `--output-format text|json|stream-json`
+- `--input-format text|stream-json`
+- `--json-schema <schema>`
+- `--include-hook-events`
+- `--include-partial-messages`
+- `--replay-user-messages`
+- `--resume-session-at <assistant-message-id>`
+- `--no-session-persistence`
+
+### Local Install Management
+
+`ccrust update` and `ccrust install [target]` install the current binary, a local executable path, or a previously recorded snapshot into `~/.cargo/bin/ccrust`. Each install records rollback snapshots under `~/.claude/ccrust/install-history/` and stores state in `~/.claude/ccrust/install-state.json`.
+
+`ccrust rollback [target]` restores one of those recorded snapshots. Use `ccrust rollback --list` to inspect available entries and `ccrust rollback --dry-run` to preview the selected target.
+
+### Tasks, Export, and Completion
+
+`ccrust task` supports:
+- `task create <subject> [-d|--description <text>] [-l|--list <id>]`
+- `task list [--pending] [--json] [-l|--list <id>]`
+- `task get <id> [-l|--list <id>]`
+- `task update <id> [--subject <text>] [-d|--description <text>] [-s|--status <status>] [--owner <agentId>] [--clear-owner] [-l|--list <id>]`
+- `task dir [-l|--list <id>]`
+
+`ccrust export <source> <outputFile>` renders a transcript to text from a session ID, a recent session index, or an existing `.json` / `.jsonl` transcript path.
+
+`ccrust completion <shell> [--output <file>]` generates shell completion scripts for `bash`, `zsh`, and `fish`.
 
 ## License
 
