@@ -1,6 +1,46 @@
 use super::*;
 use std::collections::BTreeSet;
 
+fn project_skill_search_roots(
+    cwd: &Path,
+    root: &Path,
+    plugin_root: Option<&PathBuf>,
+) -> Vec<PathBuf> {
+    if plugin_root.is_some() {
+        vec![root.to_path_buf()]
+    } else {
+        ccrust_plugins::legacy_skill_search_roots(cwd, &claude_config_home_dir())
+    }
+}
+
+fn ancestor_project_skill_entries(
+    cwd: &Path,
+    root: &Path,
+    plugin_root: Option<&PathBuf>,
+) -> Vec<ccrust_plugins::SkillEntry> {
+    let mut seen = BTreeSet::new();
+    let mut skills = Vec::new();
+
+    for search_root in project_skill_search_roots(cwd, root, plugin_root)
+        .into_iter()
+        .skip(1)
+    {
+        for entry in ccrust_plugins::discover_legacy_skill_entries(
+            &search_root,
+            ccrust_plugins::LEGACY_SKILLS_DIR,
+            ccrust_plugins::LEGACY_COMMANDS_DIR,
+        )
+        .unwrap_or_default()
+        {
+            if seen.insert(entry.path.clone()) {
+                skills.push(entry);
+            }
+        }
+    }
+
+    skills
+}
+
 pub(crate) fn task_store_for(cwd: &Path) -> CoreLocalTaskStore {
     CoreLocalTaskStore::new(cwd.join(".claude"))
 }
@@ -23,8 +63,9 @@ pub(crate) async fn resolved_skill_entries(
     cwd: &Path,
     plugin_root: Option<&PathBuf>,
 ) -> Result<Vec<ccrust_plugins::SkillEntry>> {
-    let mut skills = resolved_root_skill_entries(cwd, plugin_root).await?;
     let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
+    let mut skills = resolved_root_skill_entries(cwd, plugin_root).await?;
+    skills.extend(ancestor_project_skill_entries(cwd, &root, plugin_root));
     let home = claude_config_home_dir();
     if home != root {
         skills.extend(resolved_user_skill_entries());
@@ -41,6 +82,10 @@ pub(crate) async fn resolved_dynamic_commands(
     let runtime = OutOfProcessPluginRuntime;
     let root = resolve_plugin_root_with_override(plugin_root, None, cwd);
     let mut commands = runtime.discover_commands(&root).await.unwrap_or_default();
+    let ancestor_entries = ancestor_project_skill_entries(cwd, &root, plugin_root);
+    commands.extend(ccrust_plugins::skill_command_specs(
+        &ancestor_entries.into_iter().rev().collect::<Vec<_>>(),
+    ));
     let home = claude_config_home_dir();
     if home != root {
         commands.extend(ccrust_plugins::skill_command_specs(

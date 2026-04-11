@@ -454,6 +454,27 @@ pub fn skill_command_specs(entries: &[SkillEntry]) -> Vec<CommandSpec> {
         .collect()
 }
 
+pub fn legacy_skill_search_roots(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+    let git_root = cwd
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists());
+
+    let mut roots = Vec::new();
+    for ancestor in cwd.ancestors() {
+        if ancestor == home {
+            break;
+        }
+
+        roots.push(ancestor.to_path_buf());
+
+        if git_root == Some(ancestor) {
+            break;
+        }
+    }
+
+    roots
+}
+
 pub fn discover_legacy_skill_entries(
     root: &Path,
     skills_dir: &str,
@@ -486,9 +507,10 @@ fn collect_legacy_skill_entries(
     {
         let dirent = dirent?;
         let path = dirent.path();
-        let file_type = dirent.file_type()?;
+        let is_dir = path.is_dir();
+        let is_file = path.is_file();
 
-        if file_type.is_dir() {
+        if is_dir {
             let skill_file = path.join(SKILL_FILE_NAME);
             if skill_file.exists() {
                 entries.push(SkillEntry {
@@ -501,7 +523,7 @@ fn collect_legacy_skill_entries(
         }
 
         if source == SkillSource::LegacyCommandsDir
-            && file_type.is_file()
+            && is_file
             && path.extension().and_then(|value| value.to_str()) == Some("md")
         {
             entries.push(SkillEntry {
@@ -812,6 +834,31 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["review", "triage"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_symlinked_legacy_skill_entries() {
+        let root = make_temp_dir("user-skill-symlink-discovery");
+        let source_root = root.join("source-skills");
+        write_file(
+            &source_root.join("targeted-chatroom").join(SKILL_FILE_NAME),
+            "# Targeted Chatroom\n",
+        );
+        fs::create_dir_all(root.join("skills")).unwrap();
+        std::os::unix::fs::symlink(
+            source_root.join("targeted-chatroom"),
+            root.join("skills/targeted-chatroom"),
+        )
+        .unwrap();
+
+        let skills = discover_legacy_skill_entries(&root, "skills", "commands").unwrap();
+        let names = skills
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["targeted-chatroom"]);
     }
 
     #[tokio::test]

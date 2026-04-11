@@ -3,9 +3,11 @@ use super::{
     ToolContext, ToolKind, ToolPermissionMode,
 };
 use serde_json::json;
+use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn make_temp_dir(label: &str) -> std::path::PathBuf {
@@ -16,6 +18,42 @@ fn make_temp_dir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("code-agent-tools-{label}-{stamp}"));
     fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+fn env_lock() -> &'static Mutex<()> {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    ENV_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    struct EnvVarGuard {
+        key: String,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => env::set_var(&self.key, value),
+                None => env::remove_var(&self.key),
+            }
+        }
+    }
+
+    let _guard = env_lock().lock().unwrap();
+    let restore = EnvVarGuard {
+        key: key.to_owned(),
+        previous: env::var(key).ok(),
+    };
+
+    match value {
+        Some(value) => env::set_var(key, value),
+        None => env::remove_var(key),
+    }
+
+    let result = f();
+    drop(restore);
+    result
 }
 
 #[test]
@@ -396,6 +434,87 @@ async fn skill_tool_reads_legacy_skill_prompt() {
 
     assert!(output.content.contains("Use the demo skill."));
     assert_eq!(output.metadata["skill"], "demo");
+}
+
+#[tokio::test]
+async fn skill_tool_reads_ancestor_project_skill_prompt() {
+    let root = make_temp_dir("skill-ancestor-root");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let skill_dir = root.join(".claude").join("skills").join("review");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(skill_dir.join("SKILL.md"), "Use the project review skill.").unwrap();
+    let cwd = root.join("src/nested");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let registry = compatibility_tool_registry();
+    let output = registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "Skill".to_owned(),
+                input: json!({
+                    "skill": "review"
+                }),
+            },
+            &ToolContext {
+                cwd,
+                ..ToolContext::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(output.content.contains("Use the project review skill."));
+    assert_eq!(output.metadata["skill"], "review");
+}
+
+#[test]
+fn skill_tool_reads_user_home_skill_and_expands_prompt() {
+    let home = make_temp_dir("skill-home");
+    let home_path = home.display().to_string();
+
+    with_env_var("CLAUDE_CONFIG_DIR", Some(&home_path), || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let cwd = make_temp_dir("skill-home-cwd");
+            let skill_dir = home.join("skills").join("triage");
+            fs::create_dir_all(&skill_dir).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\narguments: target\n---\nReview $target from ${CLAUDE_SKILL_DIR} during ${CLAUDE_SESSION_ID}.",
+            )
+            .unwrap();
+
+            let session_id = uuid::Uuid::new_v4();
+            let registry = compatibility_tool_registry();
+            let output = registry
+                .invoke(
+                    ToolCallRequest {
+                        tool_name: "Skill".to_owned(),
+                        input: json!({
+                            "skill": "triage",
+                            "args": "src/lib.rs"
+                        }),
+                    },
+                    &ToolContext {
+                        session_id: Some(session_id),
+                        cwd,
+                        ..ToolContext::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert!(output.content.starts_with("Base directory for this skill:"));
+            assert!(output.content.contains("Review src/lib.rs"));
+            assert!(output.content.contains(&skill_dir.display().to_string()));
+            assert!(output.content.contains(&session_id.to_string()));
+            assert_eq!(output.metadata["skill"], "triage");
+        });
+    });
 }
 
 #[tokio::test]

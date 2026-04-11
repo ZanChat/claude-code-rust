@@ -637,10 +637,13 @@ async fn repl_plan_command_enables_plan_mode_and_shows_plan() {
 #[tokio::test]
 async fn repl_skills_command_formats_skill_list() {
     let root = temp_session_root("repl-skills");
+    fs::create_dir_all(root.join(".git")).unwrap();
     let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
     let tool_registry = compatibility_tool_registry();
     write_test_file(&root.join(".claude/skills/review/SKILL.md"), "# Review\n");
-    let registry = resolved_command_registry(&root, None).await;
+    let cwd = root.join("src/nested");
+    fs::create_dir_all(&cwd).unwrap();
+    let registry = resolved_command_registry(&cwd, None).await;
     let session_id = SessionId::new_v4();
     let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
     let mut raw_messages = Vec::new();
@@ -656,7 +659,7 @@ async fn repl_skills_command_formats_skill_list() {
         },
         &store,
         &tool_registry,
-        &root,
+        &cwd,
         None,
         ApiProvider::OpenAICompatible,
         &mut active_model,
@@ -1000,6 +1003,113 @@ fn resolved_command_registry_loads_user_home_skill_commands() {
             .unwrap()
             .contains(&home.display().to_string()));
     });
+}
+
+#[cfg(unix)]
+#[test]
+fn resolved_command_registry_loads_user_home_symlinked_skill() {
+    let root = temp_session_root("registry-project-home-symlinked-skill");
+    let home = temp_session_root("registry-user-symlinked-skill");
+    let source_root = home.join("source-skills");
+    write_test_file(
+        &source_root.join("targeted-chatroom/SKILL.md"),
+        "# Targeted Chatroom\n",
+    );
+    fs::create_dir_all(home.join("skills")).unwrap();
+    std::os::unix::fs::symlink(
+        source_root.join("targeted-chatroom"),
+        home.join("skills/targeted-chatroom"),
+    )
+    .unwrap();
+    let home_path = home.display().to_string();
+
+    with_env_var("CLAUDE_CONFIG_DIR", Some(&home_path), || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let registry = runtime.block_on(resolved_command_registry(&root, None));
+        let chatroom = registry.resolve("targeted-chatroom").unwrap();
+
+        assert_eq!(chatroom.source, CommandSource::Skill);
+        assert!(chatroom
+            .origin
+            .as_deref()
+            .unwrap()
+            .contains("targeted-chatroom/SKILL.md"));
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_prompt_command_prompt_supports_user_home_symlinked_skill() {
+    let root = temp_session_root("prompt-project-home-symlinked-skill");
+    let home = temp_session_root("prompt-user-symlinked-skill");
+    let source_root = home.join("source-skills");
+    write_test_file(
+        &source_root.join("targeted-chatroom/SKILL.md"),
+        "---\narguments: topic\n---\nDiscuss $topic from ${CLAUDE_SKILL_DIR} in session ${CLAUDE_SESSION_ID}.\n",
+    );
+    fs::create_dir_all(home.join("skills")).unwrap();
+    std::os::unix::fs::symlink(
+        source_root.join("targeted-chatroom"),
+        home.join("skills/targeted-chatroom"),
+    )
+    .unwrap();
+    let home_path = home.display().to_string();
+
+    with_env_var("CLAUDE_CONFIG_DIR", Some(&home_path), || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let registry = runtime.block_on(resolved_command_registry(&root, None));
+        let session_id = SessionId::new_v4();
+        let prompt = resolve_prompt_command_prompt(
+            &registry,
+            &CommandInvocation {
+                name: "targeted-chatroom".to_owned(),
+                args: vec!["debugging".to_owned()],
+                raw_input: "/targeted-chatroom debugging".to_owned(),
+            },
+            &root,
+            None,
+            session_id,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(prompt.contains("Discuss debugging"));
+        assert!(prompt.contains("Base directory for this skill:"));
+        assert!(prompt.contains(&home.join("skills/targeted-chatroom").display().to_string()));
+        assert!(prompt.contains(&session_id.to_string()));
+    });
+}
+
+#[test]
+fn resolved_command_registry_loads_ancestor_project_skill_commands() {
+    let root = temp_session_root("registry-ancestor-project-skills");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    write_test_file(
+        &root.join(".claude/commands/review.md"),
+        "# Project review\n",
+    );
+    let cwd = root.join("src/nested");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let registry = runtime.block_on(resolved_command_registry(&cwd, None));
+    let review = registry.resolve("review").unwrap();
+
+    assert_eq!(review.source, CommandSource::Skill);
+    assert!(review
+        .origin
+        .as_deref()
+        .unwrap()
+        .contains(&root.display().to_string()));
 }
 
 #[tokio::test]

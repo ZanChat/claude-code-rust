@@ -10,6 +10,7 @@ async-trait.workspace = true
 ccrust-core = { path = "../core" }
 ccrust-mcp = { path = "../mcp" }
 ccrust-plugins = { path = "../plugins" }
+ccrust-session = { path = "../session" }
 reqwest.workspace = true
 schemars.workspace = true
 serde.workspace = true

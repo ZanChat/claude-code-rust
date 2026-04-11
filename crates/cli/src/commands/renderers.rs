@@ -794,12 +794,14 @@ fn render_preview(title: String, lines: Vec<String>) -> String {
 }
 
 fn skill_entry_source_label(entry: &ccrust_plugins::SkillEntry, cwd: &Path) -> String {
+    let project_path = cwd.ancestors().any(|ancestor| entry.path.starts_with(ancestor));
+
     match entry.source {
         ccrust_plugins::SkillSource::Manifest => "plugin".to_owned(),
         ccrust_plugins::SkillSource::LegacyCommandsDir => {
             if entry.path.starts_with(claude_config_home_dir()) {
                 "user command".to_owned()
-            } else if entry.path.starts_with(cwd) {
+            } else if project_path {
                 "project command".to_owned()
             } else {
                 "command".to_owned()
@@ -808,7 +810,7 @@ fn skill_entry_source_label(entry: &ccrust_plugins::SkillEntry, cwd: &Path) -> S
         ccrust_plugins::SkillSource::LegacySkillsDir => {
             if entry.path.starts_with(claude_config_home_dir()) {
                 "user skill".to_owned()
-            } else if entry.path.starts_with(cwd) {
+            } else if project_path {
                 "project skill".to_owned()
             } else {
                 "skill".to_owned()
