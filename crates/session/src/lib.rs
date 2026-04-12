@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use ccrust_core::{
-    AgentId, BoundaryKind, BoundaryMarker, ContentBlock, Message, MessageRole, SessionId,
+    AgentId, BoundaryKind, BoundaryMarker, ContentBlock, Message, MessageMetadata, MessageRole,
+    SessionId, TokenUsage, ToolCall, ToolResult,
 };
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -66,6 +68,21 @@ pub trait TranscriptCodec: Send + Sync {
 #[derive(Clone, Debug, Default)]
 pub struct JsonlTranscriptCodec;
 
+#[derive(Clone, Debug, Default)]
+struct MessageMetadataPatch {
+    tags: Vec<String>,
+    attributes: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+enum DecodedTranscriptLine {
+    Message(Message),
+    MetadataPatch {
+        target_id: Uuid,
+        patch: MessageMetadataPatch,
+    },
+}
+
 #[async_trait]
 impl TranscriptCodec for JsonlTranscriptCodec {
     async fn read_messages(&self, path: &Path) -> Result<Vec<Message>> {
@@ -78,12 +95,31 @@ impl TranscriptCodec for JsonlTranscriptCodec {
             .with_context(|| format!("failed to read transcript {}", path.display()))?;
 
         let mut messages = Vec::new();
+        let mut pending_patches = BTreeMap::<Uuid, MessageMetadataPatch>::new();
         for line in content.lines().filter(|line| !line.trim().is_empty()) {
             let value = serde_json::from_str::<serde_json::Value>(line).with_context(|| {
                 format!("failed to decode transcript line in {}", path.display())
             })?;
-            if let Ok(message) = serde_json::from_value::<Message>(value) {
-                messages.push(message);
+            match decode_transcript_line(&value) {
+                Some(DecodedTranscriptLine::Message(mut message)) => {
+                    if let Some(patch) = pending_patches.remove(&message.id) {
+                        apply_metadata_patch(&mut message, patch);
+                    }
+                    messages.push(message);
+                }
+                Some(DecodedTranscriptLine::MetadataPatch { target_id, patch }) => {
+                    if let Some(message) =
+                        messages.iter_mut().find(|message| message.id == target_id)
+                    {
+                        apply_metadata_patch(message, patch);
+                    } else {
+                        pending_patches
+                            .entry(target_id)
+                            .and_modify(|existing| merge_metadata_patch(existing, &patch))
+                            .or_insert(patch);
+                    }
+                }
+                None => {}
             }
         }
 
@@ -109,6 +145,282 @@ impl TranscriptCodec for JsonlTranscriptCodec {
         file.write_all(b"\n").await?;
         Ok(())
     }
+}
+
+fn merge_metadata_patch(target: &mut MessageMetadataPatch, patch: &MessageMetadataPatch) {
+    for tag in &patch.tags {
+        if !target.tags.contains(tag) {
+            target.tags.push(tag.clone());
+        }
+    }
+    for (key, value) in &patch.attributes {
+        target.attributes.insert(key.clone(), value.clone());
+    }
+}
+
+fn apply_metadata_patch(message: &mut Message, patch: MessageMetadataPatch) {
+    for tag in patch.tags {
+        if !message.metadata.tags.contains(&tag) {
+            message.metadata.tags.push(tag);
+        }
+    }
+    for (key, value) in patch.attributes {
+        message.metadata.attributes.insert(key, value);
+    }
+}
+
+fn decode_transcript_line(value: &serde_json::Value) -> Option<DecodedTranscriptLine> {
+    serde_json::from_value::<Message>(value.clone())
+        .ok()
+        .map(DecodedTranscriptLine::Message)
+        .or_else(|| decode_legacy_transcript_line(value))
+}
+
+fn decode_legacy_transcript_line(value: &serde_json::Value) -> Option<DecodedTranscriptLine> {
+    let entry_type = value.get("type")?.as_str()?;
+    let legacy_message = value.get("message")?;
+    let base_role = parse_legacy_message_role(
+        legacy_message
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(entry_type),
+    )?;
+
+    if value
+        .get("isMeta")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && base_role == MessageRole::User
+    {
+        let expanded_prompt = legacy_text_content(legacy_message.get("content")?)
+            .trim()
+            .to_owned();
+        if expanded_prompt.is_empty() {
+            return None;
+        }
+        let target_id = parse_legacy_uuid(value.get("parentUuid")?)?;
+        let mut patch = MessageMetadataPatch::default();
+        patch.tags.push(ccrust_core::PROMPT_COMMAND_TAG.to_owned());
+        patch.attributes.insert(
+            ccrust_core::EXPANDED_PROMPT_ATTRIBUTE.to_owned(),
+            expanded_prompt,
+        );
+        return Some(DecodedTranscriptLine::MetadataPatch { target_id, patch });
+    }
+
+    let blocks = legacy_content_blocks(legacy_message.get("content")?)?;
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let mut message = Message::new(legacy_role_for_blocks(base_role.clone(), &blocks), blocks);
+    message.id = parse_legacy_uuid(value.get("uuid")?)?;
+    message.parent_id = value.get("parentUuid").and_then(parse_legacy_uuid);
+    message.session_id = value.get("sessionId").and_then(parse_legacy_session_id);
+    message.created_at_unix_ms = 0;
+    message.metadata = legacy_message_metadata(value, legacy_message, &message.blocks);
+    Some(DecodedTranscriptLine::Message(message))
+}
+
+fn parse_legacy_message_role(value: &str) -> Option<MessageRole> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "system" => Some(MessageRole::System),
+        "user" => Some(MessageRole::User),
+        "assistant" => Some(MessageRole::Assistant),
+        "tool" => Some(MessageRole::Tool),
+        "attachment" => Some(MessageRole::Attachment),
+        _ => None,
+    }
+}
+
+fn parse_legacy_uuid(value: &serde_json::Value) -> Option<Uuid> {
+    value.as_str().and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn parse_legacy_session_id(value: &serde_json::Value) -> Option<SessionId> {
+    parse_legacy_uuid(value)
+}
+
+fn legacy_content_blocks(content: &serde_json::Value) -> Option<Vec<ContentBlock>> {
+    match content {
+        serde_json::Value::String(text) => Some(vec![ContentBlock::Text { text: text.clone() }]),
+        serde_json::Value::Array(blocks) => {
+            let blocks = blocks
+                .iter()
+                .filter_map(legacy_content_block)
+                .collect::<Vec<_>>();
+            (!blocks.is_empty()).then_some(blocks)
+        }
+        _ => None,
+    }
+}
+
+fn legacy_content_block(block: &serde_json::Value) -> Option<ContentBlock> {
+    let block_type = block.get("type")?.as_str()?;
+    match block_type {
+        "text" => block
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| ContentBlock::Text {
+                text: text.to_owned(),
+            }),
+        "tool_use" => {
+            let id = block.get("id")?.as_str()?;
+            let name = block.get("name")?.as_str()?;
+            let input_json = serde_json::to_string(
+                block
+                    .get("input")
+                    .unwrap_or(&serde_json::Value::Object(Default::default())),
+            )
+            .ok()?;
+            Some(ContentBlock::ToolCall {
+                call: ToolCall {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    input_json,
+                    thought_signature: block
+                        .get("thought_signature")
+                        .or_else(|| block.get("thoughtSignature"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                },
+            })
+        }
+        "tool_result" => {
+            let tool_call_id = block
+                .get("tool_use_id")
+                .or_else(|| block.get("toolUseId"))
+                .and_then(serde_json::Value::as_str)?;
+            Some(ContentBlock::ToolResult {
+                result: ToolResult {
+                    tool_call_id: tool_call_id.to_owned(),
+                    output_text: legacy_text_content(block.get("content")?),
+                    is_error: block
+                        .get("is_error")
+                        .or_else(|| block.get("isError"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                },
+            })
+        }
+        _ => block
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| ContentBlock::Text {
+                text: text.to_owned(),
+            }),
+    }
+}
+
+fn legacy_text_content(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| {
+                (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                    .then(|| block.get("text").and_then(serde_json::Value::as_str))
+                    .flatten()
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    }
+}
+
+fn legacy_role_for_blocks(role: MessageRole, blocks: &[ContentBlock]) -> MessageRole {
+    if matches!(role, MessageRole::User)
+        && blocks
+            .iter()
+            .all(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    {
+        MessageRole::Tool
+    } else {
+        role
+    }
+}
+
+fn legacy_message_metadata(
+    entry: &serde_json::Value,
+    legacy_message: &serde_json::Value,
+    blocks: &[ContentBlock],
+) -> MessageMetadata {
+    let mut metadata = MessageMetadata {
+        provider: entry
+            .get("apiProvider")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        model: legacy_message
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        usage: legacy_token_usage(legacy_message.get("usage")),
+        tags: Vec::new(),
+        attributes: BTreeMap::new(),
+    };
+
+    if let Some(raw_input) = legacy_prompt_command_raw_input(blocks) {
+        metadata
+            .tags
+            .push(ccrust_core::PROMPT_COMMAND_TAG.to_owned());
+        metadata.attributes.insert(
+            ccrust_core::PROMPT_COMMAND_RAW_INPUT_ATTRIBUTE.to_owned(),
+            raw_input,
+        );
+    }
+
+    metadata
+}
+
+fn legacy_token_usage(value: Option<&serde_json::Value>) -> Option<TokenUsage> {
+    let value = value?;
+    Some(TokenUsage {
+        input_tokens: value
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: value
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        cache_creation_input_tokens: value
+            .get("cache_creation_input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        cache_read_input_tokens: value
+            .get("cache_read_input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+fn legacy_prompt_command_raw_input(blocks: &[ContentBlock]) -> Option<String> {
+    let text = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    prompt_command_raw_input_from_text(&text)
+}
+
+fn decoded_message_from_json_line(line: &str) -> Option<Message> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    match decode_transcript_line(&value)? {
+        DecodedTranscriptLine::Message(message) => Some(message),
+        DecodedTranscriptLine::MetadataPatch { .. } => None,
+    }
+}
+
+fn decoded_message_count(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(decoded_message_from_json_line)
+        .count()
 }
 
 pub fn claude_config_home_dir() -> PathBuf {
@@ -287,6 +599,17 @@ fn extract_tag_content(input: &str, tag: &str) -> Option<String> {
     let start = input.find(&start_tag)? + start_tag.len();
     let end = input[start..].find(&end_tag)? + start;
     Some(input[start..end].trim().to_owned())
+}
+
+fn prompt_command_raw_input_from_text(text: &str) -> Option<String> {
+    let command_name = extract_tag_content(text, "command-name")?;
+    let args = extract_tag_content(text, "command-args").unwrap_or_default();
+
+    if args.is_empty() {
+        Some(command_name)
+    } else {
+        Some(format!("{command_name} {args}"))
+    }
 }
 
 fn should_skip_first_prompt(value: &str) -> bool {
@@ -668,7 +991,7 @@ pub fn extract_first_prompt_from_head(head: &str) -> String {
                 continue;
             }
 
-            if let Some(command_name) = extract_tag_content(&normalized, "command-name") {
+            if let Some(command_name) = prompt_command_raw_input_from_text(&normalized) {
                 if command_fallback.is_empty() {
                     command_fallback = command_name;
                 }
@@ -760,7 +1083,7 @@ pub fn summarize_transcript_path(path: &Path) -> Result<Option<SessionSummary>> 
             content
                 .lines()
                 .filter(|line| !line.trim().is_empty())
-                .find_map(|line| serde_json::from_str::<Message>(line).ok())
+                .find_map(decoded_message_from_json_line)
                 .and_then(|message| {
                     (message.role == ccrust_core::MessageRole::User).then_some(message)
                 })
@@ -778,10 +1101,7 @@ pub fn summarize_transcript_path(path: &Path) -> Result<Option<SessionSummary>> 
         session_id,
         transcript_path: path.to_path_buf(),
         modified_at_unix_ms,
-        message_count: content
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count(),
+        message_count: decoded_message_count(&content),
         first_prompt,
     }))
 }
