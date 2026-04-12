@@ -14,7 +14,7 @@ impl Tool for McpAuthTool {
     }
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let config = load_mcp_server_config(&context.cwd, &input).await?;
+        let config = load_mcp_server_config(context, &input).await?;
         let action = input_string_or(&input, "action", "status");
         match action.as_str() {
             "status" => {

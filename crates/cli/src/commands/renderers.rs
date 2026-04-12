@@ -511,139 +511,13 @@ async fn handoff_lines(
     Ok((transcript_path, metadata, lines))
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct IdeLockfileContent {
-    workspace_folders: Option<Vec<String>>,
-    ide_name: Option<String>,
-    transport: Option<String>,
-}
-
-#[derive(Debug)]
-struct IdeLockfileInfo {
-    workspace_folders: Vec<String>,
-    port: u16,
-    ide_name: Option<String>,
-    use_websocket: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct DetectedIdeCandidate {
-    pub(crate) name: String,
-    pub(crate) port: u16,
-    pub(crate) url: String,
-    pub(crate) suggested_bridge: String,
-    pub(crate) workspace_folders: Vec<String>,
-}
-
-fn ide_lockfiles_dir(home_override: Option<&Path>) -> Option<PathBuf> {
-    let home = home_override
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))?;
-    Some(home.join(".claude/ide"))
-}
-
-fn sorted_ide_lockfiles(home_override: Option<&Path>) -> Vec<PathBuf> {
-    let Some(lockfiles_dir) = ide_lockfiles_dir(home_override) else {
-        return Vec::new();
-    };
-    let Ok(entries) = fs::read_dir(lockfiles_dir) else {
-        return Vec::new();
-    };
-
-    let mut paths = entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            (path.extension().and_then(|ext| ext.to_str()) == Some("lock")).then_some(path)
-        })
-        .collect::<Vec<_>>();
-    paths.sort_by(|left, right| {
-        let left_modified = left
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let right_modified = right
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        right_modified
-            .cmp(&left_modified)
-            .then_with(|| left.cmp(right))
-    });
-    paths
-}
-
-fn read_ide_lockfile(path: &Path) -> Option<IdeLockfileInfo> {
-    let content = fs::read_to_string(path).ok()?;
-    let port = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.parse::<u16>().ok())?;
-
-    if let Ok(parsed) = serde_json::from_str::<IdeLockfileContent>(&content) {
-        return Some(IdeLockfileInfo {
-            workspace_folders: parsed.workspace_folders.unwrap_or_default(),
-            port,
-            ide_name: parsed.ide_name,
-            use_websocket: parsed.transport.as_deref() == Some("ws"),
-        });
-    }
-
-    Some(IdeLockfileInfo {
-        workspace_folders: content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_owned)
-            .collect(),
-        port,
-        ide_name: None,
-        use_websocket: false,
-    })
-}
-
-fn workspace_matches_ide(cwd: &Path, workspace_folder: &str) -> bool {
-    let workspace_path = PathBuf::from(workspace_folder);
-    let resolved_workspace = fs::canonicalize(&workspace_path).unwrap_or(workspace_path);
-    cwd == resolved_workspace || cwd.starts_with(&resolved_workspace)
-}
-
-pub(crate) fn detect_workspace_ides(
-    cwd: &Path,
-    home_override: Option<&Path>,
-) -> Vec<DetectedIdeCandidate> {
-    let resolved_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    sorted_ide_lockfiles(home_override)
-        .into_iter()
-        .filter_map(|path| read_ide_lockfile(&path))
-        .filter(|lockfile| {
-            lockfile
-                .workspace_folders
-                .iter()
-                .any(|folder| workspace_matches_ide(&resolved_cwd, folder))
-        })
-        .map(|lockfile| {
-            let url_scheme = if lockfile.use_websocket { "ws" } else { "http" };
-            DetectedIdeCandidate {
-                name: lockfile.ide_name.unwrap_or_else(|| "IDE".to_owned()),
-                port: lockfile.port,
-                url: format!("{url_scheme}://127.0.0.1:{}", lockfile.port),
-                suggested_bridge: format!("ide://127.0.0.1:{}", lockfile.port),
-                workspace_folders: lockfile.workspace_folders,
-            }
-        })
-        .collect()
-}
-
 pub(crate) fn render_ide_command_with_home(
     cwd: &Path,
     ide_bridge_active: bool,
     ide_address: Option<&str>,
     home_override: Option<&Path>,
 ) -> Result<String> {
-    let detected = detect_workspace_ides(cwd, home_override);
+    let detected = detect_workspace_ides(cwd, home_override, ide_env_port());
     let (status, message) = if ide_bridge_active {
         (
             "connected",
@@ -653,14 +527,14 @@ pub(crate) fn render_ide_command_with_home(
         (
             "available",
             format!(
-                "Detected {} for this workspace. Connect with {}.",
-                candidate.name, candidate.suggested_bridge
+                "Detected {} for this workspace at {}. The IDE MCP server is available as 'ide'.",
+                candidate.name, candidate.url
             ),
         )
     } else {
         (
             "not_connected",
-            "No IDE bridge detected for this workspace. Start a supported IDE with the Claude extension, or connect explicitly with --bridge-connect ide://HOST[:PORT] or --bridge-server ide://HOST[:PORT].".to_owned(),
+            "No IDE integration detected for this workspace. Start a supported IDE with the Claude extension in the same workspace to enable the auto-connected 'ide' MCP server.".to_owned(),
         )
     };
 

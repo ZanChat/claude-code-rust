@@ -44,7 +44,10 @@ use ccrust_core::{
     CommandSpec, ContentBlock, LocalTaskStore as CoreLocalTaskStore, Message, MessageRole,
     QuestionRequest, QuestionResponse, SessionId, TaskRecord, TaskStatus, TaskStore,
 };
-use ccrust_mcp::parse_mcp_server_configs;
+use ccrust_mcp::{
+    auto_connected_ide_server_config, detect_workspace_ides, ide_env_port,
+    parse_mcp_server_configs, send_notification_from_config, DetectedIdeCandidate,
+};
 use ccrust_plugins::{
     BridgeLaunchRequest, CommandDefinitions, OutOfProcessPluginRuntime, PluginManifest,
     PluginRuntime, PLUGIN_MANIFEST_PATH, SKILL_FILE_NAME,

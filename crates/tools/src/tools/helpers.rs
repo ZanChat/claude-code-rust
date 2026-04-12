@@ -384,19 +384,36 @@ fn strip_html_tags(input: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-async fn load_mcp_server_config(cwd: &Path, input: &Value) -> Result<McpServerConfig> {
+async fn load_mcp_server_config(context: &ToolContext, input: &Value) -> Result<McpServerConfig> {
     let root = input
         .get("plugin_root")
         .and_then(Value::as_str)
-        .map(|value| resolve_path(cwd, value))
-        .unwrap_or_else(|| cwd.to_path_buf());
+        .map(|value| resolve_path(&context.cwd, value))
+        .unwrap_or_else(|| context.cwd.to_path_buf());
     let server_name = input_string(input, "server")?;
     let runtime = OutOfProcessPluginRuntime;
-    let loaded = runtime
-        .load_manifest(&root)
-        .await
-        .with_context(|| format!("failed to load plugin manifest from {}", root.display()))?;
-    let servers = parse_mcp_server_configs(&loaded.manifest.mcp_servers);
+    let manifest_path = root.join(".claude-plugin/plugin.json");
+    let mut servers = if manifest_path.exists() {
+        let loaded = runtime
+            .load_manifest(&root)
+            .await
+            .with_context(|| format!("failed to load plugin manifest from {}", root.display()))?;
+        parse_mcp_server_configs(&loaded.manifest.mcp_servers)
+    } else {
+        BTreeMap::new()
+    };
+    if !servers.contains_key("ide") {
+        let term_program = env::var("TERM_PROGRAM").ok();
+        if let Some(ide_config) = auto_connected_ide_server_config(
+            &context.cwd,
+            term_program.as_deref(),
+            None,
+            ccrust_mcp::ide_env_port(),
+            false,
+        ) {
+            servers.insert("ide".to_owned(), ide_config);
+        }
+    }
     servers
         .get(&server_name)
         .cloned()

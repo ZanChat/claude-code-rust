@@ -1,4 +1,6 @@
 use super::*;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
 
 #[test]
 fn render_ide_command_detects_matching_lockfile() {
@@ -19,7 +21,106 @@ fn render_ide_command_detects_matching_lockfile() {
 
     assert!(report.contains("\"status\": \"available\""));
     assert!(report.contains("\"name\": \"VS Code\""));
-    assert!(report.contains("ide://127.0.0.1:48123"));
+    assert!(report.contains("ws://127.0.0.1:48123"));
+}
+
+#[tokio::test]
+async fn maybe_notify_auto_connected_ide_connects_to_detected_vscode_server() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let observed_auth = Arc::new(Mutex::new(None::<String>));
+    let observed_notification = Arc::new(Mutex::new(false));
+    let observed_auth_server = observed_auth.clone();
+    let observed_notification_server = observed_notification.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_hdr_async(
+            stream,
+            move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                                    mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                                response.headers_mut().insert(
+                                        "Sec-WebSocket-Protocol",
+                                        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("mcp"),
+                                );
+                *observed_auth_server.lock().unwrap() = request
+                    .headers()
+                    .get("x-claude-code-ide-authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                Ok(response)
+            },
+        )
+        .await
+        .unwrap();
+
+        while let Some(message) = socket.next().await {
+            let message = message.unwrap();
+            if !message.is_text() {
+                continue;
+            }
+            let value = serde_json::from_str::<Value>(message.to_text().unwrap()).unwrap();
+            match value["method"].as_str().unwrap() {
+                "initialize" => {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {
+                                    "protocolVersion": "2024-11-05",
+                                    "capabilities": {}
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                "notifications/initialized" => {}
+                "ide_connected" => {
+                    *observed_notification_server.lock().unwrap() = true;
+                    assert!(value["params"]["pid"].as_u64().unwrap() > 0);
+                    break;
+                }
+                other => panic!("unexpected websocket method: {other}"),
+            }
+        }
+    });
+
+    let home = temp_session_root("ide-auto-connect-runtime-home");
+    let workspace = home.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write_test_file(
+        &home.join(format!(".claude/ide/{}.lock", address.port())),
+        &json!({
+            "workspaceFolders": [workspace.display().to_string()],
+            "ideName": "Visual Studio Code",
+            "transport": "ws",
+            "authToken": "ide-secret-token"
+        })
+        .to_string(),
+    );
+
+    let notified = maybe_notify_auto_connected_ide(
+        &workspace,
+        false,
+        Some(&home),
+        Some("vscode"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    server.await.unwrap();
+
+    assert!(notified);
+    assert_eq!(
+        observed_auth.lock().unwrap().as_deref(),
+        Some("ide-secret-token")
+    );
+    assert!(*observed_notification.lock().unwrap());
 }
 
 #[tokio::test]
@@ -928,6 +1029,42 @@ fn runtime_system_prompt_caps_mcp_instruction_budget() {
         assert!(semi_static.text.contains("[truncated]"));
         assert!(semi_static.text.chars().count() <= crate::MAX_MCP_TOTAL_CHARS);
     });
+}
+
+#[test]
+fn runtime_system_prompt_includes_auto_connected_ide_section() {
+    let home = temp_session_root("runtime-system-prompt-ide-home");
+    let workspace = home.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write_test_file(
+        &home.join(".claude/ide/48123.lock"),
+        &json!({
+            "workspaceFolders": [workspace.display().to_string()],
+            "ideName": "Visual Studio Code",
+            "transport": "ws",
+            "authToken": "ide-secret-token"
+        })
+        .to_string(),
+    );
+
+    let home_path = home.display().to_string();
+    with_env_vars(
+        &[("HOME", Some(home_path.as_str())), ("TERM_PROGRAM", Some("vscode"))],
+        || {
+            let prompt = build_runtime_system_prompt(
+                &workspace,
+                &compatibility_tool_registry(),
+                ApiProvider::OpenAICompatible,
+                "gemini-3.1-pro-preview",
+                None,
+            );
+            let prompt_text = prompt.as_text();
+
+            assert!(prompt_text.contains("# IDE Integration"));
+            assert!(prompt_text.contains("Visual Studio Code is auto-connected as MCP server 'ide'"));
+            assert!(prompt_text.contains("Use mcp with server 'ide' to call IDE tools."));
+        },
+    );
 }
 
 #[test]

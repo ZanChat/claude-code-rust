@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio_tungstenite::connect_async;
@@ -81,6 +82,39 @@ pub struct McpServerManifest {
     pub resources: Vec<McpResourceDescriptor>,
     pub state: McpServerState,
 }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DetectedIdeCandidate {
+    pub name: String,
+    pub port: u16,
+    pub url: String,
+    pub suggested_bridge: String,
+    pub workspace_folders: Vec<String>,
+    pub auth_token: Option<String>,
+    pub running_in_windows: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdeLockfileContent {
+    workspace_folders: Option<Vec<String>>,
+    ide_name: Option<String>,
+    transport: Option<String>,
+    running_in_windows: Option<bool>,
+    auth_token: Option<String>,
+}
+
+#[derive(Debug)]
+struct IdeLockfileInfo {
+    workspace_folders: Vec<String>,
+    port: u16,
+    ide_name: Option<String>,
+    use_websocket: bool,
+    running_in_windows: bool,
+    auth_token: Option<String>,
+}
+
+const IDE_MCP_INSTRUCTIONS: &str = "An IDE MCP server named 'ide' is auto-connected for this session. Use the mcp tool with server 'ide' to call IDE tools, and use list_mcp_resources or read_mcp_resource with server 'ide' to inspect IDE-provided resources.";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CachedMcpAuthToken {
@@ -163,6 +197,225 @@ impl McpRegistry {
             self.register(format!("{prefix}:{name}"), config);
         }
     }
+}
+
+pub fn ide_env_port() -> Option<u16> {
+    env::var("CLAUDE_CODE_SSE_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+}
+
+fn env_var_truthy(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn env_var_defined_false(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub fn ide_auto_connect_enabled(
+    term_program: Option<&str>,
+    env_port_override: Option<u16>,
+    explicit_flag: bool,
+) -> bool {
+    if env_var_defined_false("CLAUDE_CODE_AUTO_CONNECT_IDE") {
+        return false;
+    }
+
+    explicit_flag
+        || term_program == Some("vscode")
+        || env_port_override.is_some()
+        || env_var_truthy("CLAUDE_CODE_AUTO_CONNECT_IDE")
+}
+
+fn ide_lockfiles_dir(home_override: Option<&Path>) -> Option<PathBuf> {
+    let home = home_override
+        .map(Path::to_path_buf)
+        .or_else(|| env::var_os("HOME").map(PathBuf::from))
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))?;
+    Some(home.join(".claude/ide"))
+}
+
+fn sorted_ide_lockfiles(home_override: Option<&Path>) -> Vec<PathBuf> {
+    let Some(lockfiles_dir) = ide_lockfiles_dir(home_override) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(lockfiles_dir) else {
+        return Vec::new();
+    };
+
+    let mut paths = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            (path.extension().and_then(|ext| ext.to_str()) == Some("lock")).then_some(path)
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        let left_modified = left
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let right_modified = right
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        right_modified
+            .cmp(&left_modified)
+            .then_with(|| left.cmp(right))
+    });
+    paths
+}
+
+fn read_ide_lockfile(path: &Path) -> Option<IdeLockfileInfo> {
+    let content = fs::read_to_string(path).ok()?;
+    let port = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse::<u16>().ok())?;
+
+    if let Ok(parsed) = serde_json::from_str::<IdeLockfileContent>(&content) {
+        return Some(IdeLockfileInfo {
+            workspace_folders: parsed.workspace_folders.unwrap_or_default(),
+            port,
+            ide_name: parsed.ide_name,
+            use_websocket: parsed.transport.as_deref() == Some("ws"),
+            running_in_windows: parsed.running_in_windows.unwrap_or(false),
+            auth_token: parsed.auth_token,
+        });
+    }
+
+    Some(IdeLockfileInfo {
+        workspace_folders: content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        port,
+        ide_name: None,
+        use_websocket: false,
+        running_in_windows: false,
+        auth_token: None,
+    })
+}
+
+fn workspace_matches_ide(cwd: &Path, workspace_folder: &str) -> bool {
+    let workspace_path = PathBuf::from(workspace_folder);
+    let resolved_workspace = fs::canonicalize(&workspace_path).unwrap_or(workspace_path);
+    cwd == resolved_workspace || cwd.starts_with(&resolved_workspace)
+}
+
+pub fn detect_workspace_ides(
+    cwd: &Path,
+    home_override: Option<&Path>,
+    env_port_override: Option<u16>,
+) -> Vec<DetectedIdeCandidate> {
+    let resolved_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let candidates = sorted_ide_lockfiles(home_override)
+        .into_iter()
+        .filter_map(|path| read_ide_lockfile(&path))
+        .filter(|lockfile| {
+            lockfile
+                .workspace_folders
+                .iter()
+                .any(|folder| workspace_matches_ide(&resolved_cwd, folder))
+        })
+        .map(|lockfile| {
+            let url = if lockfile.use_websocket {
+                format!("ws://127.0.0.1:{}", lockfile.port)
+            } else {
+                format!("http://127.0.0.1:{}/sse", lockfile.port)
+            };
+            DetectedIdeCandidate {
+                name: lockfile.ide_name.unwrap_or_else(|| "IDE".to_owned()),
+                port: lockfile.port,
+                suggested_bridge: url.clone(),
+                url,
+                workspace_folders: lockfile.workspace_folders,
+                auth_token: lockfile.auth_token,
+                running_in_windows: lockfile.running_in_windows,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(port) = env_port_override {
+        let matches = candidates
+            .iter()
+            .filter(|candidate| candidate.port == port)
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            return matches;
+        }
+    }
+
+    candidates
+}
+
+pub fn auto_connected_ide_server_config(
+    cwd: &Path,
+    term_program: Option<&str>,
+    home_override: Option<&Path>,
+    env_port_override: Option<u16>,
+    explicit_flag: bool,
+) -> Option<McpServerConfig> {
+    if !ide_auto_connect_enabled(term_program, env_port_override, explicit_flag) {
+        return None;
+    }
+
+    let mut candidates = detect_workspace_ides(cwd, home_override, env_port_override);
+    if candidates.len() != 1 {
+        return None;
+    }
+
+    let candidate = candidates.pop()?;
+    let mut headers = BTreeMap::new();
+    let transport = if candidate.url.starts_with("ws://") || candidate.url.starts_with("wss://") {
+        headers.insert("Sec-WebSocket-Protocol".to_owned(), "mcp".to_owned());
+        if let Some(token) = candidate.auth_token.as_deref() {
+            headers.insert(
+                "X-Claude-Code-Ide-Authorization".to_owned(),
+                token.to_owned(),
+            );
+        }
+        McpTransportConfig::WebSocket {
+            url: candidate.url.clone(),
+        }
+    } else {
+        McpTransportConfig::Http {
+            url: candidate.url.clone(),
+        }
+    };
+
+    let mut metadata = BTreeMap::new();
+    metadata.insert("instructions".to_owned(), Value::String(IDE_MCP_INSTRUCTIONS.to_owned()));
+    metadata.insert("ideName".to_owned(), Value::String(candidate.name));
+    metadata.insert("autoConnected".to_owned(), Value::Bool(true));
+
+    Some(McpServerConfig {
+        name: "ide".to_owned(),
+        transport: Some(transport),
+        headers,
+        metadata,
+        ..McpServerConfig::default()
+    })
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -974,12 +1227,127 @@ async fn websocket_request(url: &str, config: &McpServerConfig, request: Value) 
     bail!("mcp websocket server closed before replying")
 }
 
+async fn stdio_notification(config: &McpServerConfig, request: Value) -> Result<()> {
+    let Some(McpTransportConfig::Stdio { command, args }) = config.transport.as_ref() else {
+        bail!("mcp stdio notification requires a stdio transport");
+    };
+
+    let mut child = Command::new(command)
+        .args(args)
+        .envs(merged_env(config))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn mcp server '{}'", config.name))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("mcp child stdin unavailable"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("mcp child stdout unavailable"))?;
+
+    write_content_length_message(&mut stdin, &initialize_request()).await?;
+    let initialize_response = read_content_length_message(&mut stdout).await?;
+    if initialize_response.get("error").is_some() {
+        bail!("mcp initialize failed: {}", initialize_response);
+    }
+    write_content_length_message(&mut stdin, &initialized_notification()).await?;
+    write_content_length_message(&mut stdin, &request).await?;
+    child.start_kill().ok();
+    Ok(())
+}
+
+async fn http_notification(url: &str, config: &McpServerConfig, request: Value) -> Result<()> {
+    let response = reqwest::Client::new()
+        .post(url)
+        .headers(env_headers(config)?)
+        .json(&request)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("mcp http notification failed with status {}: {}", status, body);
+    }
+    if !body.trim().is_empty() {
+        let value = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({}));
+        if let Some(error) = value.get("error") {
+            bail!("mcp http notification failed: {}", error);
+        }
+    }
+    Ok(())
+}
+
+async fn websocket_notification(url: &str, config: &McpServerConfig, request: Value) -> Result<()> {
+    let mut request_ws = url.into_client_request()?;
+    for (key, value) in &config.headers {
+        request_ws.headers_mut().insert(
+            HeaderName::from_bytes(key.as_bytes())?,
+            HeaderValue::from_str(value)?,
+        );
+    }
+    if let Some(header) = authorization_header_value(config)? {
+        request_ws.headers_mut().insert(AUTHORIZATION, header);
+    }
+    let (mut socket, _) = connect_async(request_ws).await?;
+    socket
+        .send(WsMessage::Text(initialize_request().to_string().into()))
+        .await?;
+    while let Some(message) = socket.next().await {
+        let message = message?;
+        if message.is_text() {
+            let value = serde_json::from_str::<Value>(message.to_text()?)?;
+            if value.get("id") == Some(&json!(1)) {
+                break;
+            }
+        }
+    }
+
+    socket
+        .send(WsMessage::Text(
+            initialized_notification().to_string().into(),
+        ))
+        .await?;
+    socket
+        .send(WsMessage::Text(request.to_string().into()))
+        .await?;
+    Ok(())
+}
+
 async fn send_request(config: &McpServerConfig, request: Value) -> Result<Value> {
     match config.transport.as_ref() {
         Some(McpTransportConfig::Stdio { .. }) => stdio_request(config, request).await,
         Some(McpTransportConfig::Http { url }) => http_request(url, config, request).await,
         Some(McpTransportConfig::WebSocket { url }) => {
             websocket_request(url, config, request).await
+        }
+        None => bail!(
+            "mcp server '{}' has no transport configuration",
+            config.name
+        ),
+    }
+}
+
+pub async fn send_notification_from_config(
+    config: &McpServerConfig,
+    method: &str,
+    params: Value,
+) -> Result<()> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    });
+
+    match config.transport.as_ref() {
+        Some(McpTransportConfig::Stdio { .. }) => stdio_notification(config, request).await,
+        Some(McpTransportConfig::Http { url }) => http_notification(url, config, request).await,
+        Some(McpTransportConfig::WebSocket { url }) => {
+            websocket_notification(url, config, request).await
         }
         None => bail!(
             "mcp server '{}' has no transport configuration",

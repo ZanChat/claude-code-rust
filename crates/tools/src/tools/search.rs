@@ -267,7 +267,7 @@ impl Tool for McpTool {
     }
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let config = load_mcp_server_config(&context.cwd, &input).await?;
+        let config = load_mcp_server_config(context, &input).await?;
         let tool_name = input_string(&input, "tool")?;
         let arguments = input.get("arguments").cloned().unwrap_or_else(|| json!({}));
         let result = call_tool_from_config(&config, &tool_name, arguments).await?;
@@ -303,7 +303,7 @@ impl Tool for ListMcpResourcesTool {
     }
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let config = load_mcp_server_config(&context.cwd, &input).await?;
+        let config = load_mcp_server_config(context, &input).await?;
         let resources = list_resources_from_config(&config).await?;
         let content = resources
             .iter()
@@ -355,7 +355,7 @@ impl Tool for ReadMcpResourceTool {
     }
 
     async fn invoke(&self, input: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let config = load_mcp_server_config(&context.cwd, &input).await?;
+        let config = load_mcp_server_config(context, &input).await?;
         let uri = input_string(&input, "uri")?;
         let result = read_resource_from_config(&config, &uri).await?;
         Ok(ToolOutput {

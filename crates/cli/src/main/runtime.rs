@@ -555,6 +555,28 @@ fn parse_input(input: Option<&str>) -> Result<Value> {
     }
 }
 
+async fn maybe_notify_auto_connected_ide(
+    cwd: &Path,
+    explicit_flag: bool,
+    home_override: Option<&Path>,
+    term_program_override: Option<&str>,
+    env_port_override: Option<u16>,
+) -> Result<bool> {
+    let Some(config) = auto_connected_ide_server_config(
+        cwd,
+        term_program_override,
+        home_override,
+        env_port_override,
+        explicit_flag,
+    ) else {
+        return Ok(false);
+    };
+
+    send_notification_from_config(&config, "ide_connected", json!({ "pid": std::process::id() }))
+        .await?;
+    Ok(true)
+}
+
 fn resolve_plugin_root_with_override(
     plugin_root: Option<&PathBuf>,
     candidate: Option<&str>,
@@ -1808,6 +1830,16 @@ async fn run_main() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&record)?);
         return Ok(());
     }
+
+    let term_program = env::var("TERM_PROGRAM").ok();
+    let _ = maybe_notify_auto_connected_ide(
+        &cwd,
+        cli.compat_flag_enabled("ide"),
+        None,
+        term_program.as_deref(),
+        ide_env_port(),
+    )
+    .await;
 
     if contract.global.print_mode.enabled {
         run_root_print_mode(

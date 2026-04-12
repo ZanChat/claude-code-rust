@@ -356,7 +356,7 @@ fn repl_ide_picker_state_with_home(
     connected_ide: Option<&DetectedIdeCandidate>,
     home_override: Option<&Path>,
 ) -> ReplIdePickerState {
-    let candidates = detect_workspace_ides(cwd, home_override);
+    let candidates = detect_workspace_ides(cwd, home_override, ide_env_port());
     let selected = connected_ide
         .and_then(|connected| {
             candidates

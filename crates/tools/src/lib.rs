@@ -5,6 +5,7 @@ use ccrust_core::{
     SessionId, TaskRecord, TaskStatus, TaskStore, WorkflowTaskRequest,
 };
 use ccrust_mcp::{
+    auto_connected_ide_server_config,
     call_tool_from_config, clear_cached_auth_token, clear_pending_device_flow,
     list_resources_from_config, load_cached_auth_token, load_pending_device_flow,
     parse_mcp_server_configs, poll_oauth_device_flow, read_resource_from_config,
@@ -18,6 +19,7 @@ use schemars::JsonSchema;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

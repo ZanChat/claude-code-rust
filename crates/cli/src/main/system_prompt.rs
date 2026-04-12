@@ -354,7 +354,7 @@ fn runtime_environment_section(cwd: &Path, provider: ApiProvider, model: &str) -
         .or_else(|| env::var_os("COMSPEC"))
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".to_owned());
-    format!(
+    let mut sections = vec![format!(
         "# Environment\n- Working directory: {}\n- Provider mode: {}\n- Model: {}\n- Platform: {}\n- Shell: {}\n- Git repository detected: {}",
         cwd.display(),
         provider,
@@ -362,7 +362,28 @@ fn runtime_environment_section(cwd: &Path, provider: ApiProvider, model: &str) -
         env::consts::OS,
         shell,
         git_state
-    )
+    )];
+
+    let term_program = env::var("TERM_PROGRAM").ok();
+    if let Some(ide_config) = auto_connected_ide_server_config(
+        cwd,
+        term_program.as_deref(),
+        None,
+        ide_env_port(),
+        false,
+    ) {
+        let ide_name = ide_config
+            .metadata
+            .get("ideName")
+            .and_then(Value::as_str)
+            .unwrap_or("IDE");
+        sections.push(format!(
+            "# IDE Integration\n- {} is auto-connected as MCP server 'ide'.\n- Use mcp with server 'ide' to call IDE tools.\n- Use list_mcp_resources or read_mcp_resource with server 'ide' to inspect IDE-hosted resources.",
+            ide_name
+        ));
+    }
+
+    sections.join("\n\n")
 }
 
 fn cached_static_prompt_text(enabled_tools: &BTreeSet<String>) -> String {

@@ -2,13 +2,18 @@ use super::{
     compatibility_tool_registry, compatibility_tool_specs, glob_matches, ToolCallRequest,
     ToolContext, ToolKind, ToolPermissionMode,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
+use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 fn make_temp_dir(label: &str) -> std::path::PathBuf {
     let stamp = SystemTime::now()
@@ -23,6 +28,42 @@ fn make_temp_dir(label: &str) -> std::path::PathBuf {
 fn env_lock() -> &'static Mutex<()> {
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     ENV_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+struct ScopedEnvVars {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Vec<(String, Option<String>)>,
+}
+
+impl Drop for ScopedEnvVars {
+    fn drop(&mut self) {
+        for (key, previous) in self.previous.iter().rev() {
+            match previous {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
+    }
+}
+
+fn scoped_env_vars(vars: &[(&str, Option<&str>)]) -> ScopedEnvVars {
+    let lock = env_lock().lock().unwrap();
+    let previous = vars
+        .iter()
+        .map(|(key, _)| ((*key).to_owned(), env::var(key).ok()))
+        .collect::<Vec<_>>();
+
+    for (key, value) in vars {
+        match value {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
+    }
+
+    ScopedEnvVars {
+        _lock: lock,
+        previous,
+    }
 }
 
 fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
@@ -840,4 +881,128 @@ async fn invokes_live_mcp_tools_from_plugin_manifest() {
 
     assert_eq!(tool_result.content, "mcp tool result");
     assert_eq!(resource_result.content, "note body");
+}
+
+#[tokio::test]
+async fn mcp_tool_uses_auto_connected_ide_server_in_vscode_terminal() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let observed_auth = Arc::new(Mutex::new(None::<String>));
+    let observed_auth_server = observed_auth.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_hdr_async(stream, move |request: &Request, mut response: Response| {
+            response.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_static("mcp"),
+            );
+            *observed_auth_server.lock().unwrap() = request
+                .headers()
+                .get("x-claude-code-ide-authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            Ok(response)
+        })
+        .await
+        .unwrap();
+
+        while let Some(message) = socket.next().await {
+            let message = message.unwrap();
+            if !message.is_text() {
+                continue;
+            }
+            let value = serde_json::from_str::<Value>(message.to_text().unwrap()).unwrap();
+            match value["method"].as_str().unwrap() {
+                "initialize" => {
+                    socket
+                        .send(WsMessage::Text(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {
+                                    "protocolVersion": "2024-11-05",
+                                    "capabilities": {}
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                "notifications/initialized" => {}
+                "tools/call" => {
+                    socket
+                        .send(WsMessage::Text(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 2,
+                                "result": {
+                                    "content": [{ "type": "text", "text": "ide mcp result" }],
+                                    "isError": false
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    break;
+                }
+                other => panic!("unexpected websocket method: {other}"),
+            }
+        }
+    });
+
+    let home = make_temp_dir("ide-auto-connect-home");
+    let workspace = home.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(home.join(".claude/ide")).unwrap();
+    fs::write(
+        home.join(format!(".claude/ide/{}.lock", address.port())),
+        serde_json::to_string(&json!({
+            "workspaceFolders": [workspace.display().to_string()],
+            "ideName": "Visual Studio Code",
+            "transport": "ws",
+            "authToken": "ide-secret-token"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let home_path = home.display().to_string();
+    let _env = scoped_env_vars(&[
+        ("HOME", Some(home_path.as_str())),
+        ("TERM_PROGRAM", Some("vscode")),
+    ]);
+
+    let registry = compatibility_tool_registry();
+    let context = ToolContext {
+        cwd: workspace,
+        ..ToolContext::default()
+    };
+
+    let result = registry
+        .invoke(
+            ToolCallRequest {
+                tool_name: "mcp".to_owned(),
+                input: json!({
+                    "server": "ide",
+                    "tool": "getDiagnostics",
+                    "arguments": {}
+                }),
+            },
+            &context,
+        )
+        .await
+        .unwrap();
+
+    server.await.unwrap();
+
+    assert_eq!(result.content, "ide mcp result");
+    assert_eq!(
+        observed_auth.lock().unwrap().as_deref(),
+        Some("ide-secret-token")
+    );
 }

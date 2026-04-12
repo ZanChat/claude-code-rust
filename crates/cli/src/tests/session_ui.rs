@@ -838,7 +838,7 @@ fn ide_picker_lists_matching_workspace_bridges() {
     assert_eq!(choice_list.items[0].label, "VS Code");
     assert_eq!(
         choice_list.items[0].detail.as_deref(),
-        Some("ide://127.0.0.1:48123")
+        Some("ws://127.0.0.1:48123")
     );
 }
 

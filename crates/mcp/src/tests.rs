@@ -1,4 +1,5 @@
 use super::{
+    auto_connected_ide_server_config, detect_workspace_ides,
     call_tool_from_config, list_resources_from_config, list_tools_from_config,
     load_cached_auth_token, load_manifest_from_config, load_pending_device_flow,
     parse_mcp_server_configs, poll_oauth_device_flow, read_content_length_message,
@@ -10,12 +11,24 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+fn make_temp_dir(label: &str) -> std::path::PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ccrust-mcp-{label}-{stamp}"));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
 
 #[test]
 fn stores_server_configs_and_manifests() {
@@ -85,6 +98,57 @@ fn parses_plugin_style_server_configs() {
     assert_eq!(
         config.env.get("NODE_ENV").map(String::as_str),
         Some("production")
+    );
+}
+
+#[test]
+fn auto_connected_ide_server_config_uses_lockfile_url_and_ws_headers() {
+    let home = make_temp_dir("ide-lockfile-home");
+    let workspace = home.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(home.join(".claude/ide")).unwrap();
+    fs::write(
+        home.join(".claude/ide/48123.lock"),
+        serde_json::to_string(&json!({
+            "workspaceFolders": [workspace.display().to_string()],
+            "ideName": "Visual Studio Code",
+            "transport": "ws",
+            "authToken": "ide-secret-token"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let detected = detect_workspace_ides(&workspace, Some(&home), None);
+    assert_eq!(detected.len(), 1);
+    assert_eq!(detected[0].url, "ws://127.0.0.1:48123");
+    assert_eq!(detected[0].suggested_bridge, "ws://127.0.0.1:48123");
+    assert_eq!(detected[0].auth_token.as_deref(), Some("ide-secret-token"));
+
+    let config = auto_connected_ide_server_config(
+        &workspace,
+        Some("vscode"),
+        Some(&home),
+        None,
+        false,
+    )
+    .expect("expected IDE MCP config");
+
+    assert_eq!(config.name, "ide");
+    assert!(matches!(config.transport, Some(McpTransportConfig::WebSocket { .. })));
+    assert_eq!(
+        config
+            .headers
+            .get("X-Claude-Code-Ide-Authorization")
+            .map(String::as_str),
+        Some("ide-secret-token")
+    );
+    assert_eq!(
+        config
+            .headers
+            .get("Sec-WebSocket-Protocol")
+            .map(String::as_str),
+        Some("mcp")
     );
 }
 
