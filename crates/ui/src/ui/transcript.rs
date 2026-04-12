@@ -626,7 +626,7 @@ fn append_wrapped_transcript_line(
         .token_label
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("{label} · {value}"))
+        .map(|value| format!("{label} · {value} ⧉"))
         .unwrap_or_else(|| label.to_owned());
     let label_style = role_style(&transcript_line.role);
 

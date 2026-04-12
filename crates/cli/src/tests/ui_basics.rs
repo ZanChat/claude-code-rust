@@ -674,8 +674,8 @@ fn selection_copy_shortcut_matches_explicit_copy_bindings() {
 }
 
 #[test]
-fn mouse_capture_stays_enabled_in_vscode_terminals() {
-    assert!(should_enable_mouse_capture(Some("vscode")));
+fn mouse_capture_is_disabled_in_vscode_terminals() {
+    assert!(!should_enable_mouse_capture(Some("vscode")));
     assert!(should_enable_mouse_capture(Some("Apple_Terminal")));
     assert!(should_enable_mouse_capture(None));
 }

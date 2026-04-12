@@ -479,7 +479,7 @@ fn assistant_rows_render_exact_usage_token_labels() {
     let rendered = render_to_string(&state, 100, 24).unwrap();
 
     assert!(rendered.contains("gpt-5.4(chatgpt-codex)"));
-    assert!(rendered.contains("20 tok (in 10, out 3, cache 7)"));
+    assert!(rendered.contains("20 tok (in 10, out 3, cache 7) ⧉"));
 }
 
 #[test]
