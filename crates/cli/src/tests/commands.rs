@@ -1218,6 +1218,46 @@ fn repl_skill_command_executes_expanded_prompt() {
 }
 
 #[tokio::test]
+async fn repl_skill_command_reports_empty_prompt_file() {
+    let root = temp_session_root("repl-skill-command-empty-prompt");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));
+    let tool_registry = compatibility_tool_registry();
+    write_test_file(&root.join(".claude/skills/seogeo/SKILL.md"), "");
+    let registry = resolved_command_registry(&root, None).await;
+    let session_id = SessionId::new_v4();
+    let mut active_model = DEFAULT_OPENAI_REASONING_MODEL.to_owned();
+    let mut raw_messages = Vec::new();
+    let mut vim_state = ccrust_ui::vim::VimState::default();
+    let mut repl_session = repl_session_state(session_id);
+
+    let status = handle_repl_slash_command(
+        &registry,
+        CommandInvocation {
+            name: "seogeo".to_owned(),
+            raw_input: "/seogeo".to_owned(),
+            ..CommandInvocation::default()
+        },
+        &store,
+        &tool_registry,
+        &root,
+        None,
+        ApiProvider::OpenAICompatible,
+        &mut active_model,
+        &mut repl_session,
+        &mut raw_messages,
+        false,
+        &mut vim_state,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert!(status.contains("registered but its prompt is empty or unreadable"));
+    assert!(status.contains(".claude/skills/seogeo/SKILL.md"));
+}
+
+#[tokio::test]
 async fn repl_mcp_command_lists_parsed_servers_and_auth() {
     let root = temp_session_root("repl-mcp");
     let store = ActiveSessionStore::Local(LocalSessionStore::new(root.clone()));

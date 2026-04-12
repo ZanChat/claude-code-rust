@@ -88,6 +88,20 @@ async fn handle_repl_slash_command_with_options(
         return Ok(detail);
     }
 
+    if let Some(spec) = registry.resolve(&invocation.name) {
+        if spec.kind == ccrust_core::CommandKind::Prompt {
+            let location = spec
+                .origin
+                .as_deref()
+                .map(|origin| format!(" ({origin})"))
+                .unwrap_or_default();
+            return Ok(format!(
+                "command '/{}' is registered but its prompt is empty or unreadable{}",
+                invocation.name, location
+            ));
+        }
+    }
+
     match invocation.name.as_str() {
         "help" => Ok(render_command_help(registry, remote_mode)),
         "version" => Ok(env!("CARGO_PKG_VERSION").to_owned()),
