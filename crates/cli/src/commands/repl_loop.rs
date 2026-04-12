@@ -34,7 +34,11 @@ fn drain_mouse_scroll_burst(
     Ok(burst)
 }
 
-pub(crate) fn repl_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+pub(crate) fn repl_keyboard_enhancement_flags(term_program: Option<&str>) -> KeyboardEnhancementFlags {
+    if term_program == Some("vscode") {
+        return KeyboardEnhancementFlags::empty();
+    }
+
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
@@ -77,7 +81,9 @@ pub(crate) async fn run_interactive_repl(
         EnterAlternateScreen,
         Hide,
         crossterm::event::EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(repl_keyboard_enhancement_flags())
+        PushKeyboardEnhancementFlags(repl_keyboard_enhancement_flags(
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+        ))
     )?;
     if mouse_capture_enabled {
         execute!(out, EnableMouseCapture)?;

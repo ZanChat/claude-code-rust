@@ -20,3 +20,4 @@ Cargo.lock
 *.swn
 *.pdf
 GEO-*.md
+test_hyperlink.rs

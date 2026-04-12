@@ -772,12 +772,15 @@ fn repl_shortcut_routing_is_modifier_specific() {
 
 #[test]
 fn repl_keyboard_enhancement_flags_cover_vscode_shortcuts() {
-    let flags = repl_keyboard_enhancement_flags();
+    let flags = repl_keyboard_enhancement_flags(None);
 
     assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
     assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
     assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+
+    let vscode_flags = repl_keyboard_enhancement_flags(Some("vscode"));
+    assert!(vscode_flags.is_empty());
 }
 
 #[test]
