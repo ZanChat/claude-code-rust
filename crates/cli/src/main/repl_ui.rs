@@ -168,6 +168,7 @@ fn build_repl_ui_state(
         .map(ReplPromptHistorySearchState::ui_state);
     state.prompt_selection = interaction_state.prompt_selection.clone();
     state.transcript_selection = interaction_state.transcript_selection.clone();
+    state.copied_message_item = interaction_state.copied_message_item;
     state.choice_list = choice_list;
     state.compact_banner = compact_banner;
     let command_suggestions = if interaction_state.prompt_history_search.is_some() {

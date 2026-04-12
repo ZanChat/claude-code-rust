@@ -508,6 +508,37 @@ async fn execute_local_turn_with_options(
 ) -> Result<(Option<CompactionOutcome>, usize, Option<String>, u64, u64)> {
     let parent_id = raw_messages.last().map(|message| message.id);
     let user_message = build_text_message(session_id, MessageRole::User, prompt_text, parent_id);
+    execute_local_turn_with_user_message_options(
+        store,
+        tool_registry,
+        cwd,
+        plugin_root,
+        provider,
+        active_model,
+        session_id,
+        raw_messages,
+        user_message,
+        live_runtime,
+        runtime_options,
+        pending_view,
+    )
+    .await
+}
+
+async fn execute_local_turn_with_user_message_options(
+    store: &ActiveSessionStore,
+    tool_registry: &ToolRegistry,
+    cwd: PathBuf,
+    plugin_root: Option<&PathBuf>,
+    provider: ApiProvider,
+    active_model: String,
+    session_id: SessionId,
+    raw_messages: &mut Vec<Message>,
+    user_message: Message,
+    live_runtime: bool,
+    runtime_options: &RuntimeCliOptions,
+    pending_view: Option<Arc<Mutex<PendingReplView>>>,
+) -> Result<(Option<CompactionOutcome>, usize, Option<String>, u64, u64)> {
     store.append_message(session_id, &user_message).await?;
     raw_messages.push(user_message);
     update_pending_repl_view(pending_view.as_ref(), raw_messages, "Waiting for response");
@@ -1922,15 +1953,23 @@ async fn run_main() -> Result<()> {
     }
 
     if let Some(mut prompt_text) = prompt.clone() {
+        let mut prompt_command_user_message = None;
         if let Some(invocation) = registry.parse_slash_command(&prompt_text) {
-            if let Some(expanded_prompt) = resolve_prompt_command_prompt(
+            if let Some(prompt_command_execution) = resolve_prompt_command_execution(
                 &registry,
                 &invocation,
                 &cwd,
                 cli.plugin_root.as_ref(),
                 session_id,
             )? {
-                prompt_text = expanded_prompt;
+                prompt_text = prompt_command_execution.expanded_prompt.clone();
+                prompt_command_user_message = Some(build_prompt_command_user_message(
+                    session_id,
+                    existing_messages.last().map(|message| message.id),
+                    prompt_command_execution.raw_input,
+                    prompt_command_execution.transcript_text,
+                    prompt_command_execution.expanded_prompt,
+                ));
             } else {
             handle_slash_command(
                 &registry,
@@ -1957,14 +1996,16 @@ async fn run_main() -> Result<()> {
             None => store.transcript_path(session_id).await?,
         };
         let parent_id = existing_messages.last().map(|message| message.id);
-        let user_message = build_text_message(
-            session_id,
-            MessageRole::User,
-            prompt_text.clone(),
-            parent_id,
-        );
+        let user_message = prompt_command_user_message.unwrap_or_else(|| {
+            build_text_message(
+                session_id,
+                MessageRole::User,
+                prompt_text.clone(),
+                parent_id,
+            )
+        });
         store.append_message(session_id, &user_message).await?;
-        existing_messages.push(user_message.clone());
+        existing_messages.push(user_message);
         let _applied_compaction =
             maybe_auto_compact(&store, session_id, &mut existing_messages).await?;
         let mut runtime_messages = materialize_runtime_messages(&existing_messages);

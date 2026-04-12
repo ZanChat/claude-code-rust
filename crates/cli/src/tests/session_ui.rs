@@ -851,9 +851,12 @@ async fn skills_picker_lists_discovered_skills() {
     let choice_list = build_command_choice_list(&picker);
 
     assert_eq!(choice_list.title, "Skills");
-    assert_eq!(choice_list.items.len(), 1);
-    assert_eq!(choice_list.items[0].label, "/review");
-    match &picker.items[0].action {
+    let review_index = choice_list
+        .items
+        .iter()
+        .position(|item| item.label == "/review")
+        .expect("expected /review skill in picker");
+    match &picker.items[review_index].action {
         ReplCommandPickerAction::PrefillInput { input, .. } => {
             assert_eq!(input, "/review ");
         }

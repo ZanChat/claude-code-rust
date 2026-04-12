@@ -785,6 +785,50 @@ fn group_header_toggle_action(
         .then(|| UiMouseAction::ToggleTranscriptGroup(id.clone()))
 }
 
+fn transcript_header_copy_action(
+    render_line: &TranscriptRenderLine,
+    transcript_area: Rect,
+    column: u16,
+) -> Option<UiMouseAction> {
+    let TranscriptRenderLineKind::MessageHeader(item_index) = render_line.kind else {
+        return None;
+    };
+
+    let clickable_text = render_line.plain_text.trim_end_matches(char::is_whitespace);
+    let copy_label = if clickable_text.ends_with("Copied") {
+        "Copied"
+    } else if clickable_text.ends_with('⧉') {
+        "⧉"
+    } else {
+        return None;
+    };
+
+    let local_column = column.saturating_sub(transcript_area.x) as usize;
+    let clickable_width = clickable_text.chars().count();
+    let clickable_start = clickable_width.saturating_sub(copy_label.chars().count());
+    (local_column >= clickable_start && local_column < clickable_width)
+        .then_some(UiMouseAction::CopyTranscriptItem(item_index))
+}
+
+fn transcript_selection_action(
+    render_line: &TranscriptRenderLine,
+    transcript_area: Rect,
+    column: u16,
+) -> Option<UiMouseAction> {
+    if !matches!(render_line.kind, TranscriptRenderLineKind::Regular)
+        || render_line.item_index.is_none()
+        || render_line.plain_text.is_empty()
+    {
+        return None;
+    }
+
+    Some(UiMouseAction::SetTranscriptSelection(TranscriptSelectionPoint {
+        line_index: render_line.visual_index,
+        column: (column.saturating_sub(transcript_area.x) as usize)
+            .min(render_line.plain_text.chars().count()),
+    }))
+}
+
 fn prompt_cursor_action_for_position(
     state: &UiState,
     prompt_area: Rect,
@@ -974,8 +1018,8 @@ pub fn mouse_action_for_position(
     }
 
     let line_index = row.saturating_sub(body_layout.transcript_area.y) as usize;
-    body_layout
-        .visible_lines
-        .get(line_index)
-        .and_then(|line| group_header_toggle_action(line, body_layout.transcript_area, column))
+    let render_line = body_layout.visible_lines.get(line_index)?;
+    group_header_toggle_action(render_line, body_layout.transcript_area, column)
+        .or_else(|| transcript_header_copy_action(render_line, body_layout.transcript_area, column))
+        .or_else(|| transcript_selection_action(render_line, body_layout.transcript_area, column))
 }

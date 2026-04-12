@@ -1,11 +1,11 @@
 use super::{
-    auto_connected_ide_server_config, detect_workspace_ides,
-    call_tool_from_config, list_resources_from_config, list_tools_from_config,
-    load_cached_auth_token, load_manifest_from_config, load_pending_device_flow,
-    parse_mcp_server_configs, poll_oauth_device_flow, read_content_length_message,
-    read_resource_from_config, refresh_oauth_device_token, start_oauth_device_flow,
-    write_content_length_message, McpAuthConfig, McpRegistry, McpServerConfig, McpServerManifest,
-    McpServerState, McpTransportConfig,
+    auto_connected_ide_server_config, call_tool_from_config, detect_workspace_ides,
+    list_resources_from_config, list_tools_from_config, load_cached_auth_token,
+    load_manifest_from_config, load_pending_device_flow, parse_mcp_server_configs,
+    poll_oauth_device_flow, read_content_length_message, read_resource_from_config,
+    refresh_oauth_device_token, start_oauth_device_flow, write_content_length_message,
+    McpAuthConfig, McpRegistry, McpServerConfig, McpServerManifest, McpServerState,
+    McpTransportConfig,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -125,17 +125,15 @@ fn auto_connected_ide_server_config_uses_lockfile_url_and_ws_headers() {
     assert_eq!(detected[0].suggested_bridge, "ws://127.0.0.1:48123");
     assert_eq!(detected[0].auth_token.as_deref(), Some("ide-secret-token"));
 
-    let config = auto_connected_ide_server_config(
-        &workspace,
-        Some("vscode"),
-        Some(&home),
-        None,
-        false,
-    )
-    .expect("expected IDE MCP config");
+    let config =
+        auto_connected_ide_server_config(&workspace, Some("vscode"), Some(&home), None, false)
+            .expect("expected IDE MCP config");
 
     assert_eq!(config.name, "ide");
-    assert!(matches!(config.transport, Some(McpTransportConfig::WebSocket { .. })));
+    assert!(matches!(
+        config.transport,
+        Some(McpTransportConfig::WebSocket { .. })
+    ));
     assert_eq!(
         config
             .headers
@@ -150,6 +148,47 @@ fn auto_connected_ide_server_config_uses_lockfile_url_and_ws_headers() {
             .map(String::as_str),
         Some("mcp")
     );
+}
+
+#[test]
+fn auto_connected_ide_server_config_uses_http_lockfile_url_and_auth_headers() {
+    let home = make_temp_dir("ide-sse-lockfile-home");
+    let workspace = home.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(home.join(".claude/ide")).unwrap();
+    fs::write(
+        home.join(".claude/ide/48124.lock"),
+        serde_json::to_string(&json!({
+            "workspaceFolders": [workspace.display().to_string()],
+            "ideName": "Visual Studio Code",
+            "transport": "sse",
+            "authToken": "ide-secret-token"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let detected = detect_workspace_ides(&workspace, Some(&home), None);
+    assert_eq!(detected.len(), 1);
+    assert_eq!(detected[0].url, "http://127.0.0.1:48124/sse");
+    assert_eq!(detected[0].suggested_bridge, "http://127.0.0.1:48124/sse");
+
+    let config =
+        auto_connected_ide_server_config(&workspace, Some("vscode"), Some(&home), None, false)
+            .expect("expected IDE MCP config");
+
+    assert!(matches!(
+        config.transport,
+        Some(McpTransportConfig::Http { .. })
+    ));
+    assert_eq!(
+        config
+            .headers
+            .get("X-Claude-Code-Ide-Authorization")
+            .map(String::as_str),
+        Some("ide-secret-token")
+    );
+    assert!(!config.headers.contains_key("Sec-WebSocket-Protocol"));
 }
 
 #[tokio::test]

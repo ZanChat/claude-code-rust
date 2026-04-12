@@ -9,6 +9,14 @@ struct ResolvedPromptCommand {
     base_dir: Option<PathBuf>,
     plugin_root: PathBuf,
     argument_names: Vec<String>,
+    is_skill: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptCommandExecution {
+    expanded_prompt: String,
+    transcript_text: String,
+    raw_input: String,
 }
 
 const BUILTIN_REVIEW_PROMPT: &str = r#"
@@ -344,6 +352,10 @@ fn load_prompt_command_from_path(path: &Path, plugin_root: &Path) -> Option<Reso
         base_dir,
         plugin_root: plugin_root.to_path_buf(),
         argument_names: frontmatter.argument_names,
+        is_skill: path
+            .file_name()
+            .and_then(|value| value.to_str())
+            == Some(SKILL_FILE_NAME),
     })
 }
 
@@ -361,6 +373,7 @@ fn resolve_inline_manifest_prompt_command(root: &Path, command_name: &str) -> Op
         base_dir: None,
         plugin_root: root.to_path_buf(),
         argument_names: frontmatter.argument_names,
+        is_skill: false,
     })
 }
 
@@ -375,6 +388,7 @@ fn resolve_prompt_command_definition(
             base_dir: None,
             plugin_root: PathBuf::new(),
             argument_names: Vec::new(),
+            is_skill: false,
         });
     }
 
@@ -414,6 +428,49 @@ fn expand_prompt_command(
     substitute_prompt_arguments(&content, args, &command.argument_names)
 }
 
+fn prompt_command_transcript_text(invocation: &CommandInvocation, is_skill: bool) -> String {
+    let args = invocation_argument_string(invocation)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("<command-args>{value}</command-args>"))
+        .unwrap_or_default();
+    let skill_tag = if is_skill {
+        "<skill-format>true</skill-format>"
+    } else {
+        ""
+    };
+
+    format!(
+        "<command-name>{}</command-name>{args}{skill_tag}",
+        invocation.name,
+    )
+}
+
+fn resolve_prompt_command_execution(
+    registry: &CommandRegistry,
+    invocation: &CommandInvocation,
+    cwd: &Path,
+    plugin_root: Option<&PathBuf>,
+    session_id: SessionId,
+) -> Result<Option<PromptCommandExecution>> {
+    let Some(spec) = registry.resolve(&invocation.name) else {
+        return Ok(None);
+    };
+    let Some(command) = resolve_prompt_command_definition(spec, cwd, plugin_root) else {
+        return Ok(None);
+    };
+    let expanded_prompt = expand_prompt_command(
+        command.clone(),
+        invocation_argument_string(invocation).as_deref(),
+        session_id,
+    );
+
+    Ok(Some(PromptCommandExecution {
+        expanded_prompt,
+        transcript_text: prompt_command_transcript_text(invocation, command.is_skill),
+        raw_input: invocation.raw_input.clone(),
+    }))
+}
+
 fn resolve_prompt_command_prompt(
     registry: &CommandRegistry,
     invocation: &CommandInvocation,
@@ -421,16 +478,12 @@ fn resolve_prompt_command_prompt(
     plugin_root: Option<&PathBuf>,
     session_id: SessionId,
 ) -> Result<Option<String>> {
-    let Some(spec) = registry.resolve(&invocation.name) else {
-        return Ok(None);
-    };
-    let Some(command) = resolve_prompt_command_definition(spec, cwd, plugin_root) else {
-        return Ok(None);
-    };
-
-    Ok(Some(expand_prompt_command(
-        command,
-        invocation_argument_string(invocation).as_deref(),
+    Ok(resolve_prompt_command_execution(
+        registry,
+        invocation,
+        cwd,
+        plugin_root,
         session_id,
-    )))
+    )?
+    .map(|execution| execution.expanded_prompt))
 }

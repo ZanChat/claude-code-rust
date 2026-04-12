@@ -892,20 +892,21 @@ async fn mcp_tool_uses_auto_connected_ide_server_in_vscode_terminal() {
 
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut socket = accept_hdr_async(stream, move |request: &Request, mut response: Response| {
-            response.headers_mut().insert(
-                "Sec-WebSocket-Protocol",
-                tokio_tungstenite::tungstenite::http::HeaderValue::from_static("mcp"),
-            );
-            *observed_auth_server.lock().unwrap() = request
-                .headers()
-                .get("x-claude-code-ide-authorization")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            Ok(response)
-        })
-        .await
-        .unwrap();
+        let mut socket =
+            accept_hdr_async(stream, move |request: &Request, mut response: Response| {
+                response.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    tokio_tungstenite::tungstenite::http::HeaderValue::from_static("mcp"),
+                );
+                *observed_auth_server.lock().unwrap() = request
+                    .headers()
+                    .get("x-claude-code-ide-authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                Ok(response)
+            })
+            .await
+            .unwrap();
 
         while let Some(message) = socket.next().await {
             let message = message.unwrap();

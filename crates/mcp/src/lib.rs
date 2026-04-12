@@ -387,14 +387,14 @@ pub fn auto_connected_ide_server_config(
 
     let candidate = candidates.pop()?;
     let mut headers = BTreeMap::new();
+    if let Some(token) = candidate.auth_token.as_deref() {
+        headers.insert(
+            "X-Claude-Code-Ide-Authorization".to_owned(),
+            token.to_owned(),
+        );
+    }
     let transport = if candidate.url.starts_with("ws://") || candidate.url.starts_with("wss://") {
         headers.insert("Sec-WebSocket-Protocol".to_owned(), "mcp".to_owned());
-        if let Some(token) = candidate.auth_token.as_deref() {
-            headers.insert(
-                "X-Claude-Code-Ide-Authorization".to_owned(),
-                token.to_owned(),
-            );
-        }
         McpTransportConfig::WebSocket {
             url: candidate.url.clone(),
         }
@@ -405,7 +405,10 @@ pub fn auto_connected_ide_server_config(
     };
 
     let mut metadata = BTreeMap::new();
-    metadata.insert("instructions".to_owned(), Value::String(IDE_MCP_INSTRUCTIONS.to_owned()));
+    metadata.insert(
+        "instructions".to_owned(),
+        Value::String(IDE_MCP_INSTRUCTIONS.to_owned()),
+    );
     metadata.insert("ideName".to_owned(), Value::String(candidate.name));
     metadata.insert("autoConnected".to_owned(), Value::Bool(true));
 
@@ -1271,7 +1274,11 @@ async fn http_notification(url: &str, config: &McpServerConfig, request: Value) 
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("mcp http notification failed with status {}: {}", status, body);
+        bail!(
+            "mcp http notification failed with status {}: {}",
+            status,
+            body
+        );
     }
     if !body.trim().is_empty() {
         let value = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({}));

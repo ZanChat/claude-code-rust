@@ -1,5 +1,6 @@
 async fn run_pending_repl_operation<F, T>(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    store: &ActiveSessionStore,
     registry: &ccrust_core::CommandRegistry,
     tool_registry: &ToolRegistry,
     pending_view: Arc<Mutex<PendingReplView>>,
@@ -29,9 +30,16 @@ where
     let mut tick = 0usize;
     let mut compact_banner = compact_banner;
     let mut side_question_task: Option<tokio::task::JoinHandle<Result<String>>> = None;
+    let global_prompt_history = global_prompt_history_from_store(store, session_id)
+        .await
+        .unwrap_or_default();
 
     loop {
         let pending_snapshot = pending_repl_snapshot(&pending_view);
+        let prompt_history = combined_prompt_history(
+            &prompt_history_from_messages(&pending_snapshot.messages),
+            &global_prompt_history,
+        );
         while event::poll(Duration::from_millis(0))? {
             match event::read()? {
                 Event::Resize(width, height) => {
@@ -105,6 +113,48 @@ where
                                         toggle_pending_repl_group(&pending_view, &group_id);
                                     }
                                 }
+                                UiMouseAction::CopyTranscriptItem(item_index)
+                                    if matches!(
+                                        mouse.kind,
+                                        MouseEventKind::Down(MouseButton::Left)
+                                    ) =>
+                                {
+                                    clear_prompt_mouse_anchor(interaction_state);
+                                    let message_action_items = message_action_items_from_runtime(
+                                        &pending_snapshot.messages,
+                                        Some(&pending_snapshot),
+                                        interaction_state,
+                                    );
+                                    if let Some(item) =
+                                        message_action_item_by_index(&message_action_items, item_index)
+                                    {
+                                        if let Some(text) = message_action_copy_text(&item.message) {
+                                            compact_banner = Some(
+                                                copy_text_with_fallback_notice(&text, "message")
+                                                    .unwrap_or_else(|error| {
+                                                        format!("Copy failed: {error}")
+                                                    }),
+                                            );
+                                            interaction_state.copied_message_item = Some(item_index);
+                                        }
+                                    }
+                                }
+                                UiMouseAction::SetTranscriptSelection(point) => {
+                                    clear_prompt_mouse_anchor(interaction_state);
+                                    match mouse.kind {
+                                        MouseEventKind::Down(MouseButton::Left) => {
+                                            start_transcript_selection(interaction_state, point);
+                                        }
+                                        MouseEventKind::Drag(MouseButton::Left) => {
+                                            update_transcript_selection(interaction_state, point);
+                                        }
+                                        MouseEventKind::Up(MouseButton::Left) => {
+                                            update_transcript_selection(interaction_state, point);
+                                            finish_transcript_selection(interaction_state);
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 UiMouseAction::SetPromptCursor(cursor) => {
                                     let _ = handle_prompt_mouse_action(
                                         &mouse.kind,
@@ -125,11 +175,7 @@ where
                     clear_prompt_mouse_anchor(interaction_state);
                     if let Some(search_state) = interaction_state.prompt_history_search.as_mut() {
                         let _ = insert_buffer_text(&mut search_state.input_buffer, &text);
-                        sync_prompt_history_search_preview(
-                            &prompt_history_from_messages(&pending_snapshot.messages),
-                            search_state,
-                            input_buffer,
-                        );
+                        sync_prompt_history_search_preview(&prompt_history, search_state, input_buffer);
                     } else if interaction_state.transcript_search.open {
                         let input = &mut interaction_state.transcript_search.input_buffer;
                         let _ = insert_buffer_text(input, &text);
@@ -186,7 +232,7 @@ where
                             if let Some(text) = read_text_from_clipboard() {
                                 let _ = insert_buffer_text(&mut search_state.input_buffer, &text);
                                 sync_prompt_history_search_preview(
-                                    &prompt_history_from_messages(&pending_snapshot.messages),
+                                    &prompt_history,
                                     search_state,
                                     input_buffer,
                                 );
@@ -402,7 +448,7 @@ where
                                     interaction_state.prompt_history_search.as_mut()
                                 {
                                     let _ = step_prompt_history_search_match(
-                                        &prompt_history_from_messages(&pending_snapshot.messages),
+                                        &prompt_history,
                                         search_state,
                                         input_buffer,
                                     );
@@ -553,18 +599,19 @@ where
                                 }
                             }
                             KeyCode::Char('c') if key.modifiers.is_empty() => {
-                                if let Some(text) = selected_message_action_item(
+                                if let Some(item) = selected_message_action_item(
                                     interaction_state,
                                     &message_action_items,
-                                )
-                                .and_then(|item| message_action_copy_text(&item.message))
-                                {
-                                    compact_banner = Some(
-                                        copy_text_with_fallback_notice(&text, "message")
-                                            .unwrap_or_else(|error| {
-                                                format!("Copy failed: {error}")
-                                            }),
-                                    );
+                                ) {
+                                    if let Some(text) = message_action_copy_text(&item.message) {
+                                        compact_banner = Some(
+                                            copy_text_with_fallback_notice(&text, "message")
+                                                .unwrap_or_else(|error| {
+                                                    format!("Copy failed: {error}")
+                                                }),
+                                        );
+                                        interaction_state.copied_message_item = Some(item.item_index);
+                                    }
                                 }
                                 interaction_state.message_actions = None;
                             }
@@ -744,7 +791,7 @@ where
                                         .expect("prompt history search state should exist");
                                     search_state.input_buffer.pop();
                                     sync_prompt_history_search_preview(
-                                        &prompt_history_from_messages(&pending_snapshot.messages),
+                                        &prompt_history,
                                         search_state,
                                         input_buffer,
                                     );
@@ -760,7 +807,7 @@ where
                                     .expect("prompt history search state should exist");
                                 search_state.input_buffer.push(ch);
                                 sync_prompt_history_search_preview(
-                                    &prompt_history_from_messages(&pending_snapshot.messages),
+                                    &prompt_history,
                                     search_state,
                                     input_buffer,
                                 );
@@ -1213,7 +1260,7 @@ where
                                 registry,
                                 input_buffer,
                                 selected_command_suggestion,
-                                &prompt_history_from_messages(&pending_snapshot.messages),
+                                &prompt_history,
                                 prompt_history_index,
                                 prompt_history_draft,
                             );
@@ -1224,7 +1271,7 @@ where
                                 registry,
                                 input_buffer,
                                 selected_command_suggestion,
-                                &prompt_history_from_messages(&pending_snapshot.messages),
+                                &prompt_history,
                                 prompt_history_index,
                                 prompt_history_draft,
                             );

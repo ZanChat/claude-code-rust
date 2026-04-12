@@ -72,6 +72,29 @@ fn build_repl_command_input_message(
     build_ui_event_message(session_id, parent_id, raw_input.into(), "command", None)
 }
 
+fn build_prompt_command_user_message(
+    session_id: SessionId,
+    parent_id: Option<Uuid>,
+    raw_input: String,
+    transcript_text: String,
+    expanded_prompt: String,
+) -> Message {
+    let mut message = build_text_message(session_id, MessageRole::User, transcript_text, parent_id);
+    message
+        .metadata
+        .tags
+        .push(ccrust_core::PROMPT_COMMAND_TAG.to_owned());
+    message.metadata.attributes.insert(
+        ccrust_core::PROMPT_COMMAND_RAW_INPUT_ATTRIBUTE.to_owned(),
+        raw_input,
+    );
+    message.metadata.attributes.insert(
+        ccrust_core::EXPANDED_PROMPT_ATTRIBUTE.to_owned(),
+        expanded_prompt,
+    );
+    message
+}
+
 fn build_repl_command_output_message(
     session_id: SessionId,
     parent_id: Option<Uuid>,

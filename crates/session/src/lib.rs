@@ -236,6 +236,23 @@ pub fn extract_json_string_field(text: &str, key: &str) -> Option<String> {
     None
 }
 
+fn estimated_message_text(message: &Message) -> String {
+    if message.role == MessageRole::User {
+        if let Some(expanded_prompt) = message
+            .metadata
+            .attributes
+            .get(ccrust_core::EXPANDED_PROMPT_ATTRIBUTE)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return expanded_prompt.to_owned();
+        }
+    }
+
+    message_text(message)
+}
+
 pub fn extract_last_json_string_field(text: &str, key: &str) -> Option<String> {
     let patterns = [format!("\"{key}\":\""), format!("\"{key}\": \"")];
     let mut last_value = None;
@@ -372,7 +389,7 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u64 {
                 MessageRole::Tool => 12,
                 MessageRole::Attachment => 0,
             };
-            let content_tokens = message_text(message).chars().count().div_ceil(4) as u64;
+            let content_tokens = estimated_message_text(message).chars().count().div_ceil(4) as u64;
             role_tokens + content_tokens + (message.blocks.len() as u64 * 6)
         })
         .sum()
@@ -617,6 +634,18 @@ pub fn extract_first_prompt_from_head(head: &str) -> String {
         let Some(message) = entry.get("message") else {
             continue;
         };
+
+        if let Some(raw_input) = message
+            .get("metadata")
+            .and_then(|metadata| metadata.get("attributes"))
+            .and_then(|attributes| attributes.get(ccrust_core::PROMPT_COMMAND_RAW_INPUT_ATTRIBUTE))
+            .and_then(serde_json::Value::as_str)
+        {
+            let normalized = raw_input.trim();
+            if !normalized.is_empty() {
+                return truncate_prompt(normalized);
+            }
+        }
 
         let mut texts = Vec::new();
         match message.get("content") {

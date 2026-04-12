@@ -670,6 +670,50 @@ fn prompt_mouse_hit_testing_reports_cursor_targets() {
 }
 
 #[test]
+fn transcript_message_header_copy_icon_has_click_target() {
+    let mut state = RatatuiApp::new("copy-hit").initial_state();
+    state.transcript_lines = vec![TranscriptLine {
+        role: "assistant".to_owned(),
+        text: "Copied body".to_owned(),
+        author_label: Some("Assistant(test)".to_owned()),
+        token_label: Some("12 tok".to_owned()),
+    }];
+
+    let mut saw_copy = false;
+    for row in 0..24 {
+        for column in 0..80 {
+            if mouse_action_for_position(&state, 80, 24, column, row)
+                == Some(UiMouseAction::CopyTranscriptItem(0))
+            {
+                saw_copy = true;
+                break;
+            }
+        }
+        if saw_copy {
+            break;
+        }
+    }
+
+    assert!(saw_copy);
+}
+
+#[test]
+fn transcript_header_renders_copied_feedback_for_selected_item() {
+    let mut state = RatatuiApp::new("copied-feedback").initial_state();
+    state.transcript_lines = vec![TranscriptLine {
+        role: "assistant".to_owned(),
+        text: "Body".to_owned(),
+        author_label: Some("Assistant(test)".to_owned()),
+        token_label: Some("12 tok".to_owned()),
+    }];
+    state.copied_message_item = Some(0);
+
+    let rendered = render_to_string(&state, 80, 24).unwrap();
+
+    assert!(rendered.contains("Copied"));
+}
+
+#[test]
 fn transcript_item_history_group_arrow_has_click_target() {
     let mut state = RatatuiApp::new("history-arrow-hit").initial_state();
     state.transcript_items = vec![TranscriptItem::Group(TranscriptGroup {

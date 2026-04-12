@@ -57,28 +57,36 @@ async fn handle_repl_slash_command_with_options(
             invocation.name
         ));
     }
-    if let Some(expanded_prompt) = resolve_prompt_command_prompt(
+    if let Some(prompt_command_execution) = resolve_prompt_command_execution(
         registry,
         &invocation,
         cwd,
         plugin_root,
         repl_session.session_id,
     )? {
-        let (applied_compaction, turn_count, stop_reason, _, _) = execute_local_turn_with_options(
-            store,
-            tool_registry,
-            cwd.to_path_buf(),
-            plugin_root,
-            provider,
-            active_model.clone(),
+        let user_message = build_prompt_command_user_message(
             repl_session.session_id,
-            raw_messages,
-            expanded_prompt,
-            live_runtime,
-            runtime_options,
-            None,
-        )
-        .await?;
+            raw_messages.last().map(|message| message.id),
+            prompt_command_execution.raw_input,
+            prompt_command_execution.transcript_text,
+            prompt_command_execution.expanded_prompt,
+        );
+        let (applied_compaction, turn_count, stop_reason, _, _) =
+            execute_local_turn_with_user_message_options(
+                store,
+                tool_registry,
+                cwd.to_path_buf(),
+                plugin_root,
+                provider,
+                active_model.clone(),
+                repl_session.session_id,
+                raw_messages,
+                user_message,
+                live_runtime,
+                runtime_options,
+                None,
+            )
+            .await?;
         let detail = if let Some(kind) = applied_compaction.as_ref().and_then(compaction_kind_name)
         {
             format!("{turn_count} steps · {:?} · compact {kind}", stop_reason)
@@ -337,6 +345,7 @@ async fn process_repl_submission(
     total_usage_totals: UsageTotals,
     input_buffer: &mut ccrust_ui::InputBuffer,
     prompt_history: &mut Vec<String>,
+    global_prompt_history: &mut Vec<String>,
     prompt_history_index: &mut Option<usize>,
     prompt_history_draft: &mut Option<ccrust_ui::InputBuffer>,
     transcript_scroll: &mut u16,
@@ -580,6 +589,7 @@ async fn process_repl_submission(
         let mut pending_vim_state = vim_state.clone();
         let result = run_pending_repl_operation(
             terminal,
+            store,
             registry,
             tool_registry,
             pending_view.clone(),
@@ -643,8 +653,17 @@ async fn process_repl_submission(
                     .await?;
                 }
                 if repl_session.session_id != previous_session_id {
-                    *prompt_history = prompt_history_from_messages(raw_messages);
-                    reset_prompt_history_navigation(prompt_history_index, prompt_history_draft);
+                    *global_prompt_history =
+                        global_prompt_history_from_store(store, repl_session.session_id)
+                            .await
+                            .unwrap_or_default();
+                }
+                *prompt_history = combined_prompt_history(
+                    &prompt_history_from_messages(raw_messages),
+                    global_prompt_history,
+                );
+                reset_prompt_history_navigation(prompt_history_index, prompt_history_draft);
+                if repl_session.session_id != previous_session_id {
                     *transcript_scroll = 0;
                     *compact_banner = repl_session
                         .transcript_path
@@ -735,6 +754,7 @@ async fn process_repl_submission(
     )));
     let result = run_pending_repl_operation(
         terminal,
+        store,
         registry,
         tool_registry,
         pending_view.clone(),

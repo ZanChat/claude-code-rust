@@ -1,6 +1,9 @@
 use super::*;
 use std::collections::BTreeSet;
 
+const GLOBAL_PROMPT_HISTORY_SESSION_LIMIT: usize = 24;
+const GLOBAL_PROMPT_HISTORY_ENTRY_LIMIT: usize = 200;
+
 fn project_skill_search_roots(
     cwd: &Path,
     root: &Path,
@@ -102,6 +105,83 @@ pub(crate) async fn resolved_command_registry(
     let mut registry = compatibility_command_registry();
     registry.extend(resolved_dynamic_commands(cwd, plugin_root).await);
     registry
+}
+
+fn prompt_history_entry_from_message(message: &Message) -> Option<String> {
+    if message.role != MessageRole::User {
+        return None;
+    }
+
+    if let Some(raw_input) = message
+        .metadata
+        .attributes
+        .get(ccrust_core::PROMPT_COMMAND_RAW_INPUT_ATTRIBUTE)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(raw_input.to_owned());
+    }
+
+    let text = message_text(message);
+    (!text.trim().is_empty()).then_some(text)
+}
+
+pub(crate) async fn global_prompt_history_from_store(
+    store: &ActiveSessionStore,
+    current_session_id: SessionId,
+) -> Result<Vec<String>> {
+    let summaries = store
+        .list_sessions()
+        .await?
+        .into_iter()
+        .filter(|summary| summary.session_id != current_session_id)
+        .take(GLOBAL_PROMPT_HISTORY_SESSION_LIMIT)
+        .collect::<Vec<_>>();
+
+    let mut history = Vec::new();
+    for summary in summaries.into_iter().rev() {
+        let Ok(messages) = store.load_session(summary.session_id).await else {
+            continue;
+        };
+        for message in &messages {
+            if let Some(entry) = prompt_history_entry_from_message(message) {
+                push_prompt_history_entry(&mut history, &entry);
+            }
+        }
+    }
+
+    if history.len() > GLOBAL_PROMPT_HISTORY_ENTRY_LIMIT {
+        history = history.split_off(history.len() - GLOBAL_PROMPT_HISTORY_ENTRY_LIMIT);
+    }
+
+    Ok(history)
+}
+
+pub(crate) fn combined_prompt_history(
+    session_history: &[String],
+    global_history: &[String],
+) -> Vec<String> {
+    let session_entries = session_history
+        .iter()
+        .map(|entry| entry.trim().to_owned())
+        .filter(|entry| !entry.is_empty())
+        .collect::<BTreeSet<_>>();
+    let mut combined = Vec::new();
+
+    for entry in global_history {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() || session_entries.contains(trimmed) {
+            continue;
+        }
+        push_prompt_history_entry(&mut combined, trimmed);
+    }
+
+    for entry in session_history {
+        push_prompt_history_entry(&mut combined, entry);
+    }
+
+    combined
 }
 
 pub(crate) fn session_preview(messages: &[Message]) -> Option<String> {
@@ -508,8 +588,8 @@ pub(crate) fn push_prompt_history_entry(history: &mut Vec<String>, prompt_text: 
 pub(crate) fn prompt_history_from_messages(raw_messages: &[Message]) -> Vec<String> {
     let mut history = Vec::new();
     for message in raw_messages {
-        if message.role == MessageRole::User {
-            push_prompt_history_entry(&mut history, &message_text(message));
+        if let Some(entry) = prompt_history_entry_from_message(message) {
+            push_prompt_history_entry(&mut history, &entry);
         }
     }
     history

@@ -544,10 +544,17 @@ impl Provider for EchoProvider {
             .rev()
             .find(|message| matches!(message.role, ccrust_core::MessageRole::User))
             .and_then(|message| {
-                message.blocks.iter().find_map(|block| match block {
-                    ccrust_core::ContentBlock::Text { text } => Some(text.clone()),
-                    _ => None,
-                })
+                message
+                    .metadata
+                    .attributes
+                    .get(ccrust_core::EXPANDED_PROMPT_ATTRIBUTE)
+                    .cloned()
+                    .or_else(|| {
+                        message.blocks.iter().find_map(|block| match block {
+                            ccrust_core::ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                    })
             })
             .unwrap_or_else(|| "No user prompt provided.".to_owned());
 

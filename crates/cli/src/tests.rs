@@ -2,27 +2,27 @@ use super::{
     accept_prompt_history_search, append_pending_repl_overlay_ui_event,
     append_provider_error_message, apply_managed_login_env, apply_resume_message_cutoff,
     apply_runtime_prompt_metrics, build_command_choice_list, build_ide_choice_list,
-    build_repl_command_input_message, build_repl_command_output_message, build_repl_ui_state,
-    build_resume_choice_list, build_runtime_system_prompt, build_startup_screens,
-    build_startup_ui_state, build_text_message, build_tool_result_message,
-    cancel_prompt_history_search, choose_active_session, command_suggestions,
-    connect_remote_endpoint_for_cli, current_time_ms, delete_prompt_selection,
-    enter_message_actions, execute_local_turn, execute_local_turn_with_options,
+    build_prompt_command_user_message, build_repl_command_input_message,
+    build_repl_command_output_message, build_repl_ui_state, build_resume_choice_list,
+    build_runtime_system_prompt, build_startup_screens, build_startup_ui_state, build_text_message,
+    build_tool_result_message, cancel_prompt_history_search, choose_active_session,
+    combined_prompt_history, command_suggestions, connect_remote_endpoint_for_cli, current_time_ms,
+    delete_prompt_selection, enter_message_actions, execute_local_turn,
+    execute_local_turn_with_options, execute_local_turn_with_user_message_options,
     handle_prompt_file_picker_key, handle_prompt_mouse_action, handle_repl_slash_command,
     insert_onboarding_input_text, insert_prompt_text, is_paste_shortcut,
     is_selection_copy_shortcut, load_command_settings, load_session_metadata_for_path,
-    message_action_copy_text, message_action_items_from_runtime, message_actions_ui_state,
-    message_primary_input, message_text, move_prompt_selection, navigate_prompt_history_down,
-    navigate_prompt_history_up, navigate_prompt_input_down, navigate_prompt_input_up,
-    maybe_notify_auto_connected_ide, open_prompt_history_search, pane_from_shortcut,
-    pane_from_shortcut_for_terminal,
-    parse_cli_from, parse_open_command_args, parse_server_command_args,
-    pending_btw_context_messages, pending_btw_provider_request, pending_btw_question,
-    pending_interrupt_messages, pending_transcript_group_id, project_ccrust_env_path,
-    prompt_file_picker_choice_list, prompt_history_from_messages, prompt_history_search_matches,
-    prompt_selection_text, provider_error_transcript_text, render_advisor_command,
-    render_auth_command_with_resume, render_chrome_command, render_command_help,
-    render_effort_command, render_fast_command, render_ide_command_with_home,
+    maybe_notify_auto_connected_ide, message_action_copy_text, message_action_items_from_runtime,
+    message_actions_ui_state, message_primary_input, message_text, move_prompt_selection,
+    move_transcript_selection, navigate_prompt_history_down, navigate_prompt_history_up,
+    navigate_prompt_input_down, navigate_prompt_input_up, open_prompt_history_search,
+    pane_from_shortcut, pane_from_shortcut_for_terminal, parse_cli_from, parse_open_command_args,
+    parse_server_command_args, pending_btw_context_messages, pending_btw_provider_request,
+    pending_btw_question, pending_interrupt_messages, pending_transcript_group_id,
+    project_ccrust_env_path, prompt_file_picker_choice_list, prompt_history_from_messages,
+    prompt_history_search_matches, prompt_selection_text, provider_error_transcript_text,
+    render_advisor_command, render_auth_command_with_resume, render_chrome_command,
+    render_command_help, render_effort_command, render_fast_command, render_ide_command_with_home,
     render_remote_control_command, render_session_command, render_theme_command,
     render_usage_command, repl_agents_picker_state, repl_effort_picker_state,
     repl_fast_picker_state, repl_hooks_picker_state, repl_ide_picker_state_with_home,
@@ -32,16 +32,17 @@ use super::{
     resumable_sessions, resume_command_for_session, resume_hint_text, resume_picker_item,
     run_pending_btw_side_question, should_append_pending_interrupt_message,
     should_echo_command_result_in_footer, should_exit_repl, should_launch_interactive_repl,
-    step_prompt_history_search_match, sync_prompt_history_search_preview, task_entries_for_ui,
-    task_store_for, toggle_all_history_transcript_groups, toggle_pending_repl_group,
-    toggle_pending_repl_transcript_details, ts_top_level_cli_option_specs,
-    update_session_metadata_for_path, user_ccrust_env_path, validate_root_print_mode,
-    ActiveSessionStore, Cli, CompatOptionSpec, LaunchProviderSource, LocalBridgeHandler,
-    ManagedLoginConfigState, Message, MessageRole, PendingReplStep, PendingReplView,
-    PromptSelectionMove, ReplCommandPickerAction, ReplInteractionState, ReplMessageActionState,
-    ReplSessionState, ReplShortcutAction, ReplTranscriptSearchState, ResumePickerState,
-    ResumeTargetHint, RuntimeCliOptions, RuntimeSystemPromptMetrics, StartupPreferences,
-    StartupScreen,
+    step_prompt_history_search_match, sync_prompt_history_search_preview,
+    sync_transcript_selection_preview, task_entries_for_ui, task_store_for,
+    toggle_all_history_transcript_groups, toggle_pending_repl_group,
+    toggle_pending_repl_transcript_details, transcript_selection_move_for_key,
+    ts_top_level_cli_option_specs, update_session_metadata_for_path, user_ccrust_env_path,
+    validate_root_print_mode, ActiveSessionStore, Cli, CompatOptionSpec, LaunchProviderSource,
+    LocalBridgeHandler, ManagedLoginConfigState, Message, MessageRole, PendingReplStep,
+    PendingReplView, PromptSelectionMove, ReplCommandPickerAction, ReplInteractionState,
+    ReplMessageActionState, ReplSessionState, ReplShortcutAction, ReplTranscriptSearchState,
+    ResumePickerState, ResumeTargetHint, RuntimeCliOptions, RuntimeSystemPromptMetrics,
+    StartupPreferences, StartupScreen, TranscriptSelectionMove,
 };
 use crate::cli_contract::{build_cli_contract, FastPathCommand, OutputMode, TopLevelCommand};
 use crate::cli_graph::{
@@ -68,7 +69,8 @@ use ccrust_providers::{
 use ccrust_session::{materialize_runtime_messages, LocalSessionStore, SessionSummary};
 use ccrust_tools::{compatibility_tool_registry, ToolPermissionMode};
 use ccrust_ui::{
-    PromptSelectionState, TranscriptItem, TranscriptSelectionPoint, TranscriptSelectionState,
+    transcript_selectable_lines_for_view, PromptSelectionState, RatatuiApp, TranscriptItem,
+    TranscriptLine, TranscriptSelectionPoint, TranscriptSelectionState,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 
@@ -706,6 +708,132 @@ async fn execute_local_turn_respects_max_turns_override() {
     assert_eq!(turn_count, 1);
     assert_eq!(stop_reason.as_deref(), Some("max_turns"));
     assert_eq!(raw_messages.len(), 3);
+}
+
+#[test]
+fn prompt_history_uses_raw_prompt_command_input_and_session_entries_sort_last() {
+    let mut prompt_command_message = Message::new(
+        MessageRole::User,
+        vec![ContentBlock::Text {
+            text: "<command-name>debug</command-name>".to_owned(),
+        }],
+    );
+    prompt_command_message.metadata.attributes.insert(
+        ccrust_core::PROMPT_COMMAND_RAW_INPUT_ATTRIBUTE.to_owned(),
+        "/debug failing test".to_owned(),
+    );
+
+    let history = prompt_history_from_messages(&[prompt_command_message]);
+    assert_eq!(history, vec!["/debug failing test".to_owned()]);
+
+    assert_eq!(
+        combined_prompt_history(
+            &["/debug failing test".to_owned()],
+            &[
+                "/global older prompt".to_owned(),
+                "/debug failing test".to_owned(),
+            ],
+        ),
+        vec![
+            "/global older prompt".to_owned(),
+            "/debug failing test".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn prompt_command_user_message_hides_expanded_prompt_in_transcript_but_sends_it_to_provider()
+{
+    let root = temp_session_root("hidden-prompt-command");
+    let store = ActiveSessionStore::Local(LocalSessionStore::new(root.join("sessions")));
+    let session_id = SessionId::new_v4();
+    let tool_registry = compatibility_tool_registry();
+    let mut raw_messages = Vec::new();
+    let user_message = build_prompt_command_user_message(
+        session_id,
+        None,
+        "/debug failing test".to_owned(),
+        "<command-name>debug</command-name><command-args>failing test</command-args>".to_owned(),
+        "Expanded prompt body".to_owned(),
+    );
+
+    let (_, turn_count, stop_reason, _, _) = execute_local_turn_with_user_message_options(
+        &store,
+        &tool_registry,
+        root,
+        None,
+        ApiProvider::OpenAICompatible,
+        DEFAULT_OPENAI_REASONING_MODEL.to_owned(),
+        session_id,
+        &mut raw_messages,
+        user_message,
+        false,
+        &RuntimeCliOptions::default(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(turn_count, 1);
+    assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+    assert_eq!(
+        message_text(&raw_messages[0]),
+        "<command-name>debug</command-name><command-args>failing test</command-args>"
+    );
+    assert_eq!(
+        raw_messages[0]
+            .metadata
+            .attributes
+            .get(ccrust_core::PROMPT_COMMAND_RAW_INPUT_ATTRIBUTE)
+            .map(String::as_str),
+        Some("/debug failing test")
+    );
+    assert!(message_text(raw_messages.last().unwrap()).contains("Expanded prompt body"));
+}
+
+#[test]
+fn shift_up_starts_transcript_selection_and_scrolls_focus_into_view() {
+    let key = KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT);
+    assert_eq!(
+        transcript_selection_move_for_key(&key, false),
+        Some(TranscriptSelectionMove::Up)
+    );
+
+    let mut state = RatatuiApp::new("selection-scroll").initial_state();
+    state.transcript_lines = (1..=20)
+        .map(|index| TranscriptLine {
+            role: "assistant".to_owned(),
+            text: format!("line {index}"),
+            author_label: Some("Assistant(test)".to_owned()),
+            token_label: Some("12 tok".to_owned()),
+        })
+        .collect();
+    let selectable_lines = transcript_selectable_lines_for_view(&state, 80);
+    let mut interaction_state = ReplInteractionState::default();
+
+    let focus = move_transcript_selection(
+        &mut interaction_state,
+        &selectable_lines,
+        TranscriptSelectionMove::Up,
+    )
+    .unwrap();
+
+    assert!(interaction_state.transcript_selection.is_some());
+    assert!(focus.line_index < selectable_lines.last().unwrap().line_index);
+
+    interaction_state.transcript_selection = Some(TranscriptSelectionState {
+        anchor: TranscriptSelectionPoint {
+            line_index: 0,
+            column: 0,
+        },
+        focus: TranscriptSelectionPoint {
+            line_index: 0,
+            column: 1,
+        },
+    });
+    let mut scroll = 0;
+    sync_transcript_selection_preview(&state, 80, 12, &interaction_state, &mut scroll);
+    assert!(scroll > 0);
 }
 
 #[test]

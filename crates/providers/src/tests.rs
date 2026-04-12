@@ -1099,6 +1099,41 @@ fn openai_chat_messages_do_not_duplicate_legacy_system_messages() {
 }
 
 #[test]
+fn provider_serializers_use_hidden_expanded_prompt_text_for_user_messages() {
+    let mut user = Message::new(
+        MessageRole::User,
+        vec![ContentBlock::Text {
+            text: "<command-name>debug</command-name>".to_owned(),
+        }],
+    );
+    user.metadata.attributes.insert(
+        ccrust_core::EXPANDED_PROMPT_ATTRIBUTE.to_owned(),
+        "Expanded prompt text".to_owned(),
+    );
+    let request = ProviderRequest {
+        model: DEFAULT_OPENAI_REASONING_MODEL.to_owned(),
+        messages: vec![user.clone()],
+        ..ProviderRequest::default()
+    };
+
+    let anthropic = super::anthropic_messages(&request.messages);
+    let openai_chat = super::openai_chat_messages(&request);
+    let openai_responses = super::openai_responses_input(&request.messages);
+    let gemini = super::build_gemini_generate_content_payload(&request);
+
+    assert_eq!(anthropic[0]["content"][0]["text"], "Expanded prompt text");
+    assert_eq!(openai_chat[0]["content"], "Expanded prompt text");
+    assert_eq!(
+        openai_responses[0]["content"][0]["text"],
+        "Expanded prompt text"
+    );
+    assert_eq!(
+        gemini["contents"][0]["parts"][0]["text"],
+        "Expanded prompt text"
+    );
+}
+
+#[test]
 fn serializes_bedrock_system_blocks_without_scope() {
     let request = ProviderRequest {
         model: "claude-sonnet-4-6".to_owned(),

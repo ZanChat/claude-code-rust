@@ -140,6 +140,8 @@ pub enum TranscriptItem {
 pub enum UiMouseAction {
     JumpToBottom,
     ToggleTranscriptGroup(String),
+    CopyTranscriptItem(usize),
+    SetTranscriptSelection(TranscriptSelectionPoint),
     SetPromptCursor(usize),
 }
 
@@ -271,6 +273,7 @@ pub struct UiState {
     pub prompt_history_search: Option<PromptHistorySearchState>,
     pub prompt_selection: Option<PromptSelectionState>,
     pub transcript_selection: Option<TranscriptSelectionState>,
+    pub copied_message_item: Option<usize>,
     pub command_palette: Vec<CommandPaletteEntry>,
     pub command_suggestions: Vec<CommandPaletteEntry>,
     pub selected_command_suggestion: Option<usize>,

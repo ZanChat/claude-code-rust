@@ -173,7 +173,13 @@ pub(crate) async fn run_interactive_repl(
 
     let loop_result = async {
         let mut input_buffer = initial_input_buffer;
-        let mut prompt_history = prompt_history_from_messages(raw_messages);
+        let mut global_prompt_history = global_prompt_history_from_store(store, repl_session.session_id)
+            .await
+            .unwrap_or_default();
+        let mut prompt_history = combined_prompt_history(
+            &prompt_history_from_messages(raw_messages),
+            &global_prompt_history,
+        );
         let mut prompt_history_index = None;
         let mut prompt_history_draft: Option<ccrust_ui::InputBuffer> = None;
         let mut transcript_scroll = 0u16;
@@ -264,6 +270,7 @@ pub(crate) async fn run_interactive_repl(
                         total_usage_totals,
                         &mut input_buffer,
                         &mut prompt_history,
+                        &mut global_prompt_history,
                         &mut prompt_history_index,
                         &mut prompt_history_draft,
                         &mut transcript_scroll,
@@ -397,6 +404,55 @@ pub(crate) async fn run_interactive_repl(
                                             &mut interaction_state,
                                             &group_id,
                                         );
+                                    }
+                                }
+                                UiMouseAction::CopyTranscriptItem(item_index)
+                                    if matches!(
+                                        mouse.kind,
+                                        MouseEventKind::Down(MouseButton::Left)
+                                    ) =>
+                                {
+                                    clear_prompt_mouse_anchor(&mut interaction_state);
+                                    let runtime_messages = materialize_runtime_messages(raw_messages);
+                                    let message_action_items = message_action_items_from_runtime(
+                                        &runtime_messages,
+                                        None,
+                                        &interaction_state,
+                                    );
+                                    if let Some(item) =
+                                        message_action_item_by_index(&message_action_items, item_index)
+                                    {
+                                        if let Some(text) = message_action_copy_text(&item.message) {
+                                            compact_banner = Some(
+                                                copy_text_with_fallback_notice(&text, "message")
+                                                    .unwrap_or_else(|error| {
+                                                        format!("Copy failed: {error}")
+                                                    }),
+                                            );
+                                            interaction_state.copied_message_item = Some(item_index);
+                                        }
+                                    }
+                                }
+                                UiMouseAction::SetTranscriptSelection(point) => {
+                                    clear_prompt_mouse_anchor(&mut interaction_state);
+                                    match mouse.kind {
+                                        MouseEventKind::Down(MouseButton::Left) => {
+                                            start_transcript_selection(&mut interaction_state, point);
+                                        }
+                                        MouseEventKind::Drag(MouseButton::Left) => {
+                                            update_transcript_selection(
+                                                &mut interaction_state,
+                                                point,
+                                            );
+                                        }
+                                        MouseEventKind::Up(MouseButton::Left) => {
+                                            update_transcript_selection(
+                                                &mut interaction_state,
+                                                point,
+                                            );
+                                            finish_transcript_selection(&mut interaction_state);
+                                        }
+                                        _ => {}
                                     }
                                 }
                                 UiMouseAction::SetPromptCursor(cursor) => {
@@ -1186,16 +1242,17 @@ pub(crate) async fn run_interactive_repl(
                         }
                     }
                     KeyCode::Char('c') if key.modifiers.is_empty() => {
-                        if let Some(text) = selected_message_action_item(
+                        if let Some(item) = selected_message_action_item(
                             &mut interaction_state,
                             &message_action_items,
-                        )
-                        .and_then(|item| message_action_copy_text(&item.message))
-                        {
-                            compact_banner = Some(
-                                copy_text_with_fallback_notice(&text, "message")
-                                    .unwrap_or_else(|error| format!("Copy failed: {error}")),
-                            );
+                        ) {
+                            if let Some(text) = message_action_copy_text(&item.message) {
+                                compact_banner = Some(
+                                    copy_text_with_fallback_notice(&text, "message")
+                                        .unwrap_or_else(|error| format!("Copy failed: {error}")),
+                                );
+                                interaction_state.copied_message_item = Some(item.item_index);
+                            }
                         }
                         interaction_state.message_actions = None;
                         dirty = true;
@@ -2034,6 +2091,7 @@ pub(crate) async fn run_interactive_repl(
                         total_usage_totals,
                         &mut input_buffer,
                         &mut prompt_history,
+                        &mut global_prompt_history,
                         &mut prompt_history_index,
                         &mut prompt_history_draft,
                         &mut transcript_scroll,

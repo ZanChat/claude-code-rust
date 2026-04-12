@@ -215,6 +215,13 @@ fn selected_message_action_item<'a>(
     items.iter().find(|item| item.item_index == selected_item)
 }
 
+fn message_action_item_by_index(
+    items: &[ReplMessageActionItem],
+    item_index: usize,
+) -> Option<&ReplMessageActionItem> {
+    items.iter().find(|item| item.item_index == item_index)
+}
+
 fn move_message_action_selection(
     interaction_state: &mut ReplInteractionState,
     items: &[ReplMessageActionItem],
@@ -327,7 +334,7 @@ fn should_clear_transcript_selection_on_key(key: &KeyEvent) -> bool {
 
 fn transcript_selection_move_for_key(
     key: &KeyEvent,
-    selection_exists: bool,
+    _selection_exists: bool,
 ) -> Option<TranscriptSelectionMove> {
     if !key.modifiers.contains(KeyModifiers::SHIFT)
         || key
@@ -342,9 +349,44 @@ fn transcript_selection_move_for_key(
         KeyCode::Right => Some(TranscriptSelectionMove::Right),
         KeyCode::Home => Some(TranscriptSelectionMove::LineStart),
         KeyCode::End => Some(TranscriptSelectionMove::LineEnd),
-        KeyCode::Up if selection_exists => Some(TranscriptSelectionMove::Up),
-        KeyCode::Down if selection_exists => Some(TranscriptSelectionMove::Down),
+        KeyCode::Up => Some(TranscriptSelectionMove::Up),
+        KeyCode::Down => Some(TranscriptSelectionMove::Down),
         _ => None,
+    }
+}
+
+fn start_transcript_selection(
+    interaction_state: &mut ReplInteractionState,
+    point: TranscriptSelectionPoint,
+) {
+    interaction_state.message_actions = None;
+    interaction_state.prompt_history_search = None;
+    interaction_state.prompt_selection = None;
+    interaction_state.prompt_mouse_anchor = None;
+    interaction_state.transcript_selection = Some(TranscriptSelectionState {
+        anchor: point.clone(),
+        focus: point,
+    });
+}
+
+fn update_transcript_selection(
+    interaction_state: &mut ReplInteractionState,
+    point: TranscriptSelectionPoint,
+) {
+    if let Some(selection) = interaction_state.transcript_selection.as_mut() {
+        selection.focus = point;
+    } else {
+        start_transcript_selection(interaction_state, point);
+    }
+}
+
+fn finish_transcript_selection(interaction_state: &mut ReplInteractionState) {
+    if interaction_state
+        .transcript_selection
+        .as_ref()
+        .is_some_and(|selection| selection.anchor == selection.focus)
+    {
+        interaction_state.transcript_selection = None;
     }
 }
 

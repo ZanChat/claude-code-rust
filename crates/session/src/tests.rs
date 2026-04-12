@@ -98,6 +98,15 @@ fn falls_back_to_command_name_when_no_prompt_survives() {
     assert_eq!(extract_first_prompt_from_head(head), "resume");
 }
 
+#[test]
+fn extracts_raw_prompt_command_input_from_message_metadata() {
+    let head = concat!(
+        "{\"type\":\"user\",\"message\":{\"metadata\":{\"attributes\":{\"prompt_command_raw_input\":\"/debug failing test\"}},\"content\":\"<command-name>debug</command-name>\"}}\n"
+    );
+
+    assert_eq!(extract_first_prompt_from_head(head), "/debug failing test");
+}
+
 fn make_temp_dir(label: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -179,6 +188,22 @@ fn estimates_tokens_and_materializes_latest_compaction() {
         runtime_messages.last().unwrap().id,
         messages.last().unwrap().id
     );
+}
+
+#[test]
+fn estimate_message_tokens_prefers_hidden_expanded_prompt_text() {
+    let mut message = Message::new(
+        MessageRole::User,
+        vec![ContentBlock::Text {
+            text: "<command-name>debug</command-name>".to_owned(),
+        }],
+    );
+    message.metadata.attributes.insert(
+        ccrust_core::EXPANDED_PROMPT_ATTRIBUTE.to_owned(),
+        "Expanded prompt text that should count toward estimates".to_owned(),
+    );
+
+    assert!(estimate_message_tokens(&[message]) > 20);
 }
 
 #[test]

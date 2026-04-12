@@ -612,42 +612,55 @@ fn assistant_author_label(metadata: &MessageMetadata) -> String {
     }
 }
 
-fn append_wrapped_transcript_line(
-    lines: &mut Vec<Line<'static>>,
-    transcript_line: &TranscriptLine,
-    width: u16,
-) {
-    let width = width.max(1) as usize;
+fn transcript_header_text(transcript_line: &TranscriptLine, copied: bool) -> String {
     let label = transcript_line
         .author_label
         .as_deref()
         .unwrap_or(role_label(&transcript_line.role));
-    let header = transcript_line
+    transcript_line
         .token_label
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("{label} · {value} ⧉"))
-        .unwrap_or_else(|| label.to_owned());
-    let label_style = role_style(&transcript_line.role);
+        .map(|value| {
+            if copied {
+                format!("{label} · {value} Copied")
+            } else {
+                format!("{label} · {value} ⧉")
+            }
+        })
+        .unwrap_or_else(|| label.to_owned())
+}
 
-    if transcript_line.text.trim().is_empty() {
-        for segment in wrap_plain_text(&header, width) {
-            lines.push(Line::from(Span::styled(segment, label_style)));
-        }
-        return;
-    }
+fn wrapped_transcript_lines(
+    transcript_line: &TranscriptLine,
+    width: u16,
+    copied: bool,
+) -> (Vec<Line<'static>>, usize) {
+    let width = width.max(1) as usize;
+    let header = transcript_header_text(transcript_line, copied);
+    let label_style = role_style(&transcript_line.role);
+    let mut lines = Vec::new();
 
     for segment in wrap_plain_text(&header, width) {
         lines.push(Line::from(Span::styled(segment, label_style)));
     }
+    let header_line_count = lines.len();
+
+    if transcript_line.text.trim().is_empty() {
+        return (lines, header_line_count);
+    }
+
     for segment in wrap_plain_text(&transcript_line.text, width) {
         lines.push(Line::from(vec![Span::raw(segment)]));
     }
+
+    (lines, header_line_count)
 }
 
 #[derive(Clone, Debug)]
 enum TranscriptRenderLineKind {
     Regular,
+    MessageHeader(usize),
     GroupHeader(String),
 }
 
@@ -657,6 +670,7 @@ struct TranscriptRenderLine {
     kind: TranscriptRenderLineKind,
     item_index: Option<usize>,
     plain_text: String,
+    visual_index: usize,
 }
 
 fn regular_render_line(
@@ -669,6 +683,21 @@ fn regular_render_line(
         kind: TranscriptRenderLineKind::Regular,
         item_index,
         plain_text: plain_text.into(),
+        visual_index: 0,
+    }
+}
+
+fn message_header_render_line(
+    item_index: usize,
+    line: Line<'static>,
+    plain_text: impl Into<String>,
+) -> TranscriptRenderLine {
+    TranscriptRenderLine {
+        line,
+        kind: TranscriptRenderLineKind::MessageHeader(item_index),
+        item_index: Some(item_index),
+        plain_text: plain_text.into(),
+        visual_index: 0,
     }
 }
 
@@ -683,6 +712,7 @@ fn group_header_render_line(
         kind: TranscriptRenderLineKind::GroupHeader(id.to_owned()),
         item_index,
         plain_text: plain_text.into(),
+        visual_index: 0,
     }
 }
 
@@ -864,12 +894,6 @@ fn indent_line(line: Line<'static>, indent: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-fn wrapped_transcript_lines(transcript_line: &TranscriptLine, width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    append_wrapped_transcript_line(&mut lines, transcript_line, width);
-    lines
-}
-
 fn resolved_transcript_items(state: &UiState) -> Vec<TranscriptItem> {
     if !state.transcript_items.is_empty() {
         return state.transcript_items.clone();
@@ -997,7 +1021,9 @@ fn single_item_group_detail_lines(group: &TranscriptGroup, width: u16) -> Vec<Li
             transcript_line.role.as_str(),
             "history_tool_call" | "history_tool_error" | "history_tool_result"
         ) {
-            for line in wrapped_transcript_lines(transcript_line, width.saturating_sub(2)) {
+            let (wrapped_lines, _) =
+                wrapped_transcript_lines(transcript_line, width.saturating_sub(2), false);
+            for line in wrapped_lines {
                 lines.push(indent_line(line, "  "));
             }
             continue;
@@ -1089,9 +1115,18 @@ fn transcript_visual_lines(state: &UiState, width: u16) -> Vec<TranscriptRenderL
     for (index, item) in items.iter().enumerate() {
         match item {
             TranscriptItem::Line(transcript_line) => {
-                for line in wrapped_transcript_lines(transcript_line, width) {
+                let (wrapped_lines, header_line_count) = wrapped_transcript_lines(
+                    transcript_line,
+                    width,
+                    state.copied_message_item == Some(item_index),
+                );
+                for (line_offset, line) in wrapped_lines.into_iter().enumerate() {
                     let plain_text = line_text(&line);
-                    lines.push(regular_render_line(line, Some(item_index), plain_text));
+                    if line_offset < header_line_count {
+                        lines.push(message_header_render_line(item_index, line, plain_text));
+                    } else {
+                        lines.push(regular_render_line(line, Some(item_index), plain_text));
+                    }
                 }
                 item_index += 1;
             }
@@ -1121,9 +1156,12 @@ fn transcript_visual_lines(state: &UiState, width: u16) -> Vec<TranscriptRenderL
                     } else {
                         lines.push(regular_render_line(Line::from(""), None, ""));
                         for (line_index, transcript_line) in group.lines.iter().enumerate() {
-                            for line in
-                                wrapped_transcript_lines(transcript_line, width.saturating_sub(2))
-                            {
+                            let (wrapped_lines, _) = wrapped_transcript_lines(
+                                transcript_line,
+                                width.saturating_sub(2),
+                                false,
+                            );
+                            for line in wrapped_lines {
                                 let line = indent_line(line, "  ");
                                 let plain_text = line_text(&line);
                                 lines.push(regular_render_line(line, Some(item_index), plain_text));
@@ -1144,6 +1182,7 @@ fn transcript_visual_lines(state: &UiState, width: u16) -> Vec<TranscriptRenderL
     }
 
     for (visual_index, render_line) in lines.iter_mut().enumerate() {
+        render_line.visual_index = visual_index;
         render_line.line = highlight_transcript_render_line(state, render_line, visual_index);
     }
 
@@ -1396,16 +1435,15 @@ pub fn transcript_selectable_lines_for_view(
 ) -> Vec<TranscriptSelectableLine> {
     transcript_visual_lines(state, width)
         .into_iter()
-        .enumerate()
-        .filter_map(|(line_index, line)| match line.kind {
+        .filter_map(|line| match line.kind {
             TranscriptRenderLineKind::Regular => {
                 line.item_index.map(|item_index| TranscriptSelectableLine {
                     item_index,
-                    line_index,
+                    line_index: line.visual_index,
                     text: line.plain_text,
                 })
             }
-            TranscriptRenderLineKind::GroupHeader(_) => None,
+            TranscriptRenderLineKind::MessageHeader(_) | TranscriptRenderLineKind::GroupHeader(_) => None,
         })
         .collect()
 }

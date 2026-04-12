@@ -1655,6 +1655,39 @@ pub(crate) fn message_text(message: &Message) -> String {
         .join("\n")
 }
 
+fn expanded_prompt_text(message: &Message) -> Option<&str> {
+    (message.role == MessageRole::User)
+        .then(|| {
+            message
+                .metadata
+                .attributes
+                .get(ccrust_core::EXPANDED_PROMPT_ATTRIBUTE)
+                .map(String::as_str)
+                .map(str::trim)
+        })
+        .flatten()
+        .filter(|text| !text.is_empty())
+}
+
+fn provider_user_text(message: &Message) -> String {
+    if let Some(expanded_prompt) = expanded_prompt_text(message) {
+        return expanded_prompt.to_owned();
+    }
+
+    message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Attachment { attachment } => {
+                Some(format!("[Attachment omitted: {}]", attachment.name))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(crate) fn parse_tool_input(input_json: &str) -> Value {
     serde_json::from_str(input_json).unwrap_or_else(|_| json!({}))
 }
@@ -1765,6 +1798,14 @@ pub(crate) fn anthropic_messages(messages: &[Message]) -> Vec<Value> {
 
 pub(crate) fn anthropic_content_blocks(message: &Message) -> Vec<Value> {
     let mut content = Vec::new();
+
+    if let Some(expanded_prompt) = expanded_prompt_text(message) {
+        content.push(json!({
+            "type": "text",
+            "text": expanded_prompt,
+        }));
+        return content;
+    }
 
     for block in &message.blocks {
         match block {
@@ -1914,18 +1955,7 @@ pub(crate) fn openai_chat_messages(request: &ProviderRequest) -> Vec<Value> {
                 }
             }
             MessageRole::User => {
-                let text = message
-                    .blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text { text } => Some(text.clone()),
-                        ContentBlock::Attachment { attachment } => {
-                            Some(format!("[Attachment omitted: {}]", attachment.name))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let text = provider_user_text(message);
                 if !text.trim().is_empty() {
                     encoded.push(json!({
                         "role": "user",
@@ -2108,6 +2138,10 @@ fn gemini_tool_name_map(messages: &[Message]) -> BTreeMap<String, String> {
 }
 
 fn gemini_user_parts(message: &Message) -> Vec<Value> {
+    if let Some(expanded_prompt) = expanded_prompt_text(message) {
+        return vec![json!({ "text": expanded_prompt })];
+    }
+
     let mut parts = Vec::new();
 
     for block in &message.blocks {
@@ -2581,20 +2615,10 @@ pub(crate) fn openai_responses_input(messages: &[Message]) -> Vec<Value> {
         match message.role {
             MessageRole::System => {}
             MessageRole::User => {
-                let content = message
-                    .blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text { text } if !text.is_empty() => {
-                            Some(json!({ "type": "input_text", "text": text }))
-                        }
-                        ContentBlock::Attachment { attachment } => Some(json!({
-                            "type": "input_text",
-                            "text": format!("[Attachment omitted: {}]", attachment.name),
-                        })),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
+                let text = provider_user_text(message);
+                let content = (!text.trim().is_empty())
+                    .then(|| vec![json!({ "type": "input_text", "text": text })])
+                    .unwrap_or_default();
                 if !content.is_empty() {
                     encoded.push(json!({
                         "role": "user",

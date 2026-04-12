@@ -11,6 +11,10 @@ pub type AgentId = Uuid;
 pub type TaskId = Uuid;
 pub type QuestionId = Uuid;
 
+pub const EXPANDED_PROMPT_ATTRIBUTE: &str = "expanded_prompt";
+pub const PROMPT_COMMAND_RAW_INPUT_ATTRIBUTE: &str = "prompt_command_raw_input";
+pub const PROMPT_COMMAND_TAG: &str = "prompt_command";
+
 fn unix_time_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

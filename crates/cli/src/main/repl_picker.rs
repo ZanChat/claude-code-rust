@@ -143,6 +143,7 @@ struct ReplInteractionState {
     prompt_selection: Option<PromptSelectionState>,
     prompt_mouse_anchor: Option<usize>,
     transcript_selection: Option<TranscriptSelectionState>,
+    copied_message_item: Option<usize>,
     file_picker: ReplFilePickerState,
 }
 

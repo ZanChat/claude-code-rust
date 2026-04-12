@@ -1,6 +1,46 @@
 use super::*;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (String, String) {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let mut header_end = None;
+    let mut content_length = 0usize;
+
+    loop {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "http request ended before headers completed");
+        buffer.extend_from_slice(&chunk[..read]);
+
+        if header_end.is_none() {
+            header_end = buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4);
+            if let Some(end) = header_end {
+                let headers = String::from_utf8_lossy(&buffer[..end]).to_string();
+                content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or_default();
+            }
+        }
+
+        if let Some(end) = header_end {
+            if buffer.len() >= end + content_length {
+                let headers = String::from_utf8(buffer[..end].to_vec()).unwrap();
+                let body = String::from_utf8(buffer[end..end + content_length].to_vec()).unwrap();
+                return (headers, body);
+            }
+        }
+    }
+}
 
 #[test]
 fn render_ide_command_detects_matching_lockfile() {
@@ -103,15 +143,71 @@ async fn maybe_notify_auto_connected_ide_connects_to_detected_vscode_server() {
         .to_string(),
     );
 
-    let notified = maybe_notify_auto_connected_ide(
-        &workspace,
-        false,
-        Some(&home),
-        Some("vscode"),
-        None,
-    )
-    .await
-    .unwrap();
+    let notified =
+        maybe_notify_auto_connected_ide(&workspace, false, Some(&home), Some("vscode"), None)
+            .await
+            .unwrap();
+
+    server.await.unwrap();
+
+    assert!(notified);
+    assert_eq!(
+        observed_auth.lock().unwrap().as_deref(),
+        Some("ide-secret-token")
+    );
+    assert!(*observed_notification.lock().unwrap());
+}
+
+#[tokio::test]
+async fn maybe_notify_auto_connected_ide_posts_to_detected_sse_server() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let observed_auth = Arc::new(Mutex::new(None::<String>));
+    let observed_notification = Arc::new(Mutex::new(false));
+    let observed_auth_server = observed_auth.clone();
+    let observed_notification_server = observed_notification.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (headers, body) = read_http_request(&mut stream).await;
+        *observed_auth_server.lock().unwrap() = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("x-claude-code-ide-authorization")
+                .then(|| value.trim().to_owned())
+        });
+        assert!(headers.starts_with("POST /sse HTTP/1.1"));
+
+        let value = serde_json::from_str::<Value>(&body).unwrap();
+        assert_eq!(value["method"], "ide_connected");
+        assert!(value["params"]["pid"].as_u64().unwrap() > 0);
+        *observed_notification_server.lock().unwrap() = true;
+
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .unwrap();
+    });
+
+    let home = temp_session_root("ide-auto-connect-sse-home");
+    let workspace = home.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    write_test_file(
+        &home.join(format!(".claude/ide/{}.lock", address.port())),
+        &json!({
+            "workspaceFolders": [workspace.display().to_string()],
+            "ideName": "Visual Studio Code",
+            "transport": "sse",
+            "authToken": "ide-secret-token"
+        })
+        .to_string(),
+    );
+
+    let notified =
+        maybe_notify_auto_connected_ide(&workspace, false, Some(&home), Some("vscode"), None)
+            .await
+            .unwrap();
 
     server.await.unwrap();
 
@@ -1049,7 +1145,10 @@ fn runtime_system_prompt_includes_auto_connected_ide_section() {
 
     let home_path = home.display().to_string();
     with_env_vars(
-        &[("HOME", Some(home_path.as_str())), ("TERM_PROGRAM", Some("vscode"))],
+        &[
+            ("HOME", Some(home_path.as_str())),
+            ("TERM_PROGRAM", Some("vscode")),
+        ],
         || {
             let prompt = build_runtime_system_prompt(
                 &workspace,
@@ -1061,7 +1160,9 @@ fn runtime_system_prompt_includes_auto_connected_ide_section() {
             let prompt_text = prompt.as_text();
 
             assert!(prompt_text.contains("# IDE Integration"));
-            assert!(prompt_text.contains("Visual Studio Code is auto-connected as MCP server 'ide'"));
+            assert!(
+                prompt_text.contains("Visual Studio Code is auto-connected as MCP server 'ide'")
+            );
             assert!(prompt_text.contains("Use mcp with server 'ide' to call IDE tools."));
         },
     );
@@ -1343,8 +1444,13 @@ fn repl_skill_command_executes_expanded_prompt() {
             assert!(status.contains("1 steps"));
             assert!(raw_messages.iter().any(|message| {
                 message.role == MessageRole::User
-                    && message_text(message).contains("Base directory for this skill")
-                    && message_text(message).contains("Review src/lib.rs")
+                    && message_text(message)
+                        == "<command-name>review</command-name><command-args>src/lib.rs</command-args><skill-format>true</skill-format>"
+                    && message
+                        .metadata
+                        .attributes
+                        .get(ccrust_core::EXPANDED_PROMPT_ATTRIBUTE)
+                        .is_some_and(|value| value.contains("Base directory for this skill"))
             }));
             assert!(raw_messages.iter().any(|message| {
                 message.role == MessageRole::Assistant
@@ -1488,8 +1594,16 @@ async fn builtin_review_command_executes_builtin_prompt() {
     assert!(status.contains("1 steps"));
     assert!(raw_messages.iter().any(|message| {
         message.role == MessageRole::User
-            && message_text(message).contains("You are an expert code reviewer")
-            && message_text(message).contains("PR number: 123")
+            && message_text(message)
+                == "<command-name>review</command-name><command-args>123</command-args>"
+            && message
+                .metadata
+                .attributes
+                .get(ccrust_core::EXPANDED_PROMPT_ATTRIBUTE)
+                .is_some_and(|value| {
+                    value.contains("You are an expert code reviewer")
+                        && value.contains("PR number: 123")
+                })
     }));
 }
 
