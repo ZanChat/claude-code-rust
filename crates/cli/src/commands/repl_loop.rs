@@ -34,15 +34,71 @@ fn drain_mouse_scroll_burst(
     Ok(burst)
 }
 
-pub(crate) fn repl_keyboard_enhancement_flags(term_program: Option<&str>) -> KeyboardEnhancementFlags {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplTerminalSettings {
+    pub(crate) mouse_capture_enabled: bool,
+    pub(crate) keyboard_enhancement_flags: Option<KeyboardEnhancementFlags>,
+}
+
+pub(crate) fn repl_keyboard_enhancement_flags(
+    term_program: Option<&str>,
+) -> Option<KeyboardEnhancementFlags> {
     if term_program == Some("vscode") {
-        return KeyboardEnhancementFlags::empty();
+        return None;
     }
 
-    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+    Some(
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+    )
+}
+
+pub(crate) fn repl_terminal_settings(term_program: Option<&str>) -> ReplTerminalSettings {
+    ReplTerminalSettings {
+        mouse_capture_enabled: should_enable_mouse_capture(term_program),
+        keyboard_enhancement_flags: repl_keyboard_enhancement_flags(term_program),
+    }
+}
+
+#[cfg(test)]
+fn append_terminal_command_ansi<C>(buffer: &mut String, command: C)
+where
+    C: crossterm::Command,
+{
+    <C as crossterm::Command>::write_ansi(&command, buffer)
+        .expect("terminal command should serialize to ANSI");
+}
+
+#[cfg(test)]
+pub(crate) fn repl_enter_terminal_ansi(settings: ReplTerminalSettings) -> String {
+    let mut ansi = String::new();
+    append_terminal_command_ansi(&mut ansi, EnterAlternateScreen);
+    append_terminal_command_ansi(&mut ansi, Hide);
+    append_terminal_command_ansi(&mut ansi, crossterm::event::EnableBracketedPaste);
+    if let Some(flags) = settings.keyboard_enhancement_flags {
+        append_terminal_command_ansi(&mut ansi, PushKeyboardEnhancementFlags(flags));
+    }
+    if settings.mouse_capture_enabled {
+        append_terminal_command_ansi(&mut ansi, EnableMouseCapture);
+    }
+    ansi
+}
+
+#[cfg(test)]
+pub(crate) fn repl_leave_terminal_ansi(settings: ReplTerminalSettings) -> String {
+    let mut ansi = String::new();
+    append_terminal_command_ansi(&mut ansi, Show);
+    append_terminal_command_ansi(&mut ansi, crossterm::event::DisableBracketedPaste);
+    if settings.keyboard_enhancement_flags.is_some() {
+        append_terminal_command_ansi(&mut ansi, PopKeyboardEnhancementFlags);
+    }
+    if settings.mouse_capture_enabled {
+        append_terminal_command_ansi(&mut ansi, DisableMouseCapture);
+    }
+    append_terminal_command_ansi(&mut ansi, LeaveAlternateScreen);
+    ansi
 }
 
 pub(crate) async fn run_interactive_repl(
@@ -73,19 +129,26 @@ pub(crate) async fn run_interactive_repl(
     };
     let mut vim_state = ccrust_ui::vim::VimState::default();
     let mut out = stdout();
-    let mouse_capture_enabled =
-        should_enable_mouse_capture(std::env::var("TERM_PROGRAM").ok().as_deref());
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let terminal_settings = repl_terminal_settings(term_program.as_deref());
     enable_raw_mode()?;
-    execute!(
-        out,
-        EnterAlternateScreen,
-        Hide,
-        crossterm::event::EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(repl_keyboard_enhancement_flags(
-            std::env::var("TERM_PROGRAM").ok().as_deref(),
-        ))
-    )?;
-    if mouse_capture_enabled {
+    if let Some(flags) = terminal_settings.keyboard_enhancement_flags {
+        execute!(
+            out,
+            EnterAlternateScreen,
+            Hide,
+            crossterm::event::EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(flags)
+        )?;
+    } else {
+        execute!(
+            out,
+            EnterAlternateScreen,
+            Hide,
+            crossterm::event::EnableBracketedPaste
+        )?;
+    }
+    if terminal_settings.mouse_capture_enabled {
         execute!(out, EnableMouseCapture)?;
     }
     let backend = CrosstermBackend::new(out);
@@ -2150,25 +2213,46 @@ pub(crate) async fn run_interactive_repl(
     .await;
 
     disable_raw_mode().ok();
-    if mouse_capture_enabled {
-        execute!(
-            terminal.backend_mut(),
-            Show,
-            crossterm::event::DisableBracketedPaste,
-            PopKeyboardEnhancementFlags,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        )
-        .ok();
+    if terminal_settings.mouse_capture_enabled {
+        if terminal_settings.keyboard_enhancement_flags.is_some() {
+            execute!(
+                terminal.backend_mut(),
+                Show,
+                crossterm::event::DisableBracketedPaste,
+                PopKeyboardEnhancementFlags,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            )
+            .ok();
+        } else {
+            execute!(
+                terminal.backend_mut(),
+                Show,
+                crossterm::event::DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            )
+            .ok();
+        }
     } else {
-        execute!(
-            terminal.backend_mut(),
-            Show,
-            crossterm::event::DisableBracketedPaste,
-            PopKeyboardEnhancementFlags,
-            LeaveAlternateScreen
-        )
-        .ok();
+        if terminal_settings.keyboard_enhancement_flags.is_some() {
+            execute!(
+                terminal.backend_mut(),
+                Show,
+                crossterm::event::DisableBracketedPaste,
+                PopKeyboardEnhancementFlags,
+                LeaveAlternateScreen
+            )
+            .ok();
+        } else {
+            execute!(
+                terminal.backend_mut(),
+                Show,
+                crossterm::event::DisableBracketedPaste,
+                LeaveAlternateScreen
+            )
+            .ok();
+        }
     }
     loop_result
 }

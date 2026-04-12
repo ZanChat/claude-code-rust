@@ -772,15 +772,32 @@ fn repl_shortcut_routing_is_modifier_specific() {
 
 #[test]
 fn repl_keyboard_enhancement_flags_cover_vscode_shortcuts() {
-    let flags = repl_keyboard_enhancement_flags(None);
+    let flags = repl_keyboard_enhancement_flags(None)
+        .expect("non-VS Code terminals should enable keyboard enhancement flags");
 
     assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
     assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
     assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
 
-    let vscode_flags = repl_keyboard_enhancement_flags(Some("vscode"));
-    assert!(vscode_flags.is_empty());
+    assert!(repl_keyboard_enhancement_flags(Some("vscode")).is_none());
+}
+
+#[test]
+fn repl_terminal_sequences_skip_keyboard_enhancement_commands_in_vscode() {
+    let vscode_settings = repl_terminal_settings(Some("vscode"));
+    let vscode_enter = repl_enter_terminal_ansi(vscode_settings);
+    let vscode_leave = repl_leave_terminal_ansi(vscode_settings);
+
+    assert!(!vscode_enter.contains("\u{1b}[>"));
+    assert!(!vscode_leave.contains("\u{1b}[<1u"));
+
+    let default_settings = repl_terminal_settings(None);
+    let default_enter = repl_enter_terminal_ansi(default_settings);
+    let default_leave = repl_leave_terminal_ansi(default_settings);
+
+    assert!(default_enter.contains("\u{1b}[>"));
+    assert!(default_leave.contains("\u{1b}[<1u"));
 }
 
 #[test]
